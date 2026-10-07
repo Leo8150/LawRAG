@@ -1,0 +1,3 @@
+[console_scripts]
+rouge_chinese = bin.rouge_cmd:main
+

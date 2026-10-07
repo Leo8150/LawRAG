@@ -1,0 +1,57 @@
+"""FastAPI 应用入口"""
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.config import settings
+from app.api import chat, knowledge, performance
+
+app = FastAPI(
+    title=f"LawRAG — {settings.APP_NAME}",
+    description="基于 LangChain、DashScope 与 ChromaDB 的法律检索增强问答系统",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+# CORS 中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 注册路由
+app.include_router(chat.router, prefix=settings.API_PREFIX)
+app.include_router(knowledge.router, prefix=settings.API_PREFIX)
+app.include_router(performance.router, prefix=settings.API_PREFIX)
+
+
+@app.get("/")
+async def root():
+    return {
+        "name": settings.APP_NAME,
+        "name_en": "LawRAG",
+        "version": "1.0.0",
+        "status": "running",
+        "docs": "/docs",
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """全局健康检查 — 包含云端模型配置状态（不发起计费请求）。"""
+    from app.services.kb_service import get_kb_stats
+    from app.services.perf_service import get_model_status
+    stats = get_kb_stats()
+    model_service = await get_model_status()
+    return {
+        "status": "healthy",
+        "models": {
+            "llm": settings.LLM_MODEL,
+            "embedding": settings.EMBEDDING_MODEL,
+        },
+        "model_service": model_service,
+        "knowledge_base": stats,
+    }
