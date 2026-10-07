@@ -58,10 +58,17 @@ class HybridRetriever(BaseRetriever):
     class Config:
         arbitrary_types_allowed = True
 
-    def __init__(self, collection_names: list[str] | None = None, **kwargs):
+    def __init__(
+        self,
+        collection_names: list[str] | None = None,
+        k: int | None = None,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         if collection_names:
             self.collection_names = collection_names
+        if k is not None:
+            self.k = k
         self._load_bm25_corpus()
 
     def _load_bm25_corpus(self):
@@ -159,7 +166,8 @@ class HybridRetriever(BaseRetriever):
 
 def get_hybrid_retriever(
     collection_names: list[str] | None = None,
+    k: int | None = None,
 ) -> HybridRetriever:
     """获取混合检索器"""
     names = collection_names or ["laws", "cases"]
-    return HybridRetriever(collection_names=names)
+    return HybridRetriever(collection_names=names, k=k)

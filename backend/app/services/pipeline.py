@@ -33,6 +33,7 @@ class QueryTransformStrategy(str, Enum):
 class RerankStrategy(str, Enum):
     NONE = "none"
     SIMPLE = "simple"
+    CLOUD = "cloud"
     LLM = "llm"
 
 
@@ -83,6 +84,11 @@ class RAGPipeline:
             "was_corrected": False,
             "llm_calls": 0,
             "llm_calls_saved": 0,
+            "rerank_api_calls": 0,
+            "reranker_model": None,
+            "rerank_candidates": 0,
+            "rerank_tokens": 0,
+            "rerank_fallback": False,
         }
 
     async def execute(self, question: str) -> ChatResponse:
@@ -132,7 +138,7 @@ class RAGPipeline:
             sources.append(SourceDocument(
                 content=doc.page_content[:500],
                 metadata=doc.metadata,
-                score=None,
+                score=doc.metadata.get("rerank_score"),
             ))
 
         return ChatResponse(
@@ -201,7 +207,11 @@ class RAGPipeline:
 
     async def _retrieve(self, search_queries: list[str], hyde_doc: str | None) -> list[Document]:
         t0 = time.time()
-        retriever = get_hybrid_retriever(self.config.collection_names)
+        # 重排序需要更大的候选池；不重排时只召回最终所需数量。
+        candidate_k = self.config.top_k
+        if self.config.rerank_strategy != RerankStrategy.NONE:
+            candidate_k = max(candidate_k, settings.RERANKER_CANDIDATE_K)
+        retriever = get_hybrid_retriever(self.config.collection_names, k=candidate_k)
 
         all_docs: list[Document] = []
         seen_contents: set[int] = set()
@@ -254,20 +264,49 @@ class RAGPipeline:
             return all_docs[:top_k]
 
         t0 = time.time()
+        self.metrics["rerank_candidates"] = len(all_docs)
         try:
             if strategy == RerankStrategy.SIMPLE:
                 scored = simple_rerank(question, all_docs, top_k=top_k)
-                reranked = [doc for doc, _ in scored]
+                self.metrics["reranker_model"] = "jaccard+metadata"
             elif strategy == RerankStrategy.LLM:
                 scored = await llm_rerank(question, all_docs, top_k=top_k)
-                reranked = [doc for doc, _ in scored]
+                self.metrics["reranker_model"] = settings.LLM_MODEL
+            elif strategy == RerankStrategy.CLOUD:
+                from app.services.cloud_reranker import cloud_rerank
+
+                self.metrics["rerank_api_calls"] = 1
+                self.metrics["rerank_candidates"] = min(
+                    len(all_docs), settings.RERANKER_CANDIDATE_K
+                )
+                result = await cloud_rerank(question, all_docs, top_k=top_k)
+                scored = result.ranked_documents
+                self.metrics["reranker_model"] = result.model
+                self.metrics["rerank_tokens"] = result.total_tokens
             else:
-                reranked = all_docs[:top_k]
+                scored = [(doc, 0.0) for doc in all_docs[:top_k]]
+
+            reranked = []
+            for rank, (doc, score) in enumerate(scored, 1):
+                doc.metadata["rerank_score"] = round(float(score), 6)
+                doc.metadata["rerank_rank"] = rank
+                doc.metadata["rerank_strategy"] = strategy.value
+                reranked.append(doc)
             self.metrics["rerank_ms"] = round((time.time() - t0) * 1000, 1)
             return reranked
         except Exception:
+            # 云端/LLM 重排不可用时回退到零云调用的轻量重排。
+            self.metrics["rerank_fallback"] = True
+            self.metrics["reranker_model"] = "jaccard+metadata (fallback)"
+            scored = simple_rerank(question, all_docs, top_k=top_k)
+            reranked = []
+            for rank, (doc, score) in enumerate(scored, 1):
+                doc.metadata["rerank_score"] = round(float(score), 6)
+                doc.metadata["rerank_rank"] = rank
+                doc.metadata["rerank_strategy"] = "simple_fallback"
+                reranked.append(doc)
             self.metrics["rerank_ms"] = round((time.time() - t0) * 1000, 1)
-            return all_docs[:top_k]
+            return reranked
 
     # ---- Stage 4: 生成 ----
 

@@ -20,6 +20,20 @@ class Settings(BaseSettings):
     LLM_TIMEOUT: int = 60
     EMBEDDING_MODEL: str = "text-embedding-v3"
 
+    # --- DashScope 云端重排序 ---
+    # 重排序接口使用百炼业务空间域名，与 OpenAI 兼容的 Chat/Embedding 地址不同。
+    DASHSCOPE_WORKSPACE_ID: str = ""
+    RERANKER_BASE_URL: str = ""
+    RERANKER_MODEL: str = "qwen3.7-text-rerank"
+    RERANKER_TIMEOUT: int = 30
+    RERANKER_MAX_RETRIES: int = 2
+    RERANKER_CANDIDATE_K: int = 20
+    RERANKER_DOCUMENT_MAX_CHARS: int = 1200
+    RERANKER_INSTRUCT: str = (
+        "Given a Chinese legal question, rank passages by whether they provide "
+        "accurate legal grounds for answering it."
+    )
+
     # --- ChromaDB ---
     CHROMA_PERSIST_DIR: str = str(Path(__file__).resolve().parent.parent / "chroma_db")
     LAWS_COLLECTION: str = "laws"

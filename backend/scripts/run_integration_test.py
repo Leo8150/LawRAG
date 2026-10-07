@@ -18,6 +18,7 @@ QT = {
 RR = {
     "none": RerankStrategy.NONE,
     "simple": RerankStrategy.SIMPLE,
+    "cloud": RerankStrategy.CLOUD,
     "llm": RerankStrategy.LLM,
 }
 GS = {

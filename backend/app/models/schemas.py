@@ -70,7 +70,7 @@ class ChatRequest(BaseModel):
     monitor_system: bool = False
     # --- Advanced pipeline options ---
     query_transform: str = Field("none", pattern=r"^(none|multi_query|hyde|decompose|multi_query_hyde)$")
-    rerank_strategy: str = Field("simple", pattern=r"^(none|simple|llm)$")
+    rerank_strategy: str = Field("simple", pattern=r"^(none|simple|cloud|llm)$")
     generation_strategy: str = Field("standard", pattern=r"^(standard|chain_of_thought|self_reflect|structured_legal)$")
     use_kg: bool = False
 
@@ -93,6 +93,11 @@ class StageMetrics(BaseModel):
     # 本地模型调用效率指标
     llm_calls: int = 0
     llm_calls_saved: int = 0
+    rerank_api_calls: int = 0
+    reranker_model: str | None = None
+    rerank_candidates: int = 0
+    rerank_tokens: int = 0
+    rerank_fallback: bool = False
 
 
 class ChatResponse(BaseModel):

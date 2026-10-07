@@ -2,7 +2,9 @@
 
 提供两种重排序策略：
 1. simple_rerank — 基于 jieba 分词的 Jaccard 相似度 + 元数据加分（零额外资源）
-2. llm_rerank   — 使用 Qwen3:8B 批量评分（单次 LLM 调用，替代逐文档调用）
+2. llm_rerank   — 使用当前配置的生成模型批量评分（实验对照方案）
+
+专用云端排序模型实现在 cloud_reranker.py。
 """
 
 import re

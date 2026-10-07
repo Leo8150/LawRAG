@@ -42,6 +42,7 @@ def test_strategy_enum_values():
     # Rerank
     assert RerankStrategy("none") == RerankStrategy.NONE
     assert RerankStrategy("simple") == RerankStrategy.SIMPLE
+    assert RerankStrategy("cloud") == RerankStrategy.CLOUD
     assert RerankStrategy("llm") == RerankStrategy.LLM
 
     # Generation

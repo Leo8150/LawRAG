@@ -169,9 +169,15 @@ export default function ChatPage() {
             <select className="select-small" value={rerankStrategy} onChange={e => setRerankStrategy(e.target.value)}>
               <option value="none">无重排</option>
               <option value="simple">简单重排</option>
-              <option value="llm">LLM重排</option>
+              <option value="cloud">云端专用重排（消耗额度）</option>
+              <option value="llm">Qwen评分重排（实验）</option>
             </select>
           </label>
+          {rerankStrategy === 'cloud' && (
+            <span className="option-hint" title="调用阿里云百炼 qwen3.7-text-rerank">
+              本次问答将调用云端 Reranker
+            </span>
+          )}
           <select className="select-small" value={collection} onChange={e => setCollection(e.target.value)}>
             <option value="all">全部</option>
             <option value="laws">法律条文</option>
@@ -256,6 +262,7 @@ export default function ChatPage() {
                       <div className="source-meta">
                         {src.metadata?.law_name || src.metadata?.guiding_number || src.metadata?.source_file || '来源'}
                         {src.metadata?.article_number && ` 第${src.metadata.article_number}条`}
+                        {src.score != null && ` · 相关性 ${(src.score * 100).toFixed(1)}%`}
                       </div>
                       <div className="source-text">{src.content}</div>
                     </div>
@@ -269,6 +276,9 @@ export default function ChatPage() {
                   <span className="metric-tag">检索 {msg.metrics.retrieval_ms}ms</span>
                   {msg.metrics.kg_lookup_ms != null && <span className="metric-tag">KG {msg.metrics.kg_lookup_ms}ms</span>}
                   {msg.metrics.rerank_ms != null && <span className="metric-tag">重排序 {msg.metrics.rerank_ms}ms</span>}
+                  {msg.metrics.reranker_model && <span className="metric-tag">{msg.metrics.reranker_model}</span>}
+                  {msg.metrics.rerank_tokens > 0 && <span className="metric-tag">重排 {msg.metrics.rerank_tokens} tokens</span>}
+                  {msg.metrics.rerank_fallback && <span className="metric-tag">重排已降级</span>}
                   <span className="metric-tag">生成 {msg.metrics.generation_ms}ms</span>
                   {msg.metrics.self_reflect_ms != null && <span className="metric-tag">反思 {msg.metrics.self_reflect_ms}ms</span>}
                   <span className="metric-tag">总计 {msg.metrics.total_ms}ms</span>

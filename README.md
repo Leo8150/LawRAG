@@ -1,742 +1,661 @@
 # LawRAG：法律检索增强问答系统
 
-> **LawRAG** — 面向中国法律领域的检索增强生成与依据溯源系统
+LawRAG 是一个面向中国法律咨询场景的检索增强生成（Retrieval-Augmented Generation，RAG）项目。系统将法律法规、裁判案例和犯罪知识整理为可检索知识库，在回答问题前先查找依据，再由大语言模型结合检索结果生成回答。
 
-<p align="center">
-  <strong>Qwen-Turbo + Text-Embedding-V3 + ChromaDB + LangChain + FastAPI + React</strong>
-</p>
+项目采用前后端分离架构：后端使用 FastAPI 和 LangChain 编排 RAG 流程，ChromaDB 保存向量索引，DashScope 提供生成与向量模型；前端使用 React 构建问答、知识库管理和性能评测页面。
 
----
+> 一句话理解：LawRAG 不是让模型仅凭参数记忆回答法律问题，而是先从法律知识库寻找证据，再基于证据组织答案。
 
-# 社区支持 
+## 阅读目标
 
-学 AI , 上 L 站
+阅读本文后，你将了解：
 
-[LinuxDO](https://linux.do/)
-
+- LawRAG 解决什么问题，以及为什么法律问答适合采用 RAG；
+- 法律法规和案例如何经过清洗、分块、向量化进入知识库；
+- 一次提问如何经过查询变换、混合检索、知识增强、重排序和答案生成；
+- 前后端模块、主要接口、启动方式和评测方式；
+- 项目的测试体系、质量评测与工程保障机制。
 
 ## 目录
 
-- [项目概述](#项目概述)
-- [核心特性](#核心特性)
-- [系统架构](#系统架构)
-- [法律领域 RAG 优化方案](#法律领域-rag-优化方案)
-- [环境要求](#环境要求)
-- [快速开始](#快速开始)
-- [项目结构](#项目结构)
-- [后端详细说明](#后端详细说明)
-  - [可插拔 RAG 管线架构](#可插拔-rag-管线架构)
-  - [API 接口文档](#api-接口文档)
-  - [配置参数](#配置参数)
-- [前端详细说明](#前端详细说明)
-  - [智能问答页面](#智能问答页面)
-  - [知识库管理页面](#知识库管理页面)
-  - [性能监控页面](#性能监控页面)
-- [数据源](#数据源)
-- [测试](#测试)
-- [性能测试](#性能测试)
-- [技术选型与决策](#技术选型与决策)
-- [许可证](#许可证)
+1. [项目概述](#1-项目概述)
+2. [系统架构与技术选型](#2-系统架构与技术选型)
+3. [数据准备与知识库构建](#3-数据准备与知识库构建)
+4. [一次问答的完整执行流程](#4-一次问答的完整执行流程)
+5. [系统实现与接口设计](#5-系统实现与接口设计)
+6. [环境配置与项目运行](#6-环境配置与项目运行)
+7. [测试评测与质量保障](#7-测试评测与质量保障)
 
 ---
 
-## 项目概述
+## 1. 项目概述
 
-本项目构建了一个**前后端分离**的轻量化 RAG（Retrieval-Augmented Generation）系统，以 **LangChain** 为编排框架，使用本地部署的 **Qwen3:8B** 作为生成模型、**BGE-M3** 作为 Embedding 模型，结合 **ChromaDB** 向量数据库，实现了从文档加载、智能分块、向量化存储到语义检索与生成的完整 RAG 流程。
+**本章使用的核心技术**：RAG、领域知识库、法律文本结构化、混合检索。本章介绍项目目标与业务价值，其余章节展开具体技术实现。
 
-系统选择**中国法律领域**作为垂直应用场景进行验证。法律文本具有高度结构化（编/章/节/条/款/项）、术语精确、条文间存在引用关系、用户查询常为口语化表述等显著特征，对 RAG 系统的分块策略、检索精度和生成忠实度提出了严格要求，是验证轻量化 RAG 系统能力的理想领域。系统针对这些领域特征实现了 **6 项专属 RAG 优化方案**（详见下方），也为将系统适配到其他垂直领域（医疗、金融、教育等）提供了可参考的方法论。
+### 1.1 为什么要做法律 RAG
 
----
+通用大语言模型能够生成流畅的法律回答，但如果只依赖模型参数，仍然存在三个核心问题：
 
-## 核心特性
+1. **知识不可控**：模型训练数据的时间范围不透明，可能不了解最新法规或仍引用失效条文；
+2. **依据不可追溯**：答案看似合理，却无法说明结论来自哪部法律、哪一条规定或哪个案例；
+3. **专业表达存在鸿沟**：用户常用“打人”“欠钱不还”“酒驾”等口语提问，而法律材料使用“故意伤害”“民间借贷”“危险驾驶”等正式术语。
 
-- **本地化部署**：所有模型均通过 Ollama 在本地运行，无需依赖云端 API，实现"数据不出域"的隐私保护
-- **法律领域深度优化**：6 项针对法律文本特征的专属 RAG 优化（结构化分块 / 上下文标头 / HyDE / 术语规范化 / 知识图谱 / 自我反思）
-- **可插拔管线架构**：查询变换（5种）、重排序（3种）、生成（4种）四阶段均支持策略切换，前端可视化配置
-- **前后端分离**：FastAPI 异步后端 + React 单页前端
-- **性能与质量评估**：内置 CPU/内存实时监控、各阶段延迟分解、ROUGE/忠实度/相关性自动评估
-- **多源数据整合**：整合 6 个开源法律数据集，共导入约 59,000 个文本分块
+RAG 将问题拆成“检索”和“生成”两部分：检索模块负责从受控知识库中找出证据，生成模块根据问题和证据组织回答。这样既使用了大模型的语言理解能力，也让答案尽量建立在明确资料之上。
 
----
+### 1.2 项目目标
 
-## 系统架构
+LawRAG 围绕法律文本特点实现以下能力：
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                       Frontend (React + Vite)                    │
-│  ┌──────────┐  ┌──────────┐  ┌───────────┐                     │
-│  │ 问答界面  │  │ 知识库管理│  │ 性能监控  │                     │
-│  │ 策略配置  │  │ 上传/重建 │  │ 基准测试  │                     │
-│  └─────┬────┘  └─────┬────┘  └─────┬─────┘                     │
-│        └─────────────┼─────────────┘                            │
-│                      │ HTTP / REST API                           │
-├──────────────────────┼──────────────────────────────────────────┤
-│                  Backend (FastAPI)                                │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │              Pluggable RAG Pipeline                       │   │
-│  │                                                           │   │
-│  │  Stage 1: 查询变换                                        │   │
-│  │    [无 | 多查询扩展 | HyDE | 子问题分解 | 多查询+HyDE]    │   │
-│  │              ↓                                            │   │
-│  │  Stage 2: 混合检索 (BM25 + 向量 + RRF 融合)               │   │
-│  │    + Stage 2.5: 犯罪知识图谱查找 (可选，并行)              │   │
-│  │              ↓                                            │   │
-│  │  Stage 3: 重排序                                          │   │
-│  │    [无 | 简单重排(Jaccard+元数据) | LLM重排]               │   │
-│  │              ↓                                            │   │
-│  │  Stage 4: 生成                                            │   │
-│  │    [标准 | 链式推理CoT | 自我反思修正 | 结构化法律回答]      │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                                                                  │
-│  ┌──────────┐  ┌───────────┐  ┌──────────┐  ┌──────────────┐   │
-│  │ChromaDB  │  │Qwen3:8B   │  │BGE-M3    │  │犯罪知识图谱   │   │
-│  │向量数据库│  │(Ollama)   │  │(Ollama)  │  │(内存缓存)    │   │
-│  └──────────┘  └───────────┘  └──────────┘  └──────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
+- 以法律“编、章、节、条、款、项”结构进行分块，尽量保持法条语义完整；
+- 对法律法规和裁判案例采用不同的分块策略；
+- 结合 BM25 关键词检索与向量语义检索，提高精确匹配和语义召回能力；
+- 支持多查询改写、HyDE、问题分解等查询变换策略；
+- 使用结构化犯罪知识补充罪名定义、构成要件和量刑信息；
+- 支持简单重排、云端专用 Reranker、LLM 实验重排和多种答案生成方式；
+- 返回参考来源和各阶段耗时，便于分析系统行为；
+- 提供知识库管理、问答配置、性能测试和报告导出页面。
+
+### 1.3 数据规模
+
+系统建立了两类 ChromaDB Collection：
+
+| Collection | 内容 | 向量记录数 |
+|---|---|---:|
+| `laws` | 法律法规、司法材料、犯罪结构化知识 | 35,242 |
+| `cases` | 经过预处理的裁判案例 | 5,000 |
+| 合计 | 法律知识库 | 40,242 |
+
+原始数据与向量库通过 `.gitignore` 和代码仓库分离，部署流程使用数据准备脚本构建独立的本地索引。
 
 ---
 
-## 法律领域 RAG 优化方案
+## 2. 系统架构与技术选型
 
-> 本节是本项目的核心价值所在。法律文本与通用文本有显著差异——高度结构化（编/章/节/条/款/项）、术语精确、条文间存在引用关系、用户查询常为口语化表述。主流 RAG 方案在面对这些特征时存在明确的短板，本项目针对每一项短板给出了专属解决方案。
+**本章使用的核心技术**：React、FastAPI、Pydantic、LangChain、ChromaDB、BM25、DashScope。系统按表现层、接口层、业务编排层、能力层和数据层分层，离线建库与在线问答共用同一套知识存储。
 
-### 1. 法律条文结构化分块 vs 主流固定窗口分块
+### 2.1 总体架构
 
-| 维度 | 主流做法 | 本项目方案 |
-|------|----------|------------|
-| 分块策略 | 固定 token 窗口（如 512 tokens），按字符数切割 | `LegalArticleSplitter`：以"条"为原子单位，按编/章/节/条/款/项层级切分 |
-| 问题 | 一条法律条文可能被切成两半，上半段和下半段分别嵌入，语义破碎 | 以"第X条"为切分点，保证每个 chunk 包含完整的法律条文 |
-| 案例处理 | 同上，案例的"案情"和"判决"可能混在一个 chunk 里 | `LegalCaseSplitter`：按"裁判要旨/基本案情/裁判理由/裁判结果"结构切分 |
+```mermaid
+flowchart TB
+    USER[用户]
 
-**核心实现**：`backend/app/utils/legal_chunker.py`
+    subgraph FE[表现层 · frontend]
+        CHATUI[智能问答页<br/>ChatPage.jsx]
+        KBUI[知识库管理页<br/>KnowledgePage.jsx]
+        PERFUI[性能监控页<br/>PerformancePage.jsx]
+        CLIENT[Axios API Client<br/>services/api.js]
+        CHATUI --> CLIENT
+        KBUI --> CLIENT
+        PERFUI --> CLIENT
+    end
 
-```python
-# 法律条文切分层级（优先级从高到低）
-separators = [
-    r"\n第[一二三四五六七八九十百千]+编",   # 编
-    r"\n第[一二三四五六七八九十百千]+章",   # 章
-    r"\n第[一二三四五六七八九十百千]+节",   # 节
-    r"\n第[一二三四五六七八九十\d]+条",     # 条（核心切分点）
-    r"\n[一二三四五六七八九十]+、",          # 款
-    r"\n（[一二三四五六七八九十]+）",        # 项
-]
-```
+    subgraph API[接口层 · FastAPI]
+        CHATAPI[问答接口<br/>api/chat.py]
+        KBAPI[知识库接口<br/>api/knowledge.py]
+        PERFAPI[评测接口<br/>api/performance.py]
+        SCHEMA[Pydantic Schema<br/>models/schemas.py]
+    end
 
-### 2. 上下文标头注入 (Contextual Header) vs 裸文本嵌入
+    subgraph SERVICE[业务编排层 · services]
+        PIPE[RAGPipeline<br/>pipeline.py]
+        QTS[查询变换<br/>query_rewriter.py / hyde.py]
+        KGS[犯罪知识增强<br/>kg_service.py]
+        RRS[重排序<br/>reranker.py]
+        PROMPT[Prompt 与生成<br/>prompts.py]
+        QUALITY[质量评测与报告<br/>quality_service.py / report_service.py]
+        PIPE --> QTS
+        PIPE --> KGS
+        PIPE --> RRS
+        PIPE --> PROMPT
+    end
 
-| 维度 | 主流做法 | 本项目方案 |
-|------|----------|------------|
-| Chunk 内容 | 直接对原始文本做 Embedding | 在 chunk 前注入结构化标头：`[法律名称: 民法典 | 章节: 第九章 | 条号: 第595条]` |
-| 问题 | 一段"当事人应当按照约定..."的文本脱离了"这是民法典第595条"的上下文，Embedding 无法捕捉其法律归属 | 标头让 Embedding 模型"看到"每段文本属于哪部法律、哪一章、第几条 |
-| 灵感来源 | Anthropic 2024 年提出的 Contextual Retrieval，但原方案是让 LLM 为每个 chunk 生成上下文描述（成本高） | 本项目利用法律文本已有的结构化元数据（法律名/章节/条号），**零 LLM 成本**地构建上下文标头 |
+    subgraph CORE[检索与模型能力层 · core]
+        HYBRID[HybridRetriever<br/>retriever.py]
+        BM25[BM25Okapi + jieba]
+        VECTOR[Chroma 相似度检索]
+        RRF[RRF 排名融合]
+        LLM[ChatOpenAI<br/>qwen-turbo]
+        EMB[OpenAIEmbeddings<br/>text-embedding-v3]
+        HYBRID --> BM25
+        HYBRID --> VECTOR
+        BM25 --> RRF
+        VECTOR --> RRF
+    end
 
-**核心实现**：`backend/app/utils/legal_chunker.py` → `add_contextual_header()`
+    subgraph DATA[数据与存储层]
+        RAW[法规 / 案例 / QA 原始数据]
+        PREP[prepare_datasets.py<br/>清洗与格式转换]
+        SPLIT[LegalArticleSplitter<br/>LegalCaseSplitter]
+        LAWS[(ChromaDB · laws)]
+        CASES[(ChromaDB · cases)]
+        KGDATA[(CrimeKG 结构化知识)]
+        REPORTS[(评测报告 / 问答记录)]
+        RAW --> PREP --> SPLIT --> EMB
+        EMB --> LAWS
+        EMB --> CASES
+        PREP --> KGDATA
+    end
 
-### 3. HyDE 假设文档检索 vs 直接查询嵌入
+    CLOUD[阿里云 DashScope]
 
-| 维度 | 主流做法 | 本项目方案 |
-|------|----------|------------|
-| 向量检索输入 | 直接对用户问题做 Embedding，与文档 Embedding 比较 | HyDE：先让 LLM 生成一段假设性法律条文，用该条文做向量检索 |
-| 问题 | 用户问"酒驾怎么判"→ 这是一个**问题**的 Embedding，与法律**条文**的 Embedding 分布差异大（query-document mismatch） | LLM 生成"根据刑法第一百三十三条之一，危险驾驶罪..."→ 这段假设条文与真实条文的 Embedding 分布一致 |
-| 特别之处 | 通用 HyDE 对所有检索使用假设文档 | **分离式检索**：假设文档仅用于向量检索，原始问题仍用于 BM25（保留精确关键词匹配能力） |
-
-**核心实现**：`backend/app/services/hyde.py` + `core/retriever.py` → `search_with_split_queries()`
-
-### 4. 法律术语规范化 + 查询分解 vs 原始查询直接检索
-
-| 维度 | 主流做法 | 本项目方案 |
-|------|----------|------------|
-| 查询预处理 | 用户查询原样送入检索器 | 两步预处理：(1) 口语→术语映射 (2) 复杂问题分解为子问题 |
-| 问题 | 用户说"打人怎么判"，但法律条文写的是"故意伤害罪"；用户说"酒驾"，法律写"危险驾驶" | 21 组口语→术语映射表 + LLM 子问题分解 |
-| 法律领域特殊性 | 通用领域同义词问题不严重 | 法律领域口语和正式术语之间的鸿沟极大，"偷东西"vs"盗窃罪"、"老赖"vs"失信被执行人" |
-
-**核心实现**：`backend/app/services/query_rewriter.py` → `normalize_legal_terms()` + `decompose_query()`
-
-### 5. 犯罪知识图谱增强 (KAG) vs 纯向量检索
-
-| 维度 | 主流做法 | 本项目方案 |
-|------|----------|------------|
-| 知识来源 | 仅依赖向量数据库中的非结构化文本 | 向量检索 + 结构化犯罪知识图谱（455 个罪名的定义/构成要件/量刑/法条） |
-| 问题 | 问"故意杀人罪的构成要件"时，向量检索可能返回民法典的"人身权利"相关条文（语义接近但领域错误） | KG 精确匹配罪名 → 返回该罪名的完整结构化知识（定义、四要件、量刑标准、相关法条）→ 合并到检索结果前列 |
-| 实现方式 | 需要 Neo4j 等图数据库 | 轻量实现：将犯罪知识图谱文件解析为内存字典，LLM 提取问题中的罪名后精确查找 |
-
-**核心实现**：`backend/app/services/kg_service.py`
-
-### 6. 自我反思修正 vs 单次生成
-
-| 维度 | 主流做法 | 本项目方案 |
-|------|----------|------------|
-| 生成流程 | LLM 单次生成回答，直接返回 | 生成 → 验证（引用的条文是否在参考资料中？概念是否准确？）→ 必要时修正重生成 |
-| 问题 | LLM 可能"幻觉"出不存在的法条编号，如编造"民法典第999条" | 自我反思阶段检查回答中引用的法条是否确实存在于检索到的参考资料中 |
-| 成本控制 | 多轮反思延迟高 | 限制最多 1 轮修正（增加约 3-5s），在准确性和响应速度之间取平衡 |
-
-**核心实现**：`backend/app/services/self_reflect.py`
-
-### 优化方案总结
-
-| 优化方案 | 解决的法律领域特有问题 | 实现文件 |
-|----------|------------------------|----------|
-| 结构化分块 | 法律条文的编/章/节/条层级结构 | `legal_chunker.py` |
-| 上下文标头注入 | chunk 脱离法律归属上下文 | `legal_chunker.py` |
-| HyDE 假设文档 | 问题与条文的 Embedding 分布差异 | `hyde.py` + `retriever.py` |
-| 法律术语规范化 | 口语与法律术语的鸿沟 | `query_rewriter.py` |
-| 犯罪知识图谱增强 | 刑法领域需要结构化知识（构成要件/量刑） | `kg_service.py` |
-| 自我反思修正 | LLM 幻觉法条编号的风险 | `self_reflect.py` |
-
----
-
-## 环境要求
-
-### 硬件要求
-
-| 组件 | 最低配置 | 推荐配置 |
-|------|----------|----------|
-| CPU | 8 核 | 16 核 |
-| RAM | 16GB | 32GB |
-| GPU | 不需要 | 不需要 |
-| 磁盘 | 5GB SSD | 10GB SSD |
-
-### 软件依赖
-
-- **Python** >= 3.10
-- **Node.js** >= 18.0
-- **阿里云百炼 DashScope API Key**
-
----
-
-## 快速开始
-
-### 1. 克隆项目
-
-```bash
-git clone <repository-url>
-cd LawRAG
+    USER --> CHATUI
+    USER --> KBUI
+    USER --> PERFUI
+    CLIENT -->|REST / JSON| CHATAPI
+    CLIENT -->|REST / JSON| KBAPI
+    CLIENT -->|REST / JSON| PERFAPI
+    CHATAPI --> SCHEMA --> PIPE
+    KBAPI --> SPLIT
+    PERFAPI --> QUALITY
+    PIPE --> HYBRID
+    PIPE --> QUALITY
+    RRF --> PIPE
+    KGS --> KGDATA
+    VECTOR --> LAWS
+    VECTOR --> CASES
+    PROMPT --> LLM
+    LLM --> CLOUD
+    EMB --> CLOUD
+    QUALITY --> REPORTS
 ```
 
-### 2. 配置 DashScope
+系统包含两条主链路：
 
-```bash
-$env:DASHSCOPE_API_KEY="sk-..."  # PowerShell
-# export DASHSCOPE_API_KEY="sk-..."  # bash/zsh
+- **离线建库链路**：原始数据 → 格式转换 → 元数据提取 → 结构化分块 → Embedding → ChromaDB；
+- **在线问答链路**：用户问题 → 查询变换 → 混合检索 → 知识增强 → 重排序 → 答案生成。
+
+离线建库只在首次导入或知识库变化时执行，在线问答则在每次用户提问时执行。
+
+### 2.2 技术栈
+
+| 层级 | 技术 | 作用 |
+|---|---|---|
+| 前端 | React 18、Vite、Axios、Recharts | 交互界面、接口调用、性能图表 |
+| Web 后端 | FastAPI、Pydantic | REST API、参数校验、响应模型 |
+| RAG 编排 | LangChain | 文档对象、Prompt、模型链和检索器接口 |
+| 生成模型 | DashScope `qwen-turbo` | 查询改写、答案生成、可选评测 |
+| 向量模型 | DashScope `text-embedding-v3` | 文本向量化和语义查询 |
+| 向量数据库 | ChromaDB | 保存法规与案例向量及元数据 |
+| 云端重排 | DashScope `qwen3.7-text-rerank` | 对混合检索候选文档进行二次精排 |
+| 稀疏检索 | `rank-bm25`、jieba | 中文分词和关键词匹配 |
+| 质量评测 | `rouge-chinese`、LLM Judge | ROUGE、相关性和忠实度评估 |
+| 系统监控 | psutil | CPU 和内存使用率采集 |
+
+### 2.3 为什么使用混合检索
+
+法律问题同时需要“精确匹配”和“语义理解”。例如，“民法典第五百零九条”包含明确编号，BM25 更容易准确命中；“公司一直不给我发工资怎么办”与法条原文用词差异较大，向量检索更适合发现语义相关内容。
+
+系统将 BM25 和向量检索的排名通过 RRF（Reciprocal Rank Fusion）合并。对排名为 `rank` 的文档，其贡献可简化表示为：
+
+```text
+RRF_score = weight / (60 + rank + 1)
 ```
 
-默认使用 `qwen-turbo` 和 `text-embedding-v3`。新人免费额度有地域、数量和有效期限制，建议在百炼控制台开启“免费额度用完即停”。
+同一文档如果被两种检索器同时命中，会累加两部分分数，从而获得更靠前的最终排名。默认 BM25 和向量检索权重均为 `0.5`。
 
-### 3. 启动后端
+---
 
-```bash
-cd backend
-.venv\Scripts\activate  # Windows；首次使用前运行 py -m venv .venv
+## 3. 数据准备与知识库构建
+
+**本章使用的核心技术**：Python 文件处理、PyArrow、JSON/JSONL、正则表达式、LangChain `RecursiveCharacterTextSplitter`、`OpenAIEmbeddings` 和 ChromaDB。目标是把不同格式的原始数据转换为统一的 `Document + metadata + vector` 结构。
+
+### 3.1 数据来源
+
+| 数据集 | 主要内容 | 在项目中的用途 |
+|---|---|---|
+| [Chinese-Laws](https://modelscope.cn/datasets/dengcao/Chinese-Laws) | 中国法律法规 TXT 文本 | 法律条文检索 |
+| [Chinese Law and Regulations](https://huggingface.co/datasets/twang2218/chinese-law-and-regulations) | 法律法规结构化数据 | 补充法规覆盖范围 |
+| [CrimeKgAssitant](https://github.com/liuhuanyong/CrimeKgAssitant) | 罪名知识和法律问答 | 犯罪知识增强、参考答案 |
+| [CAIL](https://github.com/thunlp/CAIL) | 中文法律案例数据 | 案例检索与测试 |
+| CAIL2018 | 刑事案件事实与标签 | 构建案例 Collection |
+
+原始数据统一存放在 `backend/data/` 下：
+
+```text
+backend/data/
+├── laws/
+│   ├── Chinese-Laws/
+│   ├── HF_Chinese_Laws/
+│   └── CrimeKG/
+├── cases/
+│   ├── CAIL2018/
+│   └── CAIL2019-SCM/
+├── qa/
+├── reference/
+├── reports/
+└── chat_records/
+```
+
+### 3.2 数据预处理
+
+运行 `scripts.prepare_datasets` 后，系统会执行以下转换：
+
+1. 将 Hugging Face Parquet 法规筛选并转换为独立 TXT 文件；
+2. 解压并读取 CAIL2018 数据，将案件事实和标签整理为 JSONL；
+3. 从 CrimeKgAssitant 中提取罪名定义、构成要件、量刑和相关法条；
+4. 从 QA 语料中抽取评测问题和参考答案；
+5. 生成后续导入脚本能够统一读取的目录和文件格式。
+
+该阶段执行确定性的本地文件转换，并支持按需下载 DISC-Law-SFT；模型调用统一集中在向量导入和在线问答阶段。
+
+完整建库流程如下。图中的前半部分由 `prepare_datasets.py` 完成，后半部分由 `import_data.py` 完成：
+
+```mermaid
+flowchart TD
+    A[多源原始数据] --> A1[TXT 法律法规]
+    A --> A2[Parquet 法规数据]
+    A --> A3[CAIL JSON / ZIP]
+    A --> A4[CrimeKG / QA JSON]
+
+    A1 --> B[统一读取与格式转换]
+    A2 --> B
+    A3 --> B
+    A4 --> B
+    B --> C{文档类型判断}
+
+    C -->|law| D1[LegalArticleSplitter<br/>按编章节目条款项切分]
+    C -->|case| D2[LegalCaseSplitter<br/>按案情与裁判结构切分]
+    C -->|crime knowledge| D3[解析罪名、定义、构成要件<br/>量刑和相关法条]
+
+    D1 --> E[正则提取元数据]
+    D2 --> E
+    D3 --> E
+    E --> F[加入 source_file、doc_type<br/>law_name、article_number 等字段]
+    F --> G[注入结构化上下文标头]
+    G --> H[按批次调用 text-embedding-v3]
+    H --> I{目标 Collection}
+    I -->|法规与犯罪知识| J[(ChromaDB · laws)]
+    I -->|裁判案例| K[(ChromaDB · cases)]
+    J --> L[供 BM25 语料加载<br/>和向量相似度检索]
+    K --> L
+```
+
+这条链路体现了三个技术层次：格式转换解决数据源不统一，领域分块解决法律语义边界，Embedding 与 ChromaDB 则负责把文本转换为可执行的语义检索索引。
+
+### 3.3 法律结构化分块
+
+普通 RAG 常按固定字符或 Token 窗口切分文档。但如果在法条中间直接切开，适用条件与法律后果可能被分到两个 Chunk，检索后只能得到半条规则。
+
+LawRAG 为两类文本分别设计分块器：
+
+| 文档类型 | 优先分隔结构 | 默认分块参数 |
+|---|---|---|
+| 法律法规 | 编 → 章 → 节 → 条 → 款 → 项 → 换行 | 512 字符，64 字符重叠 |
+| 裁判案例 | 裁判要旨 → 基本案情 → 裁判理由 → 裁判结果 | 1,024 字符，128 字符重叠 |
+
+分块后还会保存法律名称、章节、条号、生效日期、源文件、案例名称、案号、关键词、段落类型和 Chunk 序号等元数据。
+
+### 3.4 上下文标头注入
+
+单独看一句“当事人应当按照约定全面履行自己的义务”，Embedding 模型并不知道它属于哪部法律。为减少 Chunk 脱离上下文的问题，系统会在向量化前加入结构化标头：
+
+```text
+[法律名称: 中华人民共和国民法典 | 章节: 第四章 合同的履行 | 条号: 第509条]
+当事人应当按照约定全面履行自己的义务……
+```
+
+标头来自文档结构和正则提取结果，不需要额外调用 LLM。
+
+### 3.5 向量入库
+
+`scripts.import_data` 负责最终导入：
+
+```text
+读取本地文件
+  → 尝试 UTF-8 / GBK / GB2312 编码
+  → 判断法规或案例类型
+  → 结构化分块和元数据增强
+  → 批量请求 text-embedding-v3
+  → 写入 laws 或 cases Collection
+```
+
+法规以批次写入 `laws`，案例从 JSONL 中抽取事实、罪名、法条等信息后写入 `cases`。当前脚本默认最多导入 5,000 条案例。
+
+> 资源说明：`python -m scripts.import_data` 会为全部 Chunk 请求 Embedding。索引与 Embedding 模型版本绑定，数据或模型发生变化时执行重建。
+
+---
+
+## 4. 一次问答的完整执行流程
+
+**本章使用的核心技术**：FastAPI 异步接口、Pydantic 参数校验、`dataclass + Enum` 策略配置、LangChain LCEL、BM25、向量检索、RRF、`asyncio` 并行任务、Prompt Engineering 和 LLM-as-a-Judge。
+
+用户提交问题后，请求会发送到 `POST /api/chat`。后端根据策略参数构造 `PipelineConfig`，随后由 `RAGPipeline.execute()` 依次执行四个主阶段。
+
+```mermaid
+flowchart TD
+    A([用户提交问题]) --> B[POST /api/chat<br/>Pydantic 校验 ChatRequest]
+    B --> C[根据请求构造 PipelineConfig]
+    C --> D{查询变换策略}
+
+    D -->|none| D0[保留原始问题]
+    D -->|multi_query| D1[LLM 生成多个检索问题]
+    D -->|hyde| D2[LLM 生成假设法律文档]
+    D -->|decompose| D3[LLM 拆分法律子问题]
+    D -->|multi_query_hyde| D4[asyncio 并行执行<br/>多查询 + HyDE]
+
+    D0 --> E1[BM25 查询文本]
+    D1 --> E1
+    D2 --> E1
+    D3 --> E1
+    D4 --> E1
+    D0 --> E2[向量查询文本]
+    D1 --> E2
+    D2 --> E2
+    D3 --> E2
+    D4 --> E2
+
+    E1 --> F1[中文分词<br/>BM25Okapi 关键词召回]
+    E2 --> F2[text-embedding-v3<br/>ChromaDB 语义召回]
+    F1 --> G[RRF 融合排名]
+    F2 --> G
+    G --> H[多查询结果去重]
+    H --> I{是否启用 use_kg}
+
+    I -->|是| J[识别罪名<br/>查询 CrimeKG 结构化知识]
+    I -->|否| K{重排序策略}
+    J --> K
+
+    K -->|none| K0[直接截取 Top K]
+    K -->|simple| K1[Jaccard 词项重合<br/>元数据加权]
+    K -->|cloud| K2[qwen3.7-text-rerank<br/>云端专用模型精排]
+    K -->|llm| K3[简单预筛 + 生成模型批量评分]
+    K0 --> L[按 KG > 法规 > 案例排序<br/>构建 4000 字符上下文]
+    K1 --> L
+    K2 --> L
+    K3 --> L
+
+    L --> M{生成策略}
+    M -->|standard| M0[标准法律问答 Prompt]
+    M -->|chain_of_thought| M1[分步骤法律分析 Prompt]
+    M -->|structured_legal| M2[结构化法律回答 Prompt]
+    M -->|self_reflect| M3[先生成初稿]
+    M3 --> N{引用与事实检查}
+    N -->|需要修正| N1[最多修正一轮]
+    N -->|无需修正| O[形成最终答案]
+    N1 --> O
+    M0 --> O
+    M1 --> O
+    M2 --> O
+
+    O --> P{是否开启质量评估}
+    P -->|是| P1[ROUGE + 检索相关性<br/>+ 忠实度评估]
+    P -->|否| Q[组装 ChatResponse]
+    P1 --> Q
+    Q --> R[返回答案、来源、策略配置<br/>改写结果与各阶段耗时]
+    R --> S([React 渲染回答与监控信息])
+```
+
+流程图中的每个阶段都可以定位到具体实现：
+
+| 阶段 | 采用技术 | 主要源码 | 是否调用云模型 |
+|---|---|---|---|
+| 请求接收 | FastAPI、Pydantic | `api/chat.py`、`models/schemas.py` | 否 |
+| 管线配置 | Python `dataclass`、`Enum`、策略模式 | `services/pipeline.py` | 否 |
+| 多查询改写 | LangChain Prompt、`ChatOpenAI` | `services/query_rewriter.py` | 是 |
+| HyDE | 假设文档生成、查询与文档空间对齐 | `services/hyde.py` | 是 |
+| 问题分解 | LLM 结构化拆分 | `services/query_rewriter.py` | 是 |
+| BM25 召回 | jieba、`rank_bm25.BM25Okapi` | `core/retriever.py` | 否 |
+| 向量召回 | `OpenAIEmbeddings`、ChromaDB | `core/embeddings.py`、`core/vectorstore.py` | 每次查询需要一次 Embedding |
+| 融合与去重 | RRF、内容哈希、Top K | `core/retriever.py`、`services/pipeline.py` | 否 |
+| 犯罪知识增强 | 罪名识别、内存字典查找、LangChain `Document` | `services/kg_service.py` | 罪名识别会调用 LLM |
+| 轻量重排序 | Jaccard、jieba、法律元数据加权 | `services/reranker.py` | 否 |
+| 云端专用重排序 | HTTPX、`qwen3.7-text-rerank` | `services/cloud_reranker.py` | 仅选择 `cloud` 时调用 |
+| 生成模型重排序 | LangChain、Qwen 批量评分 | `services/reranker.py` | 仅选择 `llm` 时调用 |
+| 上下文构建 | 文档优先级、字符预算、来源格式化 | `services/pipeline.py` | 否 |
+| 答案生成 | LCEL `prompt \| llm`、Qwen | `services/prompts.py`、`core/llm.py` | 是 |
+| 自我反思 | 引用检查、一次纠错上限 | `services/self_reflect.py` | 仅 `self_reflect` 策略调用 |
+| 质量评估 | ROUGE、LLM-as-a-Judge | `services/quality_service.py` | ROUGE 否，其余指标是 |
+| 响应展示 | Pydantic、Axios、React Markdown | `models/schemas.py`、`ChatPage.jsx` | 否 |
+
+### 4.1 查询变换
+
+查询变换用于缩小用户表达与法律材料之间的差异：
+
+| 策略 | 执行方式 | 适用场景 |
+|---|---|---|
+| `none` | 直接使用原问题 | 问题清晰、追求低成本 |
+| `multi_query` | 从不同角度生成多个查询 | 表述模糊或涉及多个术语 |
+| `hyde` | 生成假设法律文本用于向量查询 | 口语问题与法条差异较大 |
+| `decompose` | 将复杂问题拆成多个子问题 | 一个问题包含多个法律关系 |
+| `multi_query_hyde` | 并行执行多查询和 HyDE | 追求召回范围，允许更高成本 |
+
+HyDE 采用“分离式检索”：原始问题交给 BM25，以保留关键词；假设文档交给向量检索，以缩小问题文本与法律文本之间的语义差异。
+
+### 4.2 混合检索
+
+混合检索器从 ChromaDB 读取指定 Collection 的文档，并用 jieba 分词建立内存 BM25 索引。收到查询后：
+
+1. BM25 返回关键词匹配排名；
+2. ChromaDB 返回向量相似度排名；
+3. RRF 根据排名和权重累加分数；
+4. 按融合分数排序并返回候选文档；
+5. 多查询产生的重复文档按内容去重。
+
+用户可以只检索法规、只检索案例，或者同时检索两个 Collection。
+
+### 4.3 犯罪知识增强
+
+启用 `use_kg` 后，系统从问题中识别罪名，并在 CrimeKG 转换得到的结构化知识中精确查找定义、构成要件、量刑和相关法条。命中结果会作为高优先级文档并入检索结果。
+
+犯罪知识模块采用轻量结构化查找：将罪名映射到定义、构成要件、量刑和关联法条，以常数时间完成精确查询，省去独立图数据库的部署与维护成本。
+
+### 4.4 重排序
+
+初步召回强调“尽量找到”，重排序强调“把最有用的资料放在前面”：
+
+- `none`：直接截取前 `top_k` 条；
+- `simple`：根据词项重合度和法律名称、条号、案号等元数据加权；
+- `cloud`：将融合后的候选文档批量提交给 `qwen3.7-text-rerank`，根据返回的 `relevance_score` 取 Top K；
+- `llm`：先简单预筛，再由通用生成模型批量判断候选文档相关性，主要用于实验对照。
+
+启用重排后，管线将混合检索候选池扩大到 20 条，再选出最终 Top K。默认 `simple` 提供零云端调用的快速路径；`cloud` 调用专用排序模型完成高精度排序。管线内置自动降级机制，云端超时、限流或服务异常时切换到 `simple`，并通过 `rerank_fallback` 指标记录实际执行路径。
+
+### 4.5 上下文构建与答案生成
+
+系统按照“犯罪结构化知识 > 法律法规 > 裁判案例 > 其他文档”的优先级组织上下文。每段资料带有来源标签，总上下文默认限制在约 4,000 字符以内，避免无关内容挤占模型上下文。
+
+| 生成策略 | 输出特点 |
+|---|---|
+| `standard` | 基于资料直接回答 |
+| `chain_of_thought` | 按问题、规则、分析和结论组织回答 |
+| `structured_legal` | 输出法律结论、适用依据、分析和注意事项 |
+| `self_reflect` | 首次生成后检查引用和事实，必要时修正一次 |
+
+最终响应还包括来源文档、查询改写结果、识别罪名、实际管线配置，以及查询变换、检索、KG、重排、生成和总耗时。
+
+---
+
+## 5. 系统实现与接口设计
+
+**本章使用的核心技术**：FastAPI Router、Pydantic BaseModel、REST/JSON、React Hooks、Axios、React Markdown 和 Recharts。后端负责管线与数据，前端负责配置、展示和操作，两者通过稳定的数据模型解耦。
+
+### 5.1 后端分层
+
+```text
+backend/
+├── app/
+│   ├── api/                 # 问答、知识库、性能接口
+│   ├── core/                # LLM、Embedding、ChromaDB、检索器
+│   ├── models/              # Pydantic 请求与响应模型
+│   ├── services/            # RAG 管线及各项策略
+│   ├── utils/               # 法律分块和元数据工具
+│   ├── config.py            # 环境变量与默认配置
+│   └── main.py              # FastAPI 应用入口
+├── scripts/                 # 数据准备、导入和评测脚本
+├── tests/                   # 单元测试
+├── data/                    # 本地数据和运行产物
+└── chroma_db/               # 本地向量数据库
+```
+
+`services/pipeline.py` 是在线问答主入口。它通过枚举和 `PipelineConfig` 将查询变换、重排序、生成策略解耦，使前端能够组合不同流程，而无需复制整套问答代码。
+
+### 5.2 主要 API
+
+后端默认运行在 `http://127.0.0.1:8000`，接口统一使用 `/api` 前缀。启动后可访问 `/docs` 查看 Swagger 文档。
+
+| 方法 | 路径 | 功能 |
+|---|---|---|
+| `GET` | `/` | 项目基本信息 |
+| `GET` | `/health` | 服务和模型配置状态 |
+| `POST` | `/api/chat` | 执行可配置 RAG 问答 |
+| `POST` | `/api/chat/save-record` | 保存问答记录 |
+| `GET` | `/api/chat/records` | 查询问答记录 |
+| `POST` | `/api/knowledge/upload` | 上传法规或案例文件 |
+| `GET` | `/api/knowledge/list` | 列出知识库文件 |
+| `DELETE` | `/api/knowledge/{filename}` | 删除指定文件 |
+| `POST` | `/api/knowledge/rebuild` | 重建向量索引 |
+| `GET` | `/api/knowledge/stats` | 查询文件和 Chunk 数量 |
+| `GET` | `/api/performance/system` | 查询 CPU 和内存状态 |
+| `POST` | `/api/performance/bench` | 执行性能或质量测试 |
+| `POST` | `/api/performance/report` | 生成并保存测试报告 |
+| `GET` | `/api/performance/reports` | 查询历史报告 |
+
+基础问答请求示例：
+
+```json
+{
+  "question": "公司拖欠工资三个月，员工应该如何维权？",
+  "collection": "all",
+  "query_transform": "none",
+  "rerank_strategy": "simple",
+  "generation_strategy": "standard",
+  "use_kg": false,
+  "top_k": 5,
+  "evaluate_quality": false
+}
+```
+
+### 5.3 前端页面
+
+- **智能问答**：输入问题，配置 Collection、查询变换、重排、KG 和生成策略，查看回答、来源及阶段耗时；
+- **知识库管理**：查看文件与 Chunk 数量，上传 TXT、Markdown 或 JSON 文件，删除文件并重建索引；
+- **性能监控**：查看 CPU/内存，执行基准测试，展示延迟分解和质量指标，导出历史报告。
+
+Vite 开发服务器默认运行在 `http://127.0.0.1:5173`，并将 `/api` 请求代理到后端 `8000` 端口。
+
+---
+
+## 6. 环境配置与项目运行
+
+**本章使用的核心技术**：Python `venv`、pip、Node.js、npm、Uvicorn、Vite、`pydantic-settings` 和环境变量。模型密钥与代码分离，后端与前端分别运行并通过开发代理通信。
+
+### 6.1 环境要求
+
+- Python 3.10 或更高版本；
+- Node.js 18 或更高版本；
+- 可访问 DashScope 的网络环境和 API Key；
+- 8 GB 以上磁盘空间，用于保存数据、依赖和向量索引。
+
+模型层使用 `qwen-turbo`、`text-embedding-v3`、`qwen3.7-text-rerank` 和 DashScope API。
+
+### 6.2 安装后端
+
+```powershell
+cd "D:\LLM study\LawRAG\LawRAG\backend"
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+$env:DASHSCOPE_API_KEY="sk-your-api-key"
 ```
 
-### 4. 启动前端
+也可以在 `backend/.env` 中配置：
 
-```bash
-cd frontend
+```env
+DASHSCOPE_API_KEY=sk-your-api-key
+DASHSCOPE_WORKSPACE_ID=your-workspace-id
+LLM_MODEL=qwen-turbo
+EMBEDDING_MODEL=text-embedding-v3
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+RERANKER_MODEL=qwen3.7-text-rerank
+RERANKER_CANDIDATE_K=20
+RERANKER_DOCUMENT_MAX_CHARS=1200
+```
+
+复制 `backend/.env.example` 为 `backend/.env` 并填写环境变量。真实密钥仅保存在 `.env`，该文件已被 Git 忽略。云端 Reranker 使用带业务空间 ID 的独立文本排序 Endpoint，Chat 和 Embedding 使用 OpenAI 兼容地址。
+
+### 6.3 准备数据与建立索引
+
+```powershell
+cd "D:\LLM study\LawRAG\LawRAG\backend"
+python -m scripts.prepare_datasets
+python -m scripts.import_data
+```
+
+第一条命令完成本地格式转换，第二条命令批量调用 `text-embedding-v3` 并生成 ChromaDB 索引。索引构建完成后可直接启动问答服务。
+
+### 6.4 启动后端和前端
+
+后端：
+
+```powershell
+cd "D:\LLM study\LawRAG\LawRAG\backend"
+.\.venv\Scripts\Activate.ps1
+uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+前端使用另一个终端启动：
+
+```powershell
+cd "D:\LLM study\LawRAG\LawRAG\frontend"
 npm install
 npm run dev
 ```
 
-访问 http://localhost:5173（Vite 开发服务器自动将 `/api/*` 代理到 `http://localhost:8000`）。
+访问地址：
 
-### 5. 下载原始数据
+- 前端界面：`http://127.0.0.1:5173`
+- 后端文档：`http://127.0.0.1:8000/docs`
+- 健康检查：`http://127.0.0.1:8000/health`
 
-> 原始数据集未包含在仓库中（体积大，且受各数据集自身许可约束）。请按以下方式手动获取并放置到对应目录：
+模型调用发生在问答、查询变换、云端重排、质量评测和索引构建阶段；服务启动与健康检查只加载配置和本地状态。
 
-```
-backend/data/
-├── laws/
-│   ├── Chinese-Laws/          ← ModelScope dengcao/Chinese-Laws（177 部法律 TXT）
-│   └── HF_Chinese_Laws/       ← HuggingFace twang2218/chinese-law-and-regulations
-├── cases/
-│   ├── CAIL2019-SCM/          ← GitHub thunlp/CAIL（test/train/valid.json）
-│   └── CAIL2018_ALL_DATA.zip  ← https://cail.oss-cn-qingdao.aliyuncs.com/CAIL2018_ALL_DATA.zip
-└── qa/
-    └── CrimeKgAssitant/       ← GitHub liuhuanyong/CrimeKgAssitant（含 data/qa_corpus.json 和 data/kg_crime.json）
-```
+---
 
-各数据集的详细来源与链接见下方[数据源](#数据源)章节。
+## 7. 测试、评测与质量保障
 
-### 7. 数据预处理与导入
+**本章使用的核心技术**：pytest、`rouge-chinese`、jieba、LLM-as-a-Judge、psutil 和 JSON 报告。测试负责验证确定性代码，评测负责衡量非确定性的检索与生成质量。
 
-```bash
-conda activate LawRAG
+### 7.1 单元测试
+
+项目包含 27 个单元测试：
+
+| 测试文件 | 覆盖内容 |
+|---|---|
+| `test_basic.py` | 配置、法律分块、案例分块、元数据格式化 |
+| `test_pipeline.py` | 管线默认值、策略枚举、兼容参数映射 |
+| `test_advanced_retrieval.py` | 法律术语规范化、上下文标头 |
+| `test_kg.py` | 犯罪知识加载和罪名查找 |
+| `test_cloud_reranker.py` | 云端排序请求格式、响应映射、配置检查和无网络降级 |
+
+```powershell
 cd backend
-python -m scripts.prepare_datasets   # 格式转换：CAIL2018 ZIP→JSONL、CrimeKG→TXT、QA→参考答案
-python -m scripts.import_data        # 分块并写入 ChromaDB 向量数据库
+pip install pytest
+pytest tests -v
 ```
 
-### 8. 运行测试
+测试套件将模型和网络依赖替换为可控 Mock。云端重排测试通过 `httpx.MockTransport` 验证请求、响应、排序映射与降级逻辑，形成稳定的离线回归环境。
 
-```bash
-conda activate LawRAG
-cd backend
-pytest tests/ -v
+### 7.2 性能与质量评测
+
+系统可以记录查询变换、检索、KG、重排、生成和总耗时，以及 CPU、内存、平均延迟、QPS、ROUGE、检索相关性、忠实度和模型调用次数。
+
+```powershell
+python -m scripts.run_integration_test
+python -m scripts.run_quality_eval
 ```
 
----
-
-## 项目结构
-
-```
-LawRAG/
-├── README.md                             # 本文件
-├── .gitignore
-│
-├── backend/
-│   ├── requirements.txt                  # Python 依赖
-│   ├── app/
-│   │   ├── main.py                       # FastAPI 应用入口
-│   │   ├── config.py                     # 全局配置（模型、数据库、检索、高级管线参数）
-│   │   ├── api/                          # HTTP API 路由层
-│   │   │   ├── chat.py                   # POST /api/chat — 问答接口
-│   │   │   ├── knowledge.py             # /api/knowledge/* — 知识库管理
-│   │   │   └── performance.py           # /api/performance/* — 性能监控
-│   │   ├── core/                         # 核心组件
-│   │   │   ├── llm.py                    # Qwen3:8B 初始化（ChatOllama）
-│   │   │   ├── embeddings.py            # BGE-M3 初始化（OllamaEmbeddings）
-│   │   │   ├── vectorstore.py           # ChromaDB 向量数据库（带实例缓存）
-│   │   │   └── retriever.py             # 混合检索器（BM25 + 向量 + RRF 融合 + HyDE 分离检索）
-│   │   ├── services/                     # 业务逻辑层
-│   │   │   ├── pipeline.py              # 可插拔 RAG 管线编排器（策略枚举 + PipelineConfig）
-│   │   │   ├── prompts.py               # 全部 Prompt 模板（标准/CoT/结构化/HyDE/反思/分解/KG）
-│   │   │   ├── hyde.py                  # HyDE 假设文档生成
-│   │   │   ├── self_reflect.py          # 自我反思与修正
-│   │   │   ├── kg_service.py            # 犯罪知识图谱加载、实体提取与查找
-│   │   │   ├── rag_service.py           # RAG 入口（向后兼容包装器）
-│   │   │   ├── kb_service.py            # 知识库管理（上传/列表/删除/重建）
-│   │   │   ├── reranker.py              # 重排序（Jaccard + 元数据加分 / LLM 批量评分）
-│   │   │   ├── query_rewriter.py        # 查询重写 + 术语规范化 + 查询分解
-│   │   │   ├── perf_service.py          # 性能基准测试
-│   │   │   ├── quality_service.py       # 质量评估（ROUGE / 相关性 / 忠实度）
-│   │   │   └── report_service.py        # 测试报告生成
-│   │   ├── models/
-│   │   │   └── schemas.py               # Pydantic 数据模型
-│   │   └── utils/
-│   │       ├── legal_chunker.py         # 法律文本专用分块器 + 上下文标头注入
-│   │       └── metadata.py              # 元数据格式化工具
-│   ├── data/
-│   │   ├── laws/                         # 法律条文 + 犯罪知识图谱
-│   │   ├── cases/                        # 案例数据（JSONL）
-│   │   ├── qa/                           # QA 语料
-│   │   └── reference/                    # 评估参考数据
-│   ├── scripts/
-│   │   ├── import_data.py               # 数据批量导入脚本
-│   │   ├── prepare_datasets.py          # 数据格式转换脚本
-│   │   └── crawl_laws.py                # 法律法规数据库爬虫（备用）
-│   └── tests/
-│       ├── test_basic.py                # 基础测试（配置、分块、元数据）
-│       ├── test_pipeline.py             # 管线配置与策略枚举测试
-│       ├── test_advanced_retrieval.py   # 高级检索功能测试（术语规范化、上下文标头）
-│       ├── test_kg.py                   # 犯罪知识图谱模块测试
-│       └── test_queries.txt             # 测试问题集
-│
-├── frontend/
-│   ├── package.json                      # 依赖与脚本
-│   ├── vite.config.js                    # Vite 构建配置 + API 代理
-│   ├── index.html                        # HTML 入口
-│   └── src/
-│       ├── main.jsx                      # React 挂载入口
-│       ├── App.jsx                       # 根组件（侧边栏导航 + 页面切换）
-│       ├── pages/
-│       │   ├── ChatPage.jsx             # 智能问答页面（管线策略配置面板）
-│       │   ├── KnowledgePage.jsx        # 知识库管理页面
-│       │   └── PerformancePage.jsx      # 性能监控页面
-│       ├── services/
-│       │   └── api.js                   # Axios API 封装
-│       └── styles/
-│           └── global.css               # 全局样式
-│
-└── docs/
-    ├── final.md                          # 毕业论文终稿
-    ├── mid_term.md                       # 中期检查报告
-    ├── Thesis_Proposal.md               # 开题报告
-    └── devlog.md                         # 开发问题记录与解决方案
-```
-
----
-
-## 后端详细说明
-
-### 可插拔 RAG 管线架构
-
-核心是 `pipeline.py` 中的 `RAGPipeline` 类，将 RAG 流程拆分为 4 个可独立配置的阶段：
-
-```
-用户提问 → PipelineConfig → RAGPipeline.execute()
-
-  Stage 1: 查询变换 (QueryTransformStrategy)
-    ├── none          — 不变换，直接使用原始问题
-    ├── multi_query   — LLM 从 3 个角度改写查询（法律条文/司法解释/不同术语）
-    ├── hyde          — 生成假设性法律条文用于向量检索（原始问题仍用于 BM25）
-    ├── decompose     — 将复杂问题分解为多个法律子问题
-    └── multi_query_hyde — 多查询 + HyDE 组合（两个 LLM 调用并行执行）
-
-  Stage 2: 混合检索
-    BM25 (jieba分词) + BGE-M3 向量检索 → RRF 融合
-    + Stage 2.5: 犯罪知识图谱查找（可选，并行）
-
-  Stage 3: 重排序 (RerankStrategy)
-    ├── none    — 不重排
-    ├── simple  — Jaccard 关键词重叠 + 法律名称/条号/案号元数据加分
-    └── llm     — 先简单重排预筛选 8 篇候选，再 LLM 单次批量评分
-
-  Stage 4: 生成 (GenerationStrategy)
-    ├── standard          — 标准法律问答 Prompt
-    ├── chain_of_thought  — 链式推理（识别问题→查找法律→分析要件→结论→注意事项）
-    ├── self_reflect      — 标准生成 + 自我反思验证 + 必要时修正
-    └── structured_legal  — 结构化输出（法律结论/适用法律/详细分析/注意事项）
-```
-
-**向后兼容**：旧版 API 参数自动映射：
-- `use_rerank=false` → `rerank_strategy="none"`
-- `use_query_rewrite=true` → `query_transform="multi_query"`
-
-### API 接口文档
-
-#### 问答接口
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/chat` | RAG 智能问答 |
-
-**请求参数**：
-
-```json
-{
-  "question": "故意杀人罪的量刑标准是什么？",
-  "top_k": 5,
-  "collection": "all",
-  "query_transform": "hyde",
-  "rerank_strategy": "simple",
-  "generation_strategy": "chain_of_thought",
-  "use_kg": true,
-  "evaluate_quality": false,
-  "monitor_system": false
-}
-```
-
-| 参数 | 可选值 | 默认值 | 说明 |
-|------|--------|--------|------|
-| `question` | - | 必填 | 用户问题（1-2000字） |
-| `query_transform` | `none` / `multi_query` / `hyde` / `decompose` / `multi_query_hyde` | `none` | 查询变换策略 |
-| `rerank_strategy` | `none` / `simple` / `llm` | `simple` | 重排序策略 |
-| `generation_strategy` | `standard` / `chain_of_thought` / `self_reflect` / `structured_legal` | `standard` | 生成策略 |
-| `use_kg` | `true` / `false` | `false` | 犯罪知识图谱增强 |
-| `collection` | `all` / `laws` / `cases` | `all` | 检索范围 |
-| `evaluate_quality` | `true` / `false` | `false` | 是否评估回答质量 |
-| `monitor_system` | `true` / `false` | `false` | 是否采集系统资源快照 |
-
-**返回数据**：
-
-```json
-{
-  "answer": "根据《中华人民共和国刑法》第二百三十二条...",
-  "sources": [...],
-  "metrics": {
-    "query_rewrite_ms": 1500.0,
-    "retrieval_ms": 320.5,
-    "kg_lookup_ms": 2100.0,
-    "rerank_ms": 15.2,
-    "generation_ms": 3500.8,
-    "self_reflect_ms": null,
-    "total_ms": 7450.3,
-    "was_corrected": false
-  },
-  "kg_entities": ["故意杀人罪"],
-  "generation_strategy": "chain_of_thought",
-  "pipeline_config": { ... }
-}
-```
-
-#### 知识库管理
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| POST | `/api/knowledge/upload` | 上传文档（支持 .txt .md .json） |
-| GET | `/api/knowledge/list` | 列出已上传文件 |
-| DELETE | `/api/knowledge/{filename}` | 删除指定文件 |
-| POST | `/api/knowledge/rebuild` | 重建全部索引 |
-| GET | `/api/knowledge/stats` | 知识库统计（文件数、分块数） |
-
-#### 性能监控
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/performance/system` | CPU/内存实时状态 |
-| POST | `/api/performance/bench` | 运行基准测试 |
-
-### 配置参数
-
-通过环境变量或 `.env` 文件覆盖默认配置：
-
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `DASHSCOPE_API_KEY` | 空 | 阿里云百炼 API Key（必填） |
-| `DASHSCOPE_BASE_URL` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | 北京地域 OpenAI 兼容接口 |
-| `LLM_MODEL` | `qwen-turbo` | 生成模型 |
-| `EMBEDDING_MODEL` | `text-embedding-v3` | Embedding 模型 |
-| `RETRIEVAL_TOP_K` | `10` | 检索返回文档数 |
-| `BM25_WEIGHT` / `VECTOR_WEIGHT` | `0.5` / `0.5` | BM25 / 向量检索权重 |
-| `CONTEXTUAL_CHUNKING` | `True` | 是否启用上下文标头注入 |
-| `HYDE_TEMPERATURE` | `0.7` | HyDE 假设文档生成温度 |
-| `SELF_REFLECT_MAX_ITER` | `1` | 自我反思最大修正轮次 |
-| `DEFAULT_QUERY_TRANSFORM` | `none` | 默认查询变换策略 |
-| `DEFAULT_RERANK` | `simple` | 默认重排序策略 |
-| `DEFAULT_GENERATION` | `standard` | 默认生成策略 |
-
----
-
-## 前端详细说明
-
-### 前端依赖
-
-| 包名 | 用途 |
-|------|------|
-| react / react-dom | UI 框架 |
-| axios | HTTP 请求（超时 300s） |
-| lucide-react | 图标库 |
-| react-markdown | Markdown 渲染 |
-| recharts | 性能监控图表 |
-| vite / @vitejs/plugin-react | 构建工具 |
-
-### API 调用封装
-
-所有 API 调用通过 `src/services/api.js` 统一封装：
-
-| 函数 | 说明 |
-|------|------|
-| `sendChat()` | 问答（含策略参数 `queryTransform`, `rerankStrategy`, `generationStrategy`, `useKg`） |
-| `uploadDocument()` | 上传文档 |
-| `listDocuments()` | 列出文件 |
-| `deleteDocument()` | 删除文件 |
-| `rebuildIndex()` | 重建索引 |
-| `getKBStats()` | 知识库统计 |
-| `getSystemInfo()` | 系统资源状态 |
-| `runBenchmark()` | 基准测试 |
-
-### 智能问答页面
-
-对话式法律问答界面，核心功能：
-
-- **对话式问答**：输入法律问题，AI 返回基于法律条文的专业回答（Markdown 渲染）
-- **参考来源**：每条回答下方展示检索到的法律条文/案例来源卡片
-- **策略配置面板**：通过下拉菜单配置 RAG 管线各阶段策略
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│ [检索配置]                                                          │
-│   查询变换: [无▾ | 多查询扩展 | HyDE | 子问题分解 | 多查询+HyDE]    │
-│   重排策略: [简单重排▾ | 无 | LLM重排]                              │
-│   知识库:   [全部▾ | 法律条文 | 指导案例]                            │
-│   [✓] KG增强                                                       │
-│                                                                     │
-│ [生成配置]                                                          │
-│   生成策略: [标准▾ | 链式推理(CoT) | 自我修正 | 结构化法律回答]       │
-│                                                                     │
-│ | [✓] 性能监控  [  ] 质量评估                                       │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                     │
-│              ┌───────────────────────┐                              │
-│              │ 用户: 故意杀人罪的量刑？│                              │
-│              └───────────────────────┘                              │
-│  ┌──────────────────────────────────────────┐                      │
-│  │ [CoT推理]  [已修正]                       │    ← 策略与修正徽章   │
-│  │                                           │                      │
-│  │ AI: ## 1. 识别法律问题                     │                      │
-│  │     本问题涉及刑法中的故意杀人罪...         │                      │
-│  │                                           │                      │
-│  │ KG匹配: [故意杀人罪]                       │    ← KG 实体标签     │
-│  │                                           │                      │
-│  │ 参考来源 (5)                               │                      │
-│  │ ┌ 刑法 / 第232条 ─────────────────┐       │                      │
-│  │ │ 故意杀人的，处死刑、无期徒刑...   │       │                      │
-│  │ └─────────────────────────────────┘       │                      │
-│  │                                           │                      │
-│  │ 查询变换 1500ms  检索 320ms  KG 2100ms    │    ← 各阶段耗时      │
-│  │ 重排序 15ms  生成 3500ms  反思 2800ms      │                      │
-│  │ 总计 10235ms                               │                      │
-│  └──────────────────────────────────────────┘                      │
-│                                                                     │
-├─────────────────────────────────────────────────────────────────────┤
-│ [请输入法律问题...                                    ] [发送]      │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-#### 选项详解 — 检索配置
-
-| 选项 | 可选值 | 说明 |
-|------|--------|------|
-| **查询变换** | 无变换 | 直接使用用户原始问题进行检索，速度最快 |
-| | 多查询扩展 | LLM 将用户问题从 3 个角度改写（法律条文 / 司法解释 / 不同术语），扩大召回覆盖面。适合问题描述模糊时使用 |
-| | HyDE | LLM 先生成一段假设性法律条文，用该条文做向量检索（解决"问题"与"条文"的语体不一致），原始问题仍用于 BM25 精确匹配。适合用户提问和法律条文表述差异大的场景 |
-| | 子问题分解 | LLM 将复杂问题拆分为 2-4 个子问题（适用法律/构成要件/法律后果/术语规范化），分别检索后合并结果。适合一句话包含多个法律要点的复杂提问 |
-| | 多查询+HyDE | 以上两种方式的组合，覆盖面最广但耗时最长（两个 LLM 调用并行执行） |
-| **重排策略** | 无重排 | 直接使用 BM25+向量 RRF 融合的原始排序，零额外开销 |
-| | 简单重排 | 基于 jieba 分词的 Jaccard 关键词重叠度 + 法律名称/条号/案号元数据加分，不消耗 LLM 资源，速度快且对法律条文检索效果好（**推荐默认**） |
-| | LLM重排 | 先用简单重排预筛选候选文档，再由 LLM 对候选文档批量评分（单次调用），精度最高但增加约 8-15s 延迟 |
-| **知识库** | 全部 | 同时检索法律条文和指导案例两个 Collection |
-| | 法律条文 | 仅检索 laws Collection，适合问法条内容时使用 |
-| | 指导案例 | 仅检索 cases Collection，适合找判例时使用 |
-| **KG增强** | 开/关 | 开启后系统从问题中识别罪名，从犯罪知识图谱中查找该罪名的结构化知识（定义、构成要件、量刑标准、相关法条），合并到检索结果中。仅对刑法问题有效 |
-
-#### 选项详解 — 生成配置
-
-| 选项 | 说明 |
-|------|------|
-| **标准** | 直接根据检索到的参考资料生成法律回答，速度最快（推荐日常使用） |
-| **链式推理(CoT)** | LLM 按"识别法律问题→查找适用法律→分析构成要件→得出结论→注意事项"五步推理后回答，回答更有条理但篇幅更长 |
-| **自我修正** | 先用标准方式生成回答，然后 LLM 自我检查法条引用是否准确，有问题则修正重生成。回答上方显示"已修正"标签。增加约 3-8s 延迟 |
-| **结构化法律回答** | 输出严格按"法律结论 / 适用法律 / 详细分析 / 注意事项"四段格式组织，适合需要正式法律意见格式的场景 |
-
-#### 选项详解 — 评估选项
-
-| 选项 | 说明 |
-|------|------|
-| **性能监控** | 开启后在问答前后分别采集系统 CPU/内存快照，实时显示资源状态。生成过程中在消息气泡内显示实时 CPU/内存数据 |
-| **质量评估** | 开启后自动评估回答质量：ROUGE 指标（与参考答案的文本重叠度）、检索相关性（检索结果与问题的匹配度）、忠实度（回答是否忠实于检索到的参考资料） |
-
-#### 回答区域显示元素
-
-| 元素 | 含义 |
-|------|------|
-| **策略徽章**（紫色） | 标识使用了哪种非标准生成策略（CoT推理 / 自我修正 / 结构化） |
-| **已修正徽章**（黄色） | 自我修正模式下，LLM 检查发现问题并重新生成后显示 |
-| **KG匹配标签**（绿色） | 知识图谱匹配到的罪名实体，如 `[故意杀人罪]` |
-| **参考来源卡片** | 检索到的法律条文/案例原文摘要，显示法律名称、条号等元数据 |
-| **耗时指标栏** | 各阶段耗时：查询变换 / 检索 / KG / 重排序 / 生成 / 反思 / 总计（ms） |
-| **性能&质量详情**（可展开） | 系统资源前后对比 + 质量评估得分（ROUGE-L / 检索相关性 / 忠实度） |
-
-### 知识库管理页面
-
-管理法律文档的上传、查看和索引重建：
-
-- **统计概览**：4 张卡片展示文件总数、总分块数、法律分块数、案例分块数
-- **上传文档**：选择类型（法律条文/指导案例）→ 选择文件 → 自动分块并写入向量库。支持 `.txt` `.md` `.json` 格式
-- **文件列表**：显示已上传的文件名、类型标签、文件大小，支持删除
-- **重建索引**：清除所有向量数据并从 `data/` 目录重新导入（带确认弹窗）
-
-### 性能监控页面
-
-系统资源监控和 RAG 基准测试：
-
-- **实时资源监控**：CPU 使用率、内存使用率、已用/总内存，每 5 秒自动刷新
-- **基准测试**：运行多条法律领域测试查询，展示汇总指标（平均延迟/QPS）、柱状图（检索/生成耗时分解）、详细结果列表
-- **测试报告**：支持生成和下载完整性能报告（含质量评估）
-
----
-
-## 数据源
-
-### 法律条文 (`backend/data/laws/`)
-
-| 数据集 | 来源 | 规模 | 说明 |
-|--------|------|------|------|
-| **Chinese-Laws** | [ModelScope dengcao/Chinese-Laws](https://www.modelscope.cn/datasets/dengcao/Chinese-Laws) | 177 部法律 (5.9MB) | 中国现行主要法律条文全文，TXT 格式 |
-| **HF 法律法规库** | [HuggingFace twang2218/chinese-law-and-regulations](https://huggingface.co/datasets/twang2218/chinese-law-and-regulations) | 2,719 部法规 (44MB) | 法律、行政法规、地方性法规全文 |
-| **犯罪知识图谱** | [GitHub liuhuanyong/CrimeKgAssitant](https://github.com/liuhuanyong/CrimeKgAssitant) | 455+ 罪名 (7.5MB) | 罪名定义、构成要件、量刑标准、相关法条 |
-
-### 刑事案例 (`backend/data/cases/`)
-
-| 数据集 | 来源 | 规模 | 说明 |
-|--------|------|------|------|
-| **CAIL2019-SCM** | [GitHub thunlp/CAIL](https://github.com/thunlp/CAIL) | 3 个文件 | 民事案例相似性匹配数据集 |
-| **CAIL2018** | [CAIL2018 官方](https://cail.oss-cn-qingdao.aliyuncs.com/CAIL2018_ALL_DATA.zip) | 10,000 条 (已导入) / 154K+ 条 (可用) | 刑事法律文书 |
-
-### 法律问答与评估 (`backend/data/qa/`, `backend/data/reference/`)
-
-| 数据集 | 来源 | 规模 | 说明 |
-|--------|------|------|------|
-| **CrimeKgAssitant QA** | [GitHub liuhuanyong/CrimeKgAssitant](https://github.com/liuhuanyong/CrimeKgAssitant) | 203,459 条 | 真实法律咨询问答对 |
-| **评估参考答案** | 从上述 QA 精选 | 195 条 | 按类别均匀采样，用于 ROUGE/相关性/忠实度评估 |
-
-### 数据构成总览
-
-系统经数据预处理与导入后，共生成约 **59,000** 个文本分块（chunk），存储于 ChromaDB 的两个 Collection 中：
-
-| Collection | 数据来源 | 分块策略 | 分块参数 | 用途 |
-|-----------|---------|---------|---------|------|
-| `laws` | Chinese-Laws (177部) + HF法律法规库 (2,719部) + CrimeKG (455+罪名) | `LegalArticleSplitter`：按编/章/节/条层级切分 | chunk_size=512, overlap=64 | 法律条文检索 |
-| `cases` | CAIL2019-SCM + CAIL2018 (10,000条) | `LegalCaseSplitter`：按裁判要旨/案情/理由/结果切分 | chunk_size=1024, overlap=128 | 案例检索 |
-
-### 数据来源说明
-
-所有数据集均来自公开的学术数据集或开源项目，通过 `scripts/prepare_datasets.py` 统一转换格式，再由 `scripts/import_data.py` 分块导入向量数据库：
-
-| 数据集 | 原始来源 | 获取方式 | 原始格式 | 预处理 |
-|--------|---------|---------|---------|--------|
-| Chinese-Laws | ModelScope `dengcao/Chinese-Laws` | ModelScope 下载 | TXT（每部法律一个文件） | 直接导入，自动检测编码 (UTF-8/GBK) |
-| HF 法律法规库 | HuggingFace `twang2218/chinese-law-and-regulations` | hf-mirror.com 镜像下载 | Markdown（每部法规一个文件） | 直接导入 |
-| CrimeKG | GitHub `liuhuanyong/CrimeKgAssitant` | `prepare_datasets.py` 解析 | 按罪名分目录的结构化文本 | 解析罪名定义/构成要件/量刑/法条 → 合并为 TXT 导入 laws Collection + 内存 KG 字典 |
-| CAIL2019-SCM | GitHub `thunlp/CAIL` | 仓库直接下载 | JSON（含 A/B/C 三案例 + 相似度标签） | 仅提取字段 A 作为案例文本 |
-| CAIL2018 | CAIL 官方 Aliyun OSS | `prepare_datasets.py` 下载解压 | ZIP → 多层嵌套 JSON | 提取 `fact` + `meta`（accusation 等）→ JSONL |
-| CrimeKgAssitant QA | GitHub `liuhuanyong/CrimeKgAssitant` | 同 CrimeKG | JSON 问答对 (203,459条) | 按类别均匀采样 195 条 → `reference_answers.json`，用于 ROUGE/忠实度评估 |
-
----
-
-## 测试
-
-系统包含 24 个单元测试用例，分布在 4 个测试文件中：
-
-| 测试文件 | 覆盖范围 |
-|---------|---------|
-| `test_basic.py` | 配置加载、法律条文分块、案例分块、元数据格式化 |
-| `test_pipeline.py` | PipelineConfig 默认值、策略枚举、向后兼容映射 |
-| `test_advanced_retrieval.py` | 法律术语规范化、上下文标头注入 |
-| `test_kg.py` | 知识图谱加载、罪名查找 |
-
-```bash
-cd backend && pytest tests/ -v
-```
-
----
-
-## 性能测试
-
-系统内置性能测试模块，覆盖以下维度：
-
-- **资源占用**：CPU/RAM 实时监控
-- **响应速度**：端到端延迟、各阶段耗时分解（查询变换/检索/KG/重排序/生成/反思）
-- **生成质量**：ROUGE、检索相关性、忠实度自动评估
-- **吞吐量**：并发请求处理能力
-
-### 各策略组合预期延迟
-
-| 策略组合 | 查询变换 | 重排序 | 生成 | KG | 预期延迟 |
-|---------|---------|--------|------|-----|---------|
-| 快速 | 无 | 简单 | 标准 | 关 | 10-20s |
-| 精确检索 | HyDE | 简单 | 标准 | 关 | 15-25s |
-| 深度分析 | HyDE | 简单 | CoT | 开 | 25-40s |
-| 最高质量 | 多查询+HyDE | LLM | 自我修正 | 开 | 40-80s |
-
----
-
-## 技术选型与决策
-
-| 组件 | 选择 | 理由 |
-|------|------|------|
-| 主模型 | Qwen3:8B (Ollama) | 中文能力强，8B 参数量适合 16GB 显存本地运行 |
-| Embedding | BGE-M3 (Ollama) | 多语言多粒度，中文检索效果优秀 |
-| 向量数据库 | ChromaDB | 轻量级、嵌入式、零配置部署、自带持久化和元数据过滤 |
-| 后端框架 | FastAPI | 异步高性能、自动生成 OpenAPI 文档 |
-| 前端框架 | React + Vite | 开发体验好、生态丰富、HMR 快速 |
-| RAG 框架 | LangChain | 组件化设计、丰富的集成、生态成熟 |
-| 稀疏检索 | BM25 (rank_bm25) | 精确匹配法律条文编号和关键词 |
-| 中文分词 | jieba | 法律文本中文分词效果好 |
-
-### 为什么不选其他方案
-
-- **为什么不用 LlamaIndex**：LangChain 生态更成熟，自定义灵活度更高
-- **为什么不用 Milvus/Weaviate**：ChromaDB 零配置部署，适合轻量化需求
-- **为什么不用 FAISS**：ChromaDB 自带持久化和元数据过滤，更适合生产场景
-- **为什么不用 API 模型**：本地部署保障数据隐私，法律数据敏感
-- **为什么不用 Neo4j 图数据库**：犯罪知识图谱的查找需求是简单键值查找，内存字典 O(1) 即可满足
-
----
-
-## 许可证
-
-本项目仅供学习与研究使用，法律数据版权归原始数据提供方所有。
+`run_integration_test` 使用 40 个问题验证多种策略组合；`run_quality_eval` 执行问答和质量评分。两套脚本覆盖生成模型、Embedding 和 LLM Judge 的真实链路，用于产出端到端评测数据。
+
+### 7.3 工程质量设计
+
+项目通过以下机制保证管线稳定性和结果可分析性：
+
+- **策略可替换**：查询变换、重排序和生成分别由枚举配置，支持独立组合与对比；
+- **云端调用隔离**：模型客户端按需初始化，服务启动与单元测试保持零外部调用；
+- **重排自动降级**：云端排序异常时切换到轻量算法，并将降级状态写入响应指标；
+- **请求可观测**：记录查询变换、检索、知识增强、重排、生成和总耗时；
+- **质量可量化**：统一计算 ROUGE、检索相关性和回答忠实度；
+- **结果可追溯**：回答同步返回来源内容、法律元数据、重排分数和排序位置；
+- **报告可沉淀**：性能测试、质量指标和问答记录均可保存并下载为 JSON；
+- **数据与代码分离**：数据集、向量索引、密钥和运行产物通过目录规范独立管理。
