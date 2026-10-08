@@ -112,7 +112,7 @@ export default function PerformancePage() {
                 onChange={e => setEvaluateQuality(e.target.checked)}
                 disabled={running}
               />
-              <CheckSquare size={14} /> 质量评估
+              <CheckSquare size={14} /> RAG 评测
             </label>
             <button className="btn btn-primary" onClick={handleBenchmark} disabled={running || exporting}>
               {running ? <><span className="spinner" /> 测试中...</> : <><Play size={14} /> 运行测试</>}
@@ -130,7 +130,7 @@ export default function PerformancePage() {
 
         {!benchResult && !running && (
           <div className="empty-state" style={{ padding: 30 }}>
-            <p>点击"运行测试"执行基准性能测试，或"导出报告"生成含质量评估的完整报告</p>
+            <p>点击"运行测试"执行基准性能测试，或"导出报告"生成含 RAG 核心指标的完整报告</p>
           </div>
         )}
 
@@ -142,8 +142,8 @@ export default function PerformancePage() {
                 <div className="stat-label">查询数</div>
               </div>
               <div className="stat-card">
-                <div className="stat-value">{benchResult.avg_latency_ms}</div>
-                <div className="stat-label">平均延迟 (ms)</div>
+                <div className="stat-value">{benchResult.p95_latency_ms}</div>
+                <div className="stat-label">P95 Latency (ms)</div>
               </div>
               <div className="stat-card">
                 <div className="stat-value">{benchResult.avg_retrieval_ms}</div>
@@ -155,26 +155,26 @@ export default function PerformancePage() {
               </div>
             </div>
 
-            {/* 质量指标卡片 */}
+            {/* RAG 核心评测指标 */}
             {quality && (
               <div style={{ marginTop: 16 }}>
-                <h4 style={{ fontSize: 14, marginBottom: 8 }}>质量评估指标</h4>
+                <h4 style={{ fontSize: 14, marginBottom: 8 }}>RAG 核心评测指标</h4>
                 <div className="stats-grid">
                   <div className="stat-card" style={{ borderLeft: '3px solid #8b5cf6' }}>
-                    <div className="stat-value">{quality.avg_rouge_l?.toFixed(4) ?? '-'}</div>
-                    <div className="stat-label">ROUGE-L (F1)</div>
+                    <div className="stat-value">{quality.recall_at_5?.toFixed(4) ?? '-'}</div>
+                    <div className="stat-label">Recall@5</div>
                   </div>
                   <div className="stat-card" style={{ borderLeft: '3px solid #3b82f6' }}>
-                    <div className="stat-value">{quality.avg_retrieval_relevance?.toFixed(2) ?? '-'}</div>
-                    <div className="stat-label">检索相关性 (0-10)</div>
+                    <div className="stat-value">{quality.mrr_at_10?.toFixed(4) ?? '-'}</div>
+                    <div className="stat-label">MRR@10</div>
                   </div>
                   <div className="stat-card" style={{ borderLeft: '3px solid #22c55e' }}>
                     <div className="stat-value">{quality.avg_faithfulness?.toFixed(2) ?? '-'}</div>
-                    <div className="stat-label">忠实度 (0-10)</div>
+                    <div className="stat-label">Faithfulness (0-10)</div>
                   </div>
                   <div className="stat-card" style={{ borderLeft: '3px solid #f59e0b' }}>
-                    <div className="stat-value">{quality.avg_rouge_1?.toFixed(4) ?? '-'}</div>
-                    <div className="stat-label">ROUGE-1 (F1)</div>
+                    <div className="stat-value">{benchResult.p95_latency_ms ?? '-'}</div>
+                    <div className="stat-label">P95 Latency (ms)</div>
                   </div>
                 </div>
               </div>
@@ -250,8 +250,8 @@ export default function PerformancePage() {
                     {r.created_at?.replace('T', ' ').slice(0, 19)}
                   </span>
                   <span className="file-meta">
-                    查询 {r.total_queries} 条 | 延迟 {r.avg_latency_ms}ms | QPS {r.queries_per_second}
-                    {r.has_quality && ' | 含质量评估'}
+                    查询 {r.total_queries} 条 | P95 {r.p95_latency_ms}ms | QPS {r.queries_per_second}
+                    {r.has_quality && ' | 含 RAG 评测'}
                   </span>
                 </div>
                 <a

@@ -24,7 +24,8 @@ frontend/dist/
 chroma_db/
 *.log
 docs/
-backend/data/
+backend/data/*
+!backend/data/rag_eval_dataset.json
 
 # Local config
 .claude/

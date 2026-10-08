@@ -16,7 +16,7 @@ router = APIRouter(prefix="/chat", tags=["问答"])
 
 @router.post("", response_model=APIResponse)
 async def chat(req: ChatRequest):
-    """RAG 问答接口，支持系统监控和质量评估"""
+    """RAG 问答接口，支持系统监控和 RAG 评测。"""
     try:
         # 系统快照（问答前）
         system_before = None
@@ -41,7 +41,7 @@ async def chat(req: ChatRequest):
         if req.monitor_system:
             system_after = get_system_info()
 
-        # 质量评估
+        # RAG 评测
         quality = None
         if req.evaluate_quality:
             from app.services.quality_service import evaluate_single_query

@@ -41,13 +41,14 @@ def generate_report(benchmark: BenchmarkResultV2) -> ReportFull:
         "model": settings.LLM_MODEL,
         "embedding": settings.EMBEDDING_MODEL,
         "vector_db": "ChromaDB (嵌入式)",
-        "deployment": "全本地部署，无需云端 API",
+        "deployment": "本地知识库 + DashScope 模型服务",
         "avg_latency_ms": benchmark.avg_latency_ms,
+        "p95_latency_ms": benchmark.p95_latency_ms,
         "qps": benchmark.queries_per_second,
     }
     if benchmark.quality:
-        highlights["avg_rouge_l"] = benchmark.quality.avg_rouge_l
-        highlights["avg_retrieval_relevance"] = benchmark.quality.avg_retrieval_relevance
+        highlights["recall_at_5"] = benchmark.quality.recall_at_5
+        highlights["mrr_at_10"] = benchmark.quality.mrr_at_10
         highlights["avg_faithfulness"] = benchmark.quality.avg_faithfulness
 
     report = ReportFull(
@@ -86,6 +87,7 @@ def list_reports() -> list[ReportMeta]:
                 created_at=data.get("created_at", ""),
                 total_queries=bench.get("total_queries", 0),
                 avg_latency_ms=bench.get("avg_latency_ms", 0),
+                p95_latency_ms=bench.get("p95_latency_ms", 0),
                 queries_per_second=bench.get("queries_per_second", 0),
                 has_quality=bench.get("quality") is not None,
             ))

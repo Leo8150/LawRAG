@@ -167,10 +167,9 @@ export default function ChatPage() {
           </label>
           <label className="option-label" title="重排策略">
             <select className="select-small" value={rerankStrategy} onChange={e => setRerankStrategy(e.target.value)}>
-              <option value="none">无重排</option>
-              <option value="simple">简单重排</option>
-              <option value="cloud">云端专用重排（消耗额度）</option>
-              <option value="llm">Qwen评分重排（实验）</option>
+              <option value="none">不重排</option>
+              <option value="simple">轻量重排</option>
+              <option value="cloud">云端重排（消耗额度）</option>
             </select>
           </label>
           {rerankStrategy === 'cloud' && (
@@ -206,7 +205,7 @@ export default function ChatPage() {
         </label>
         <label className="option-label" style={{ color: enableQuality ? '#8b5cf6' : undefined }}>
           <input type="checkbox" checked={enableQuality} onChange={e => setEnableQuality(e.target.checked)} />
-          质量评估
+          RAG 评测
         </label>
       </div>
 
@@ -216,7 +215,7 @@ export default function ChatPage() {
             <div className="icon">&#9878;</div>
             <p>请输入法律问题，开始智能问答</p>
             <p style={{ fontSize: 12, marginTop: 8, color: 'var(--text-muted)' }}>
-              开启"性能监控"可实时查看系统状态，开启"质量评估"可评估回答质量
+              开启"性能监控"可实时查看系统状态，开启"RAG 评测"可计算检索指标与忠实度
             </p>
           </div>
         )}
@@ -337,7 +336,7 @@ export default function ChatPage() {
                     <span className="file-name" style={{ fontSize: 12 }}>{r.question || '...'}</span>
                     <span className="file-meta" style={{ fontSize: 11 }}>
                       {r.created_at?.replace('T', ' ').slice(0, 19)} | {r.total_ms}ms
-                      {r.has_quality && ' | 含质量评估'}
+                      {r.has_quality && ' | 含 RAG 评测'}
                     </span>
                   </div>
                   <a
@@ -402,9 +401,9 @@ function MonitorPanel({ msg, onSave }) {
               忠实度 {msg.quality.faithfulness.score}/10
             </span>
           )}
-          {hasQuality && msg.quality.retrieval_relevance && (
+          {hasQuality && msg.quality.retrieval && (
             <span style={{ marginLeft: 8, fontSize: 11, color: '#3b82f6' }}>
-              相关性 {msg.quality.retrieval_relevance.avg_relevance}/10
+              Recall@5 {msg.quality.retrieval.recall_at_5?.toFixed(4)}
             </span>
           )}
         </span>
@@ -427,28 +426,22 @@ function MonitorPanel({ msg, onSave }) {
             </div>
           )}
 
-          {/* 质量评估详情 */}
+          {/* RAG 评测详情 */}
           {hasQuality && (
             <div className="quality-section">
-              <h5>质量评估</h5>
+              <h5>RAG 评测</h5>
               <div className="monitor-grid">
-                {msg.quality.rouge && (
+                {msg.quality.retrieval && (
                   <>
                     <div className="monitor-card" style={{ borderLeft: '3px solid #8b5cf6' }}>
-                      <div className="monitor-value">{msg.quality.rouge.rouge_l?.toFixed(4)}</div>
-                      <div className="monitor-label">ROUGE-L</div>
+                      <div className="monitor-value">{msg.quality.retrieval.recall_at_5?.toFixed(4)}</div>
+                      <div className="monitor-label">Recall@5</div>
                     </div>
                     <div className="monitor-card" style={{ borderLeft: '3px solid #a78bfa' }}>
-                      <div className="monitor-value">{msg.quality.rouge.rouge_1?.toFixed(4)}</div>
-                      <div className="monitor-label">ROUGE-1</div>
+                      <div className="monitor-value">{msg.quality.retrieval.mrr_at_10?.toFixed(4)}</div>
+                      <div className="monitor-label">MRR@10</div>
                     </div>
                   </>
-                )}
-                {msg.quality.retrieval_relevance && (
-                  <div className="monitor-card" style={{ borderLeft: '3px solid #3b82f6' }}>
-                    <div className="monitor-value">{msg.quality.retrieval_relevance.avg_relevance}</div>
-                    <div className="monitor-label">检索相关性 ({msg.quality.retrieval_relevance.relevant_doc_count}/{msg.quality.retrieval_relevance.relevant_doc_count + (msg.sources?.length || 0) - msg.quality.retrieval_relevance.relevant_doc_count})</div>
-                  </div>
                 )}
                 {msg.quality.faithfulness && (
                   <div className="monitor-card" style={{ borderLeft: '3px solid #22c55e' }}>

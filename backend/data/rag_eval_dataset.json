@@ -1,0 +1,35 @@
+[
+  {
+    "id": "contract_formation_001",
+    "category": "合同法",
+    "question": "民法典中关于合同成立的规定是什么？",
+    "relevant_documents": [
+      {"law_name": "中华人民共和国民法典"}
+    ]
+  },
+  {
+    "id": "intentional_homicide_001",
+    "category": "刑法",
+    "question": "故意杀人罪的量刑标准是什么？",
+    "relevant_documents": [
+      {"law_name": "中华人民共和国刑法"}
+    ]
+  },
+  {
+    "id": "labor_compensation_001",
+    "category": "劳动法",
+    "question": "劳动合同法中关于经济补偿金的规定",
+    "relevant_documents": [
+      {"law_name": "中华人民共和国劳动合同法"}
+    ]
+  },
+  {
+    "id": "traffic_compensation_001",
+    "category": "交通事故",
+    "question": "交通事故损害赔偿的法律依据",
+    "relevant_documents": [
+      {"law_name": "中华人民共和国民法典"},
+      {"law_name": "中华人民共和国道路交通安全法"}
+    ]
+  }
+]

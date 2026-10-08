@@ -41,7 +41,7 @@ LawRAG 围绕法律文本特点实现以下能力：
 - 结合 BM25 关键词检索与向量语义检索，提高精确匹配和语义召回能力；
 - 支持多查询改写、HyDE、问题分解等查询变换策略；
 - 使用结构化犯罪知识补充罪名定义、构成要件和量刑信息；
-- 支持简单重排、云端专用 Reranker、LLM 实验重排和多种答案生成方式；
+- 支持不重排、轻量重排和云端专用 Reranker，并提供多种答案生成方式；
 - 返回参考来源和各阶段耗时，便于分析系统行为；
 - 提供知识库管理、问答配置、性能测试和报告导出页面。
 
@@ -92,7 +92,7 @@ flowchart TB
         KGS[犯罪知识增强<br/>kg_service.py]
         RRS[重排序<br/>reranker.py]
         PROMPT[Prompt 与生成<br/>prompts.py]
-        QUALITY[质量评测与报告<br/>quality_service.py / report_service.py]
+        QUALITY[RAG 评测与报告<br/>quality_service.py / report_service.py]
         PIPE --> QTS
         PIPE --> KGS
         PIPE --> RRS
@@ -168,7 +168,7 @@ flowchart TB
 | 向量数据库 | ChromaDB | 保存法规与案例向量及元数据 |
 | 云端重排 | DashScope `qwen3.7-text-rerank` | 对混合检索候选文档进行二次精排 |
 | 稀疏检索 | `rank-bm25`、jieba | 中文分词和关键词匹配 |
-| 质量评测 | `rouge-chinese`、LLM Judge | ROUGE、相关性和忠实度评估 |
+| RAG 评测 | 人工相关文档标注、LLM Judge | Recall@5、MRR@10、P95 Latency、Faithfulness |
 | 系统监控 | psutil | CPU 和内存使用率采集 |
 
 ### 2.3 为什么使用混合检索
@@ -223,7 +223,7 @@ backend/data/
 1. 将 Hugging Face Parquet 法规筛选并转换为独立 TXT 文件；
 2. 解压并读取 CAIL2018 数据，将案件事实和标签整理为 JSONL；
 3. 从 CrimeKgAssitant 中提取罪名定义、构成要件、量刑和相关法条；
-4. 从 QA 语料中抽取评测问题和参考答案；
+4. 整理评测问题及相关法律文档标注，生成 RAG 检索评测集；
 5. 生成后续导入脚本能够统一读取的目录和文件格式。
 
 该阶段执行确定性的本地文件转换，并支持按需下载 DISC-Law-SFT；模型调用统一集中在向量导入和在线问答阶段。
@@ -315,7 +315,13 @@ LawRAG 为两类文本分别设计分块器：
 flowchart TD
     A([用户提交问题]) --> B[POST /api/chat<br/>Pydantic 校验 ChatRequest]
     B --> C[根据请求构造 PipelineConfig]
-    C --> D{查询变换策略}
+    C --> C0{collection 检索范围}
+    C0 -->|all| C1[ChromaDB<br/>laws + cases]
+    C0 -->|laws| C2[ChromaDB<br/>laws 法律法规库]
+    C0 -->|cases| C3[ChromaDB<br/>cases 裁判案例库]
+    C1 --> D{查询变换策略}
+    C2 --> D
+    C3 --> D
 
     D -->|none| D0[保留原始问题]
     D -->|multi_query| D1[LLM 生成多个检索问题]
@@ -334,8 +340,8 @@ flowchart TD
     D3 --> E2
     D4 --> E2
 
-    E1 --> F1[中文分词<br/>BM25Okapi 关键词召回]
-    E2 --> F2[text-embedding-v3<br/>ChromaDB 语义召回]
+    E1 --> F1[中文分词 + BM25Okapi<br/>检索所选 Collection 的内存索引]
+    E2 --> F2[text-embedding-v3<br/>检索所选 ChromaDB Collection]
     F1 --> G[RRF 融合排名]
     F2 --> G
     G --> H[多查询结果去重]
@@ -348,11 +354,9 @@ flowchart TD
     K -->|none| K0[直接截取 Top K]
     K -->|simple| K1[Jaccard 词项重合<br/>元数据加权]
     K -->|cloud| K2[qwen3.7-text-rerank<br/>云端专用模型精排]
-    K -->|llm| K3[简单预筛 + 生成模型批量评分]
     K0 --> L[按 KG > 法规 > 案例排序<br/>构建 4000 字符上下文]
     K1 --> L
     K2 --> L
-    K3 --> L
 
     L --> M{生成策略}
     M -->|standard| M0[标准法律问答 Prompt]
@@ -367,13 +371,23 @@ flowchart TD
     M1 --> O
     M2 --> O
 
-    O --> P{是否开启质量评估}
-    P -->|是| P1[ROUGE + 检索相关性<br/>+ 忠实度评估]
+    O --> P{是否开启 RAG 评测}
+    P -->|是| P1[Recall@5 + MRR@10<br/>+ P95 Latency + Faithfulness]
     P -->|否| Q[组装 ChatResponse]
     P1 --> Q
     Q --> R[返回答案、来源、策略配置<br/>改写结果与各阶段耗时]
     R --> S([React 渲染回答与监控信息])
 ```
+
+每次问答都访问同一个本地 ChromaDB 持久化目录 `backend/chroma_db`，具体查询哪个 Collection 由请求参数 `collection` 决定：
+
+| `collection` 参数 | 实际查询的 ChromaDB Collection | 数据内容 |
+|---|---|---|
+| `all` | `laws` + `cases` | 同时查询法律法规与裁判案例，分别召回后统一融合 |
+| `laws` | `laws` | 法律法规、司法解释和犯罪结构化知识 |
+| `cases` | `cases` | 裁判案例与指导案例 |
+
+查询变换产生的每个原始问题、改写问题或子问题，都会在上述选定 Collection 中执行检索。普通向量查询使用问题文本，HyDE 使用生成的假设法律文档作为向量查询文本。BM25 不访问另一套数据库，而是从同一批 ChromaDB Collection 文档加载并构建内存关键词索引，因此稀疏检索和向量检索的数据范围保持一致。
 
 流程图中的每个阶段都可以定位到具体实现：
 
@@ -384,17 +398,16 @@ flowchart TD
 | 多查询改写 | LangChain Prompt、`ChatOpenAI` | `services/query_rewriter.py` | 是 |
 | HyDE | 假设文档生成、查询与文档空间对齐 | `services/hyde.py` | 是 |
 | 问题分解 | LLM 结构化拆分 | `services/query_rewriter.py` | 是 |
-| BM25 召回 | jieba、`rank_bm25.BM25Okapi` | `core/retriever.py` | 否 |
-| 向量召回 | `OpenAIEmbeddings`、ChromaDB | `core/embeddings.py`、`core/vectorstore.py` | 每次查询需要一次 Embedding |
+| BM25 召回 | jieba、`rank_bm25.BM25Okapi`；索引范围与所选 Collection 一致 | `core/retriever.py` | 否 |
+| 向量召回 | `OpenAIEmbeddings`；按请求查询 ChromaDB 的 `laws`、`cases` 或两者 | `core/embeddings.py`、`core/vectorstore.py` | 每个向量查询文本需要一次 Embedding |
 | 融合与去重 | RRF、内容哈希、Top K | `core/retriever.py`、`services/pipeline.py` | 否 |
 | 犯罪知识增强 | 罪名识别、内存字典查找、LangChain `Document` | `services/kg_service.py` | 罪名识别会调用 LLM |
 | 轻量重排序 | Jaccard、jieba、法律元数据加权 | `services/reranker.py` | 否 |
 | 云端专用重排序 | HTTPX、`qwen3.7-text-rerank` | `services/cloud_reranker.py` | 仅选择 `cloud` 时调用 |
-| 生成模型重排序 | LangChain、Qwen 批量评分 | `services/reranker.py` | 仅选择 `llm` 时调用 |
 | 上下文构建 | 文档优先级、字符预算、来源格式化 | `services/pipeline.py` | 否 |
 | 答案生成 | LCEL `prompt \| llm`、Qwen | `services/prompts.py`、`core/llm.py` | 是 |
 | 自我反思 | 引用检查、一次纠错上限 | `services/self_reflect.py` | 仅 `self_reflect` 策略调用 |
-| 质量评估 | ROUGE、LLM-as-a-Judge | `services/quality_service.py` | ROUGE 否，其余指标是 |
+| RAG 评测 | 相关文档标注、排名指标、LLM-as-a-Judge | `services/quality_service.py`、`services/perf_service.py` | 检索和延迟指标否，Faithfulness 是 |
 | 响应展示 | Pydantic、Axios、React Markdown | `models/schemas.py`、`ChatPage.jsx` | 否 |
 
 ### 4.1 查询变换
@@ -435,10 +448,9 @@ HyDE 采用“分离式检索”：原始问题交给 BM25，以保留关键词�
 
 - `none`：直接截取前 `top_k` 条；
 - `simple`：根据词项重合度和法律名称、条号、案号等元数据加权；
-- `cloud`：将融合后的候选文档批量提交给 `qwen3.7-text-rerank`，根据返回的 `relevance_score` 取 Top K；
-- `llm`：先简单预筛，再由通用生成模型批量判断候选文档相关性，主要用于实验对照。
+- `cloud`：将融合后的候选文档批量提交给 `qwen3.7-text-rerank`，根据返回的 `relevance_score` 取 Top K。
 
-启用重排后，管线将混合检索候选池扩大到 20 条，再选出最终 Top K。默认 `simple` 提供零云端调用的快速路径；`cloud` 调用专用排序模型完成高精度排序。管线内置自动降级机制，云端超时、限流或服务异常时切换到 `simple`，并通过 `rerank_fallback` 指标记录实际执行路径。
+三种策略分别承担实验基线、零云调用轻量排序和生产级云端精排职责。启用重排后，管线将混合检索候选池扩大到 20 条，再选出最终 Top K。默认 `simple` 提供零云端调用的快速路径；`cloud` 调用专用排序模型完成高精度排序。管线内置自动降级机制，云端超时、限流或服务异常时切换到 `simple`，并通过 `rerank_fallback` 指标记录实际执行路径。
 
 ### 4.5 上下文构建与答案生成
 
@@ -598,17 +610,17 @@ npm run dev
 - 后端文档：`http://127.0.0.1:8000/docs`
 - 健康检查：`http://127.0.0.1:8000/health`
 
-模型调用发生在问答、查询变换、云端重排、质量评测和索引构建阶段；服务启动与健康检查只加载配置和本地状态。
+模型调用发生在问答、查询变换、云端重排、Faithfulness 评测和索引构建阶段；Recall@5、MRR@10 与 P95 Latency 的计算不额外调用模型。
 
 ---
 
 ## 7. 测试、评测与质量保障
 
-**本章使用的核心技术**：pytest、`rouge-chinese`、jieba、LLM-as-a-Judge、psutil 和 JSON 报告。测试负责验证确定性代码，评测负责衡量非确定性的检索与生成质量。
+**本章使用的核心技术**：pytest、人工相关文档标注、排名指标、LLM-as-a-Judge、psutil 和 JSON 报告。测试负责验证确定性代码，评测从检索、生成和端到端延迟三个层面衡量 RAG 系统。
 
 ### 7.1 单元测试
 
-项目包含 27 个单元测试：
+项目使用离线单元测试覆盖管线基础能力与 RAG 指标计算：
 
 | 测试文件 | 覆盖内容 |
 |---|---|
@@ -617,6 +629,7 @@ npm run dev
 | `test_advanced_retrieval.py` | 法律术语规范化、上下文标头 |
 | `test_kg.py` | 犯罪知识加载和罪名查找 |
 | `test_cloud_reranker.py` | 云端排序请求格式、响应映射、配置检查和无网络降级 |
+| `test_rag_evaluation.py` | Recall@5、MRR@10、指标聚合和 P95 计算 |
 
 ```powershell
 cd backend
@@ -626,16 +639,25 @@ pytest tests -v
 
 测试套件将模型和网络依赖替换为可控 Mock。云端重排测试通过 `httpx.MockTransport` 验证请求、响应、排序映射与降级逻辑，形成稳定的离线回归环境。
 
-### 7.2 性能与质量评测
+### 7.2 RAG 核心评测
 
-系统可以记录查询变换、检索、KG、重排、生成和总耗时，以及 CPU、内存、平均延迟、QPS、ROUGE、检索相关性、忠实度和模型调用次数。
+项目将评测指标收敛为四项核心指标：
+
+| 指标 | 评测对象 | 计算方式 |
+|---|---|---|
+| Recall@5 | 召回覆盖率 | Top 5 命中的标准相关文档数 / 标准相关文档总数 |
+| MRR@10 | 检索排序 | Top 10 中第一个相关文档排名的倒数；未命中记为 0 |
+| P95 Latency | 端到端性能 | 批量请求延迟升序排列后的第 95 百分位值 |
+| Faithfulness | 回答忠实度 | LLM Judge 判断答案是否得到检索来源支持，分值范围 0～10 |
+
+评测数据位于 `backend/data/rag_eval_dataset.json`。每条样本包含问题、法律领域和 `relevant_documents` 标注；标注通过 `law_name`、`article_number`、`source_file` 或 `content_contains` 与召回文档元数据匹配。Recall@5 和 MRR@10 直接使用这些人工标注离线计算。
 
 ```powershell
 python -m scripts.run_integration_test
 python -m scripts.run_quality_eval
 ```
 
-`run_integration_test` 使用 40 个问题验证多种策略组合；`run_quality_eval` 执行问答和质量评分。两套脚本覆盖生成模型、Embedding 和 LLM Judge 的真实链路，用于产出端到端评测数据。
+`run_integration_test` 使用 40 个问题验证多种策略组合；`run_quality_eval` 读取标准评测集，统一输出四项核心指标并将完整结果保存到 `backend/data/reports/rag_eval_results.json`。其中 Recall@5、MRR@10 和 P95 Latency 不需要额外 Judge 调用，Faithfulness 在显式运行完整评测时调用 LLM Judge。
 
 ### 7.3 工程质量设计
 
@@ -645,7 +667,7 @@ python -m scripts.run_quality_eval
 - **云端调用隔离**：模型客户端按需初始化，服务启动与单元测试保持零外部调用；
 - **重排自动降级**：云端排序异常时切换到轻量算法，并将降级状态写入响应指标；
 - **请求可观测**：记录查询变换、检索、知识增强、重排、生成和总耗时；
-- **质量可量化**：统一计算 ROUGE、检索相关性和回答忠实度；
+- **效果可量化**：统一计算 Recall@5、MRR@10、P95 Latency 和 Faithfulness；
 - **结果可追溯**：回答同步返回来源内容、法律元数据、重排分数和排序位置；
 - **报告可沉淀**：性能测试、质量指标和问答记录均可保存并下载为 JSON；
 - **数据与代码分离**：数据集、向量索引、密钥和运行产物通过目录规范独立管理。

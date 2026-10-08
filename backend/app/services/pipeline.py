@@ -8,7 +8,7 @@ from langchain_core.documents import Document
 
 from app.core.llm import get_llm
 from app.core.retriever import get_hybrid_retriever
-from app.services.reranker import simple_rerank, llm_rerank
+from app.services.reranker import simple_rerank
 from app.services.query_rewriter import multi_query_rewrite
 from app.services.prompts import (
     LEGAL_QA_PROMPT,
@@ -34,7 +34,6 @@ class RerankStrategy(str, Enum):
     NONE = "none"
     SIMPLE = "simple"
     CLOUD = "cloud"
-    LLM = "llm"
 
 
 class GenerationStrategy(str, Enum):
@@ -117,10 +116,6 @@ class RAGPipeline:
 
         # Stage 3: 重排序
         reranked_docs = await self._rerank(question, all_docs)
-        if self.config.rerank_strategy == RerankStrategy.LLM:
-            self.metrics["llm_calls"] += 1
-            # 批量重排序节省 N-1 次调用（相比逐文档评分）
-            self.metrics["llm_calls_saved"] += max(0, len(all_docs) - 1)
 
         # Stage 4: 生成
         answer, was_corrected = await self._generate(question, reranked_docs)
@@ -269,9 +264,6 @@ class RAGPipeline:
             if strategy == RerankStrategy.SIMPLE:
                 scored = simple_rerank(question, all_docs, top_k=top_k)
                 self.metrics["reranker_model"] = "jaccard+metadata"
-            elif strategy == RerankStrategy.LLM:
-                scored = await llm_rerank(question, all_docs, top_k=top_k)
-                self.metrics["reranker_model"] = settings.LLM_MODEL
             elif strategy == RerankStrategy.CLOUD:
                 from app.services.cloud_reranker import cloud_rerank
 
@@ -295,7 +287,7 @@ class RAGPipeline:
             self.metrics["rerank_ms"] = round((time.time() - t0) * 1000, 1)
             return reranked
         except Exception:
-            # 云端/LLM 重排不可用时回退到零云调用的轻量重排。
+            # 云端重排不可用时回退到零云调用的轻量重排。
             self.metrics["rerank_fallback"] = True
             self.metrics["reranker_model"] = "jaccard+metadata (fallback)"
             scored = simple_rerank(question, all_docs, top_k=top_k)

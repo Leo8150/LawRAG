@@ -21,18 +21,15 @@ class SystemInfo(BaseModel):
     memory_total_gb: float
 
 
-# ===================== 质量评估 =====================
+# ===================== RAG 评测 =====================
 
-class RougeScores(BaseModel):
-    rouge_1: float = 0.0
-    rouge_2: float = 0.0
-    rouge_l: float = 0.0
-
-
-class RetrievalRelevanceScore(BaseModel):
-    avg_relevance: float = 0.0
-    relevant_doc_count: int = 0
-    relevance_ratio: float = 0.0
+class RetrievalMetrics(BaseModel):
+    """单条查询的标准检索评测结果。"""
+    recall_at_5: float = 0.0
+    mrr_at_10: float = 0.0
+    relevant_document_count: int = 0
+    retrieved_relevant_at_5: int = 0
+    first_relevant_rank: int | None = None
 
 
 class FaithfulnessScore(BaseModel):
@@ -41,21 +38,20 @@ class FaithfulnessScore(BaseModel):
 
 
 class QualityMetrics(BaseModel):
-    """单条查询的质量评估结果"""
+    """单条查询的 RAG 评测结果。"""
     query: str
-    rouge: RougeScores | None = None
-    retrieval_relevance: RetrievalRelevanceScore | None = None
+    retrieval: RetrievalMetrics | None = None
     faithfulness: FaithfulnessScore | None = None
 
 
 class QualityAggregated(BaseModel):
-    """汇总质量均值"""
-    avg_rouge_1: float = 0.0
-    avg_rouge_2: float = 0.0
-    avg_rouge_l: float = 0.0
-    avg_retrieval_relevance: float = 0.0
+    """RAG 评测核心指标汇总。"""
+    recall_at_5: float = 0.0
+    mrr_at_10: float = 0.0
     avg_faithfulness: float = 0.0
     evaluated_count: int = 0
+    retrieval_evaluated_count: int = 0
+    faithfulness_evaluated_count: int = 0
 
 
 # ===================== 问答 =====================
@@ -70,7 +66,7 @@ class ChatRequest(BaseModel):
     monitor_system: bool = False
     # --- Advanced pipeline options ---
     query_transform: str = Field("none", pattern=r"^(none|multi_query|hyde|decompose|multi_query_hyde)$")
-    rerank_strategy: str = Field("simple", pattern=r"^(none|simple|cloud|llm)$")
+    rerank_strategy: str = Field("simple", pattern=r"^(none|simple|cloud)$")
     generation_strategy: str = Field("standard", pattern=r"^(standard|chain_of_thought|self_reflect|structured_legal)$")
     use_kg: bool = False
 
@@ -144,10 +140,11 @@ class BenchmarkResult(BaseModel):
 
 
 class BenchmarkResultV2(BaseModel):
-    """包含质量评估的基准测试结果"""
+    """包含四项 RAG 核心指标的基准测试结果。"""
     system_info: SystemInfo
     total_queries: int
     avg_latency_ms: float
+    p95_latency_ms: float
     avg_retrieval_ms: float
     avg_generation_ms: float
     queries_per_second: float
@@ -164,6 +161,7 @@ class ReportMeta(BaseModel):
     created_at: str
     total_queries: int = 0
     avg_latency_ms: float = 0.0
+    p95_latency_ms: float = 0.0
     queries_per_second: float = 0.0
     has_quality: bool = False
 

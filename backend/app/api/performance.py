@@ -22,7 +22,7 @@ async def benchmark(
     use_rerank: bool = True,
     evaluate_quality: bool = False,
 ):
-    """运行基准测试，可选质量评估"""
+    """运行基准测试，可选 RAG 评测。"""
     result = await run_benchmark(
         queries=queries,
         use_rerank=use_rerank,
@@ -37,7 +37,7 @@ async def create_report(
     use_rerank: bool = True,
     evaluate_quality: bool = True,
 ):
-    """运行基准测试 + 质量评估，生成并保存完整报告"""
+    """运行基准测试与 RAG 评测，生成并保存完整报告。"""
     bench_result = await run_benchmark(
         queries=queries,
         use_rerank=use_rerank,

@@ -1,5 +1,6 @@
-"""性能测试服务"""
+"""RAG 核心指标与性能基准测试服务。"""
 
+import math
 import time
 import psutil
 from app.services.rag_service import rag_query
@@ -22,6 +23,14 @@ LEGAL_TEST_QUERIES = [
     "行政诉讼的受案范围",
     "最高法关于民间借贷利率的指导案例",
 ]
+
+
+def calculate_p95(latencies: list[float]) -> float:
+    """使用最近秩法计算 P95 延迟。"""
+    if not latencies:
+        return 0.0
+    ordered = sorted(latencies)
+    return ordered[max(math.ceil(len(ordered) * 0.95) - 1, 0)]
 
 
 def get_system_info() -> SystemInfo:
@@ -49,7 +58,7 @@ async def run_benchmark(
     use_rerank: bool = True,
     evaluate_quality: bool = False,
 ) -> BenchmarkResultV2:
-    """运行基准性能测试，可选质量评估"""
+    """运行基准测试，汇总 Recall@5、MRR@10、P95 Latency 和 Faithfulness。"""
     test_queries = queries or LEGAL_TEST_QUERIES[:4]
     sys_info = get_system_info()
 
@@ -57,15 +66,23 @@ async def run_benchmark(
     total_retrieval = 0.0
     total_generation = 0.0
     total_latency = 0.0
+    latencies = []
 
-    # 质量评估相关
+    # RAG 评测结果
     quality_details = []
 
     for q in test_queries:
         t0 = time.time()
         try:
-            result = await rag_query(question=q, use_rerank=use_rerank, use_query_rewrite=False)
+            # MRR@10 需要保留前 10 个检索结果；Recall@5 从其中前 5 个计算。
+            result = await rag_query(
+                question=q,
+                use_rerank=use_rerank,
+                use_query_rewrite=False,
+                top_k=10,
+            )
             latency = (time.time() - t0) * 1000
+            latencies.append(latency)
             details.append({
                 "query": q,
                 "latency_ms": round(latency, 1),
@@ -78,7 +95,7 @@ async def run_benchmark(
             total_generation += result.metrics.generation_ms
             total_latency += latency
 
-            # 质量评估
+            # 检索与忠实度评测
             if evaluate_quality:
                 from app.services.quality_service import evaluate_single_query
                 qm = await evaluate_single_query(
@@ -89,25 +106,30 @@ async def run_benchmark(
                 quality_details.append(qm)
 
         except Exception as e:
+            latency = (time.time() - t0) * 1000
             details.append({
                 "query": q,
                 "error": str(e),
-                "latency_ms": round((time.time() - t0) * 1000, 1),
+                "latency_ms": round(latency, 1),
             })
-            total_latency += (time.time() - t0) * 1000
+            total_latency += latency
+            latencies.append(latency)
 
     n = len(test_queries)
 
-    # 汇总质量指标
+    # 汇总 RAG 指标
     quality_aggregated = None
     if evaluate_quality and quality_details:
         from app.services.quality_service import aggregate_quality
         quality_aggregated = aggregate_quality(quality_details)
 
+    p95_latency = calculate_p95(latencies)
+
     return BenchmarkResultV2(
         system_info=sys_info,
         total_queries=n,
         avg_latency_ms=round(total_latency / n, 1) if n else 0,
+        p95_latency_ms=round(p95_latency, 1),
         avg_retrieval_ms=round(total_retrieval / n, 1) if n else 0,
         avg_generation_ms=round(total_generation / n, 1) if n else 0,
         queries_per_second=round(n / (total_latency / 1000), 2) if total_latency else 0,

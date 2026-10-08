@@ -19,7 +19,6 @@ RR = {
     "none": RerankStrategy.NONE,
     "simple": RerankStrategy.SIMPLE,
     "cloud": RerankStrategy.CLOUD,
-    "llm": RerankStrategy.LLM,
 }
 GS = {
     "standard": GenerationStrategy.STANDARD,
@@ -60,12 +59,12 @@ TEST_CASES = [
      "cfg": {"query_transform": "multi_query_hyde", "rerank_strategy": "simple", "generation_strategy": "self_reflect", "use_kg": True}},
     {"id": "T13", "q": "诈骗罪的立案标准是多少金额？电信诈骗有特殊规定吗？",
      "cfg": {"query_transform": "multi_query_hyde", "rerank_strategy": "simple", "generation_strategy": "self_reflect", "use_kg": True}},
-    # T14: 多查询+HyDE+LLM重排+标准
+    # T14: 多查询+HyDE+云端重排+标准
     {"id": "T14", "q": "知识产权侵权的认定标准是什么？",
-     "cfg": {"query_transform": "multi_query_hyde", "rerank_strategy": "llm", "generation_strategy": "standard", "use_kg": False}},
+     "cfg": {"query_transform": "multi_query_hyde", "rerank_strategy": "cloud", "generation_strategy": "standard", "use_kg": False}},
     # T15: 全策略
     {"id": "T15", "q": "民间借贷利率的法律上限是多少？超过部分是否受法律保护？",
-     "cfg": {"query_transform": "multi_query_hyde", "rerank_strategy": "llm", "generation_strategy": "self_reflect", "use_kg": True}},
+     "cfg": {"query_transform": "multi_query_hyde", "rerank_strategy": "cloud", "generation_strategy": "self_reflect", "use_kg": True}},
     # T16-T40: 扩展覆盖集（真实咨询语料 + 长尾领域）
     {"id": "T16", "q": "你好，请问交通事故发生了伤着住院治疗需要赔付是怎么样流程？",
      "cfg": {"query_transform": "hyde", "rerank_strategy": "simple", "generation_strategy": "standard", "use_kg": False}},
@@ -80,9 +79,9 @@ TEST_CASES = [
     {"id": "T21", "q": "有限责任公司股东变更都需要什么资料，我自己去工商局能办理吗？需要花钱吗大概流程是什么样的？",
      "cfg": {"query_transform": "decompose", "rerank_strategy": "simple", "generation_strategy": "structured_legal", "use_kg": False}},
     {"id": "T22", "q": "注册商标后有人用同样名称从事文化宣传和商业经营活动也不向注册人告知是否属于侵权属于侵权？",
-     "cfg": {"query_transform": "multi_query_hyde", "rerank_strategy": "llm", "generation_strategy": "standard", "use_kg": False}},
+     "cfg": {"query_transform": "multi_query_hyde", "rerank_strategy": "cloud", "generation_strategy": "standard", "use_kg": False}},
     {"id": "T23", "q": "分享画家作品算侵权吗？我在堆糖网找的图片发表到XX讯这个软件上上可以吗",
-     "cfg": {"query_transform": "multi_query_hyde", "rerank_strategy": "llm", "generation_strategy": "standard", "use_kg": False}},
+     "cfg": {"query_transform": "multi_query_hyde", "rerank_strategy": "cloud", "generation_strategy": "standard", "use_kg": False}},
     {"id": "T24", "q": "申请复议是什么意思，申请复议了之后该怎么办？",
      "cfg": {"query_transform": "none", "rerank_strategy": "simple", "generation_strategy": "standard", "use_kg": False}},
     {"id": "T25", "q": "对消防处罚有异议，行政处罚说我们违反了第58条，其中的人员密集场所，未经消防安全检查擅自投入使用",
