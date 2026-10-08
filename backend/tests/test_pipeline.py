@@ -46,7 +46,6 @@ def test_strategy_enum_values():
 
     # Generation
     assert GenerationStrategy("standard") == GenerationStrategy.STANDARD
-    assert GenerationStrategy("chain_of_thought") == GenerationStrategy.COT
     assert GenerationStrategy("self_reflect") == GenerationStrategy.SELF_REFLECT
     assert GenerationStrategy("structured_legal") == GenerationStrategy.STRUCTURED
 

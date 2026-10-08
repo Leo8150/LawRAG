@@ -22,7 +22,6 @@ RR = {
 }
 GS = {
     "standard": GenerationStrategy.STANDARD,
-    "chain_of_thought": GenerationStrategy.COT,
     "self_reflect": GenerationStrategy.SELF_REFLECT,
     "structured_legal": GenerationStrategy.STRUCTURED,
 }
@@ -35,11 +34,11 @@ TEST_CASES = [
      "cfg": {"query_transform": "none", "rerank_strategy": "simple", "generation_strategy": "standard", "use_kg": False}},
     {"id": "T03", "q": "行政诉讼的受案范围包括哪些？",
      "cfg": {"query_transform": "none", "rerank_strategy": "simple", "generation_strategy": "standard", "use_kg": False}},
-    # T04-T06: 刑法+KG (KG+简单+CoT)
+    # T04-T06: 刑法+KG（KG+轻量重排+结构化生成）
     {"id": "T04", "q": "故意杀人罪的量刑标准是什么？",
-     "cfg": {"query_transform": "none", "rerank_strategy": "simple", "generation_strategy": "chain_of_thought", "use_kg": True}},
+     "cfg": {"query_transform": "none", "rerank_strategy": "simple", "generation_strategy": "structured_legal", "use_kg": True}},
     {"id": "T05", "q": "盗窃罪的构成要件有哪些？入室盗窃如何加重处罚？",
-     "cfg": {"query_transform": "none", "rerank_strategy": "simple", "generation_strategy": "chain_of_thought", "use_kg": True}},
+     "cfg": {"query_transform": "none", "rerank_strategy": "simple", "generation_strategy": "structured_legal", "use_kg": True}},
     {"id": "T06", "q": "交通肇事罪和危险驾驶罪有什么区别？",
      "cfg": {"query_transform": "none", "rerank_strategy": "simple", "generation_strategy": "standard", "use_kg": True}},
     # T07-T09: 口语化 (HyDE+简单+标准)
@@ -107,7 +106,7 @@ TEST_CASES = [
     {"id": "T35", "q": "取保候审可以出国吗？就是在网上赌博做推广人员，然后被抓，去没有一个月现在想去国外旅游可以出去吗？",
      "cfg": {"query_transform": "multi_query_hyde", "rerank_strategy": "simple", "generation_strategy": "self_reflect", "use_kg": True}},
     {"id": "T36", "q": "因盗窃罪被拘留十天，后来派出所说取保候审，当时交了5000元取保金，受害人钱已退还是不是还要被判刑？",
-     "cfg": {"query_transform": "none", "rerank_strategy": "simple", "generation_strategy": "chain_of_thought", "use_kg": True}},
+     "cfg": {"query_transform": "none", "rerank_strategy": "simple", "generation_strategy": "structured_legal", "use_kg": True}},
     {"id": "T37", "q": "玩黑彩输了150万都是骗来的，范了什么法",
      "cfg": {"query_transform": "hyde", "rerank_strategy": "simple", "generation_strategy": "standard", "use_kg": False}},
     {"id": "T38", "q": "网上平台贷款受法律保护吗？？？",

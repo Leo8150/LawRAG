@@ -12,7 +12,6 @@ from app.services.reranker import simple_rerank
 from app.services.query_rewriter import multi_query_rewrite
 from app.services.prompts import (
     LEGAL_QA_PROMPT,
-    LEGAL_COT_PROMPT,
     LEGAL_STRUCTURED_PROMPT,
 )
 from app.utils.metadata import format_source_display
@@ -38,7 +37,6 @@ class RerankStrategy(str, Enum):
 
 class GenerationStrategy(str, Enum):
     STANDARD = "standard"
-    COT = "chain_of_thought"
     SELF_REFLECT = "self_reflect"
     STRUCTURED = "structured_legal"
 
@@ -308,9 +306,7 @@ class RAGPipeline:
         strategy = self.config.generation_strategy
 
         # 选择 prompt
-        if strategy == GenerationStrategy.COT:
-            prompt = LEGAL_COT_PROMPT
-        elif strategy == GenerationStrategy.STRUCTURED:
+        if strategy == GenerationStrategy.STRUCTURED:
             prompt = LEGAL_STRUCTURED_PROMPT
         else:
             prompt = LEGAL_QA_PROMPT

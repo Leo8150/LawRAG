@@ -192,9 +192,8 @@ export default function ChatPage() {
           <label className="option-label" title="生成策略">
             <select className="select-small" value={generationStrategy} onChange={e => setGenerationStrategy(e.target.value)}>
               <option value="standard">标准</option>
-              <option value="chain_of_thought">链式推理(CoT)</option>
-              <option value="self_reflect">自我修正</option>
               <option value="structured_legal">结构化法律回答</option>
+              <option value="self_reflect">自我修正</option>
             </select>
           </label>
         </div>
@@ -234,7 +233,7 @@ export default function ChatPage() {
                 <div className="pipeline-badges">
                   {msg.generationStrategy && msg.generationStrategy !== 'standard' && (
                     <span className="badge badge-strategy">
-                      {{'chain_of_thought': 'CoT推理', 'self_reflect': '自我修正', 'structured_legal': '结构化'}[msg.generationStrategy] || msg.generationStrategy}
+                      {{'self_reflect': '自我修正', 'structured_legal': '结构化'}[msg.generationStrategy] || msg.generationStrategy}
                     </span>
                   )}
                   {msg.metrics?.was_corrected && (

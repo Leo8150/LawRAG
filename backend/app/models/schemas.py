@@ -67,7 +67,7 @@ class ChatRequest(BaseModel):
     # --- Advanced pipeline options ---
     query_transform: str = Field("none", pattern=r"^(none|multi_query|hyde|decompose|multi_query_hyde)$")
     rerank_strategy: str = Field("simple", pattern=r"^(none|simple|cloud)$")
-    generation_strategy: str = Field("standard", pattern=r"^(standard|chain_of_thought|self_reflect|structured_legal)$")
+    generation_strategy: str = Field("standard", pattern=r"^(standard|self_reflect|structured_legal)$")
     use_kg: bool = False
 
 
