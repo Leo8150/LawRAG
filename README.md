@@ -372,7 +372,7 @@ flowchart TD
     M2 --> O
 
     O --> P{是否开启 RAG 评测}
-    P -->|是| P1[Recall@5 + MRR@10<br/>+ P95 Latency + Faithfulness]
+    P -->|是| P1["Recall@5 + MRR@10<br/>P95 Latency + Faithfulness"]
     P -->|否| Q[组装 ChatResponse]
     P1 --> Q
     Q --> R[返回答案、来源、策略配置<br/>改写结果与各阶段耗时]
