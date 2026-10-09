@@ -63,6 +63,11 @@ class Settings(BaseSettings):
     DEFAULT_RERANK: str = "simple"
     DEFAULT_GENERATION: str = "standard"
 
+    # --- 上下文工程与短期记忆 ---
+    CONTEXT_MAX_TOKENS: int = 4000
+    MEMORY_TTL_SECONDS: int = 86400
+    MEMORY_MAX_TURNS: int = 6
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 

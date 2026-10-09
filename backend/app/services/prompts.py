@@ -1,6 +1,6 @@
 """RAG 提示词模板"""
 
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 # ===================== 标准法律问答 =====================
 
@@ -14,8 +14,15 @@ LEGAL_QA_PROMPT = ChatPromptTemplate.from_messages([
 4. 语言简洁专业，使用法律术语
 5. 必要时区分不同情况分别作答
 
+技能目录：
+{skill_catalog}
+
+短期会话记忆：
+{memory_context}
+
 参考资料：
 {context}"""),
+    MessagesPlaceholder(variable_name="skill_messages"),
     ("human", "{question}"),
 ])
 
@@ -43,8 +50,15 @@ LEGAL_STRUCTURED_PROMPT = ChatPromptTemplate.from_messages([
 - 引用具体的法律名称和条文编号
 - 如果参考资料中没有相关信息，请诚实说明
 
+技能目录：
+{skill_catalog}
+
+短期会话记忆：
+{memory_context}
+
 参考资料：
 {context}"""),
+    MessagesPlaceholder(variable_name="skill_messages"),
     ("human", "{question}"),
 ])
 

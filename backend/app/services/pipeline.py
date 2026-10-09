@@ -1,10 +1,12 @@
 """RAG 可插拔管线 — 编排查询变换、检索、重排序、生成等阶段"""
 
 import time
+from uuid import uuid4
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 
 from langchain_core.documents import Document
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app.core.llm import get_llm
 from app.core.retriever import get_hybrid_retriever
@@ -17,6 +19,9 @@ from app.services.prompts import (
 from app.utils.metadata import format_source_display
 from app.models.schemas import ChatResponse, SourceDocument, StageMetrics
 from app.config import settings
+from app.context import FourStageContextCompactor
+from app.memory import memory_service
+from app.skills import LegalSkill, load_skill, skill_loader
 
 
 # ===================== 策略枚举 =====================
@@ -51,6 +56,7 @@ class PipelineConfig:
     use_kg: bool = False
     top_k: int = 5
     collection_names: list[str] = field(default_factory=lambda: ["laws", "cases"])
+    skill_name: str = "auto"
 
     def to_dict(self) -> dict:
         return {
@@ -60,6 +66,7 @@ class PipelineConfig:
             "use_kg": self.use_kg,
             "top_k": self.top_k,
             "collection_names": self.collection_names,
+            "skill_name": self.skill_name,
         }
 
 
@@ -86,13 +93,28 @@ class RAGPipeline:
             "rerank_candidates": 0,
             "rerank_tokens": 0,
             "rerank_fallback": False,
+            "context_compact_ms": 0,
+            "context_tokens_before": 0,
+            "context_tokens_after": 0,
+            "memory_turns": 0,
         }
 
-    async def execute(self, question: str) -> ChatResponse:
+    async def execute(self, question: str, conversation_id: str | None = None) -> ChatResponse:
         total_start = time.time()
 
+        # Stage 0: 恢复短期记忆；目录进入 system prompt，完整 Skill 通过 tool_result 注入。
+        conversation_id = conversation_id or uuid4().hex
+        memory = memory_service.load(conversation_id)
+        resolved_question, memory_context = memory_service.resolve_question(question, memory)
+        self.metrics["memory_turns"] = len(memory.turns)
+        skill, skill_messages = await self._select_skill(resolved_question)
+
+        # Skill 可以收窄数据源；调用方显式选择单库时保持调用方选择。
+        if set(self.config.collection_names) == {settings.LAWS_COLLECTION, settings.CASES_COLLECTION}:
+            self.config.collection_names = list(skill.collection_names)
+
         # Stage 1: 查询变换
-        search_queries, hyde_doc, rewritten_queries = await self._query_transform(question)
+        search_queries, hyde_doc, rewritten_queries = await self._query_transform(resolved_question)
         self.metrics["llm_calls"] += self._count_transform_calls()
 
         # Stage 2: 检索（纯检索，零 LLM 调用）
@@ -100,8 +122,12 @@ class RAGPipeline:
 
         # Stage 2.5: KG 查找（并入检索结果）
         kg_entities: list[str] = []
-        if self.config.use_kg:
-            kg_entities, kg_docs = await self._kg_lookup(question)
+        effective_use_kg = self.config.use_kg or skill.use_kg
+        if effective_use_kg:
+            kg_entities, kg_docs = await self._kg_lookup(
+                resolved_question,
+                allow_llm_fallback=self.config.use_kg,
+            )
             # KG 精确匹配命中时节省 1 次 LLM 调用
             if kg_docs:
                 self.metrics["llm_calls_saved"] += 1
@@ -113,10 +139,29 @@ class RAGPipeline:
                         existing_keys.add(key)
 
         # Stage 3: 重排序
-        reranked_docs = await self._rerank(question, all_docs)
+        reranked_docs = await self._rerank(resolved_question, all_docs)
 
-        # Stage 4: 生成
-        answer, was_corrected = await self._generate(question, reranked_docs)
+        # Stage 4: 四阶段上下文压缩（Budget -> Snip -> Micro -> Summary）
+        compact_start = time.time()
+        compact_result = FourStageContextCompactor(settings.CONTEXT_MAX_TOKENS).compact(
+            reranked_docs,
+            question=resolved_question,
+            memory_context=memory_context,
+            skill_instructions=skill.instructions,
+            priority=skill.context_priority,
+        )
+        self.metrics["context_compact_ms"] = round((time.time() - compact_start) * 1000, 1)
+        self.metrics["context_tokens_before"] = compact_result.tokens_before
+        self.metrics["context_tokens_after"] = compact_result.tokens_after
+
+        # Stage 5: 生成
+        answer, was_corrected = await self._generate(
+            resolved_question,
+            compact_result.context,
+            memory_context,
+            skill_messages,
+            skill_loader.catalog_prompt(),
+        )
         self.metrics["was_corrected"] = was_corrected
         self.metrics["llm_calls"] += 1  # 生成至少 1 次
         if was_corrected:
@@ -127,13 +172,19 @@ class RAGPipeline:
 
         # 构建来源
         sources = []
-        for doc in reranked_docs:
+        for doc in compact_result.documents:
             sources.append(SourceDocument(
                 content=doc.page_content[:500],
                 metadata=doc.metadata,
                 score=doc.metadata.get("rerank_score"),
             ))
 
+        # Stage 6: 只保存有限轮次和来源 ID，不复制整篇证据。
+        source_ids = [format_source_display(doc.metadata) for doc in compact_result.documents]
+        memory_service.append(conversation_id, question, answer, source_ids, skill.name)
+
+        config_dict = self.config.to_dict()
+        config_dict["use_kg"] = effective_use_kg
         return ChatResponse(
             answer=answer,
             sources=sources,
@@ -141,8 +192,57 @@ class RAGPipeline:
             rewritten_queries=rewritten_queries,
             kg_entities=kg_entities or None,
             generation_strategy=self.config.generation_strategy.value,
-            pipeline_config=self.config.to_dict(),
+            pipeline_config=config_dict,
+            conversation_id=conversation_id,
+            resolved_question=resolved_question if resolved_question != question else None,
+            active_skill=skill.name,
+            context_compaction=compact_result.to_dict(),
         )
+
+    async def _select_skill(self, question: str) -> tuple[LegalSkill, list[BaseMessage]]:
+        """Ask the model to call load_skill, then append the result as a ToolMessage."""
+        requested = self.config.skill_name
+        if requested == "auto":
+            selector = get_llm(temperature=0).bind_tools([load_skill], tool_choice="load_skill")
+            selection = await selector.ainvoke([
+                SystemMessage(content=(
+                    "你是 LawRAG 的技能路由器。根据用户问题，从目录中选择且只选择一个技能，"
+                    "并调用 load_skill(name)。不要直接回答法律问题。\n\n"
+                    f"{skill_loader.catalog_prompt()}"
+                )),
+                HumanMessage(content=question),
+            ])
+            self.metrics["llm_calls"] += 1
+            call = next(
+                (item for item in selection.tool_calls if item.get("name") == "load_skill"),
+                None,
+            )
+            requested = str((call or {}).get("args", {}).get("name", "general_legal"))
+            if requested not in skill_loader.available():
+                requested = "general_legal"
+            call_id = str((call or {}).get("id") or f"load-skill-{uuid4().hex}")
+        else:
+            if requested not in skill_loader.available():
+                requested = "general_legal"
+            call_id = f"load-skill-{uuid4().hex}"
+
+        # Normalize to exactly one tool call so every call has one matching result.
+        selection = AIMessage(
+            content="",
+            tool_calls=[{"name": "load_skill", "args": {"name": requested}, "id": call_id}],
+        )
+
+        # This is the only point that reads the complete SKILL.md body.
+        skill_content = load_skill.invoke({"name": requested})
+        skill = skill_loader.load(requested)
+        tool_result = ToolMessage(
+            content=skill_content,
+            tool_call_id=call_id,
+            name="load_skill",
+        )
+        # Preserve the original user message, assistant tool call and tool result
+        # as one valid message history for the next LLM invocation.
+        return skill, [HumanMessage(content=question), selection, tool_result]
 
     # ---- Stage 1: 查询变换 ----
 
@@ -235,11 +335,15 @@ class RAGPipeline:
 
     # ---- Stage 2.5: KG 查找 ----
 
-    async def _kg_lookup(self, question: str) -> tuple[list[str], list[Document]]:
+    async def _kg_lookup(
+        self,
+        question: str,
+        allow_llm_fallback: bool = True,
+    ) -> tuple[list[str], list[Document]]:
         t0 = time.time()
         try:
             from app.services.kg_service import extract_crime_entities, kg_lookup
-            entities = await extract_crime_entities(question)
+            entities = await extract_crime_entities(question, allow_llm_fallback=allow_llm_fallback)
             docs = kg_lookup(entities) if entities else []
             self.metrics["kg_lookup_ms"] = round((time.time() - t0) * 1000, 1)
             return entities, docs
@@ -300,9 +404,15 @@ class RAGPipeline:
 
     # ---- Stage 4: 生成 ----
 
-    async def _generate(self, question: str, docs: list[Document]) -> tuple[str, bool]:
+    async def _generate(
+        self,
+        question: str,
+        context: str,
+        memory_context: str,
+        skill_messages: list[BaseMessage],
+        skill_catalog: str,
+    ) -> tuple[str, bool]:
         t0 = time.time()
-        context = build_context(docs)
         strategy = self.config.generation_strategy
 
         # 选择 prompt
@@ -313,7 +423,13 @@ class RAGPipeline:
 
         llm = get_llm()
         chain = prompt | llm
-        response = await chain.ainvoke({"context": context, "question": question})
+        response = await chain.ainvoke({
+            "context": context,
+            "question": question,
+            "memory_context": memory_context or "无历史会话，本轮作为独立问题处理。",
+            "skill_catalog": skill_catalog,
+            "skill_messages": skill_messages,
+        })
         answer = response.content
         was_corrected = False
 
@@ -350,23 +466,5 @@ def resolve_collections(collection: str) -> list[str]:
 
 
 def build_context(docs: list[Document], max_length: int = 4000) -> str:
-    """构建上下文文本 — 在本地 8B 模型有限的上下文窗口(8192 tokens)下，
-    显式按文档优先级分配预算：KG 结构化知识 > 法律条文 > 案例。"""
-    if not docs:
-        return "未找到相关参考资料。"
-
-    # 按 doc_type 优先级排序：kg > law/statute > case > other
-    PRIORITY = {"kg": 0, "law": 1, "statute": 1, "case": 2}
-    sorted_docs = sorted(docs, key=lambda d: PRIORITY.get(d.metadata.get("doc_type", ""), 3))
-
-    parts = []
-    total_len = 0
-    for i, doc in enumerate(sorted_docs, 1):
-        source_label = format_source_display(doc.metadata)
-        segment = f"[来源{i}] {source_label}\n{doc.page_content}\n"
-        if total_len + len(segment) > max_length:
-            break
-        parts.append(segment)
-        total_len += len(segment)
-
-    return "\n".join(parts)
+    """兼容旧调用方式，内部统一使用四阶段上下文压缩器。"""
+    return FourStageContextCompactor(max_context_tokens=max_length).compact(docs).context

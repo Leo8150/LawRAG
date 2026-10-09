@@ -42,6 +42,9 @@ LawRAG 围绕法律文本特点实现以下能力：
 - 支持多查询改写、HyDE、问题分解等查询变换策略；
 - 使用结构化犯罪知识补充罪名定义、构成要件和量刑信息；
 - 支持不重排、轻量重排和云端专用 Reranker，并提供多种答案生成方式；
+- 使用带 TTL 的短期会话 Memory 理解“如果已经退赃呢”等连续追问；
+- 根据问题领域按需加载刑事、劳动、合同、交通或通用法律 Skill；
+- 通过 Budget、Snip、Micro、Summary 四阶段压缩控制证据上下文；
 - 返回参考来源和各阶段耗时，便于分析系统行为；
 - 提供知识库管理、问答配置、性能测试和报告导出页面。
 
@@ -88,12 +91,18 @@ flowchart TB
 
     subgraph SERVICE[业务编排层 · services]
         PIPE[RAGPipeline<br/>pipeline.py]
+        MEMORY[短期会话 Memory<br/>memory/service.py]
+        SKILL[Skill Catalog + load_skill Tool<br/>skills/loader.py / tool.py]
+        COMPACT[四阶段 Context Compact<br/>context/compactor.py]
         QTS[查询变换<br/>query_rewriter.py / hyde.py]
         KGS[犯罪知识增强<br/>kg_service.py]
         RRS[重排序<br/>reranker.py]
         PROMPT[Prompt 与生成<br/>prompts.py]
         QUALITY[RAG 评测与报告<br/>quality_service.py / report_service.py]
         PIPE --> QTS
+        PIPE --> MEMORY
+        PIPE --> SKILL
+        PIPE --> COMPACT
         PIPE --> KGS
         PIPE --> RRS
         PIPE --> PROMPT
@@ -163,6 +172,9 @@ flowchart TB
 | 前端 | React 18、Vite、Axios、Recharts | 交互界面、接口调用、性能图表 |
 | Web 后端 | FastAPI、Pydantic | REST API、参数校验、响应模型 |
 | RAG 编排 | LangChain | 文档对象、Prompt、模型链和检索器接口 |
+| 上下文工程 | Budget、Snip、Micro、Summary | Token 预算、单文档裁剪、证据去重和抽取式摘要 |
+| 会话记忆 | TTL Memory | 保存最近 6 轮问答、来源 ID 与当前 Skill，支持连续追问 |
+| 领域能力 | YAML frontmatter、`load_skill`、ToolMessage | 技能目录进入 system prompt，完整 SKILL.md 按需进入 tool_result |
 | 生成模型 | DashScope `qwen-turbo` | 查询改写、答案生成、可选评测 |
 | 向量模型 | DashScope `text-embedding-v3` | 文本向量化和语义查询 |
 | 向量数据库 | ChromaDB | 保存法规与案例向量及元数据 |
@@ -443,14 +455,19 @@ LawRAG 为两类文本分别设计分块器：
 
 ## 4. 一次问答的完整执行流程
 
-**本章使用的核心技术**：FastAPI 异步接口、Pydantic 参数校验、`dataclass + Enum` 策略配置、LangChain LCEL、BM25、向量检索、RRF、`asyncio` 并行任务、Prompt Engineering 和 LLM-as-a-Judge。
+**本章使用的核心技术**：FastAPI 异步接口、Pydantic 参数校验、短期会话 Memory、Skill Loading、四阶段 Context Compact、LangChain LCEL、BM25、向量检索、RRF、Prompt Engineering 和 LLM-as-a-Judge。
 
-用户提交问题后，请求会发送到 `POST /api/chat`。后端根据策略参数构造 `PipelineConfig`，随后由 `RAGPipeline.execute()` 依次执行四个主阶段。
+用户提交问题后，请求会发送到 `POST /api/chat`。后端根据 `conversation_id` 恢复短期记忆，补全追问语义并按需加载领域 Skill，随后由 `RAGPipeline.execute()` 完成检索、重排、四阶段上下文压缩和答案生成。
 
 ```mermaid
 flowchart TD
     A([用户提交问题]) --> B[POST /api/chat<br/>Pydantic 校验 ChatRequest]
-    B --> C[根据请求构造 PipelineConfig]
+    B --> B1[按 conversation_id 加载短期 Memory]
+    B1 --> B2[识别追问并补全当前问题]
+    B2 --> B3[system prompt 注入技能目录<br/>仅 name + description]
+    B3 --> B4[LLM 调用 load_skill name]
+    B4 --> B5[完整 SKILL.md 作为 tool_result<br/>追加到 messages]
+    B5 --> C[根据已加载 Skill 构造 PipelineConfig]
     C --> C0{collection 检索范围}
     C0 -->|all| C1[ChromaDB<br/>laws + cases]
     C0 -->|laws| C2[ChromaDB<br/>laws 法律法规库]
@@ -490,11 +507,14 @@ flowchart TD
     K -->|none| K0[直接截取 Top K]
     K -->|simple| K1[Jaccard 词项重合<br/>元数据加权]
     K -->|cloud| K2[qwen3.7-text-rerank<br/>云端专用模型精排]
-    K0 --> L[按 KG > 法规 > 案例排序<br/>构建 4000 字符上下文]
-    K1 --> L
-    K2 --> L
+    K0 --> L0[Budget<br/>计算证据 Token 预算]
+    K1 --> L0
+    K2 --> L0
+    L0 --> L1[Snip<br/>限制单篇文档占用]
+    L1 --> L2[Micro<br/>去重、排序与证据合并]
+    L2 --> L3[Summary<br/>案例与 KG 抽取式摘要]
 
-    L --> M{生成策略}
+    L3 --> M{生成策略}
     M -->|standard| M0[标准法律问答 Prompt]
     M -->|structured_legal| M2[结构化法律回答 Prompt]
     M -->|self_reflect| M3[先生成初稿]
@@ -504,8 +524,9 @@ flowchart TD
     N1 --> O
     M0 --> O
     M2 --> O
+    O --> O1[写入最近 6 轮 Memory<br/>刷新 24 小时 TTL]
 
-    O --> P{是否开启 RAG 评测}
+    O1 --> P{是否开启 RAG 评测}
     P -->|是| P1["Recall@5 + MRR@10<br/>P95 Latency + Faithfulness"]
     P -->|否| Q[组装 ChatResponse]
     P1 --> Q
@@ -529,6 +550,8 @@ flowchart TD
 |---|---|---|---|
 | 请求接收 | FastAPI、Pydantic | `api/chat.py`、`models/schemas.py` | 否 |
 | 管线配置 | Python `dataclass`、`Enum`、策略模式 | `services/pipeline.py` | 否 |
+| 短期记忆 | TTL、最近轮次窗口、追问补全 | `memory/service.py` | 否 |
+| Skill 路由与加载 | frontmatter 目录、Tool Calling、`load_skill`、ToolMessage | `skills/loader.py`、`skills/tool.py`、`backend/skills/` | `auto` 模式调用 1 次 |
 | 多查询改写 | LangChain Prompt、`ChatOpenAI` | `services/query_rewriter.py` | 是 |
 | HyDE | 假设文档生成、查询与文档空间对齐 | `services/hyde.py` | 是 |
 | 问题分解 | LLM 结构化拆分 | `services/query_rewriter.py` | 是 |
@@ -538,13 +561,47 @@ flowchart TD
 | 犯罪知识增强 | 罪名识别、内存字典查找、LangChain `Document` | `services/kg_service.py` | 罪名识别会调用 LLM |
 | 轻量重排序 | Jaccard、jieba、法律元数据加权 | `services/reranker.py` | 否 |
 | 云端专用重排序 | HTTPX、`qwen3.7-text-rerank` | `services/cloud_reranker.py` | 仅选择 `cloud` 时调用 |
-| 上下文构建 | 文档优先级、字符预算、来源格式化 | `services/pipeline.py` | 否 |
+| 上下文压缩 | Budget、Snip、Micro、Summary、来源格式化 | `context/compactor.py` | 否 |
 | 答案生成 | LCEL `prompt \| llm`、Qwen | `services/prompts.py`、`core/llm.py` | 是 |
 | 自我反思 | 引用检查、一次纠错上限 | `services/self_reflect.py` | 仅 `self_reflect` 策略调用 |
 | RAG 评测 | 相关文档标注、排名指标、LLM-as-a-Judge | `services/quality_service.py`、`services/perf_service.py` | 检索和延迟指标否，Faithfulness 是 |
 | 响应展示 | Pydantic、Axios、React Markdown | `models/schemas.py`、`ChatPage.jsx` | 否 |
 
-### 4.1 查询变换
+### 4.1 短期 Memory 与 Skill Loading
+
+前端在会话开始时生成一个 `conversation_id`，后续问题复用同一标识。后端短期 Memory 保存最近 6 轮问题、答案摘要、来源 ID 和实际 Skill，并在每次访问时刷新 24 小时 TTL。系统发现“如果已经退赃呢”“那未成年人呢”等追问后，将上一轮核心问题与当前问题组合为可独立检索的 `resolved_question`；新会话不会读取其他会话内容。
+
+```mermaid
+flowchart LR
+    subgraph START[服务启动]
+        A[扫描 skills/*/SKILL.md] --> B[解析 YAML frontmatter]
+        B --> C[name + description 技能目录]
+        C --> D[注入 system prompt]
+    end
+    subgraph RUNTIME[请求运行]
+        E[LLM 查看技能目录] --> F[调用 load_skill name]
+        F --> G[读取选中的完整 SKILL.md]
+        G --> H[以 tool_result 追加到 messages]
+        H --> I[后续 RAG 与答案生成]
+    end
+    D -.每次请求使用目录.-> E
+```
+
+项目内置五个领域 Skill：
+
+| Skill | 典型问题 | 加载后的能力 |
+|---|---|---|
+| `general_legal` | 未明确分类的一般法律问题 | 通用法律关系分析，法规优先 |
+| `criminal_law` | 盗窃、诈骗、伤害、量刑 | 自动启用 CrimeKG 本地精确匹配，优先罪名结构与刑法依据 |
+| `labor_law` | 工资、辞退、工伤、仲裁 | 强调劳动关系、仲裁时效和举证责任 |
+| `contract_law` | 借款、买卖、租赁、违约 | 强调合同效力、履行、解除和损失范围 |
+| `traffic_law` | 交通事故、酒驾、保险赔偿 | 区分行政、民事与刑事责任 |
+
+每个 `SKILL.md` 使用 YAML frontmatter 声明 `name` 和 `description`。服务启动时 `SkillLoader.scan()` 只读取这两项元数据，完整正文保持未加载；`skill_name=auto` 时，模型根据 system prompt 中的目录调用 `load_skill(name)`，Loader 才读取对应的完整 `SKILL.md`，并以 `ToolMessage` 追加到消息序列。下一次模型调用同时看到技能目录、`tool_result`、检索证据和当前问题。手动指定 `skill_name` 时跳过自动选择调用，但仍通过相同的 `load_skill → tool_result → messages` 路径加载正文。
+
+自动选择 Skill 会增加 1 次轻量 LLM 调用。刑事 Skill 自动启用 KG 时仅进行本地罪名精确匹配；只有请求显式设置 `use_kg=true` 且本地未命中时，才使用模型辅助识别罪名。
+
+### 4.2 查询变换
 
 查询变换用于缩小用户表达与法律材料之间的差异：
 
@@ -558,7 +615,7 @@ flowchart TD
 
 HyDE 采用“分离式检索”：原始问题交给 BM25，以保留关键词；假设文档交给向量检索，以缩小问题文本与法律文本之间的语义差异。
 
-### 4.2 混合检索
+### 4.3 混合检索
 
 混合检索器从 ChromaDB 读取指定 Collection 的文档，并用 jieba 分词建立内存 BM25 索引。收到查询后：
 
@@ -570,13 +627,13 @@ HyDE 采用“分离式检索”：原始问题交给 BM25，以保留关键词�
 
 用户可以只检索法规、只检索案例，或者同时检索两个 Collection。
 
-### 4.3 犯罪知识增强
+### 4.4 犯罪知识增强
 
 启用 `use_kg` 后，系统从问题中识别罪名，并在 CrimeKG 转换得到的结构化知识中精确查找定义、构成要件、量刑和相关法条。命中结果会作为高优先级文档并入检索结果。
 
 犯罪知识模块采用轻量结构化查找：将罪名映射到定义、构成要件、量刑和关联法条，以常数时间完成精确查询，省去独立图数据库的部署与维护成本。
 
-### 4.4 重排序
+### 4.5 重排序
 
 初步召回强调“尽量找到”，重排序强调“把最有用的资料放在前面”：
 
@@ -586,9 +643,18 @@ HyDE 采用“分离式检索”：原始问题交给 BM25，以保留关键词�
 
 三种策略分别承担实验基线、零云调用轻量排序和生产级云端精排职责。启用重排后，管线将混合检索候选池扩大到 20 条，再选出最终 Top K。默认 `simple` 提供零云端调用的快速路径；`cloud` 调用专用排序模型完成高精度排序。管线内置自动降级机制，云端超时、限流或服务异常时切换到 `simple`，并通过 `rerank_fallback` 指标记录实际执行路径。
 
-### 4.5 上下文构建与答案生成
+### 4.6 四阶段上下文压缩与答案生成
 
-系统按照“犯罪结构化知识 > 法律法规 > 裁判案例 > 其他文档”的优先级组织上下文。每段资料带有来源标签，总上下文默认限制在约 4,000 字符以内，避免无关内容挤占模型上下文。
+重排序结果进入 `FourStageContextCompactor`，以默认 4,000 Token 证据窗口执行四阶段压缩。整个过程使用确定性算法，不调用模型：
+
+| 阶段 | 处理方式 | 法律场景约束 |
+|---|---|---|
+| Budget | 扣除问题、短期记忆和 Skill 指令占用，计算剩余证据预算 | 为最终答案预留上下文空间 |
+| Snip | 为法条、案例和 KG 设置单文档上限 | 法条只做原文截取，不改写法律原意 |
+| Micro | 内容归一化去重，按 Skill 的证据优先级和重排分数排序 | 防止同一法条或案例重复占用预算 |
+| Summary | 超出预算时对案例和 KG 做抽取式摘要 | 摘要仅选取原句；法律条文仍保持抽取式裁剪 |
+
+压缩后的每段证据保留 `[来源N]` 标签和原始元数据。接口返回 `tokens_before`、`tokens_after`、`token_budget` 和实际文档数，便于观察压缩效果。
 
 | 生成策略 | 输出特点 |
 |---|---|
@@ -598,9 +664,9 @@ HyDE 采用“分离式检索”：原始问题交给 BM25，以保留关键词�
 
 三种策略分别承担快速基线、法律场景结构化输出和高质量纠错职责。复杂法律分析统一由 `structured_legal` 输出结论、依据和详细分析，避免重复的生成路径。
 
-最终响应还包括来源文档、查询改写结果、识别罪名、实际管线配置，以及查询变换、检索、KG、重排、生成和总耗时。
+最终响应还包括 `conversation_id`、补全后的问题、当前 Skill、上下文压缩统计、来源文档、识别罪名，以及查询变换、检索、KG、重排、压缩、生成和总耗时。
 
-### 4.6 贯穿示例：入室盗窃如何认定和处罚
+### 4.7 贯穿示例：入室盗窃如何认定和处罚
 
 下面以用户问题“进入他人住宅盗窃财物，数额不大，会构成盗窃罪吗？”为例，将离线知识库构建与在线 RAG 问答连接起来：
 
@@ -619,7 +685,11 @@ flowchart LR
     end
 
     subgraph ONLINE[在线 RAG 问答]
-        Q[用户问题<br/>入室盗窃数额不大会构成犯罪吗] --> T[查询变换或直接检索]
+        Q[用户问题<br/>入室盗窃数额不大会构成犯罪吗] --> MEM[加载短期 Memory]
+        MEM --> CAT[system prompt 提供 Skill 目录]
+        CAT --> CALL[LLM 调用 load_skill criminal_law]
+        CALL --> SK[完整 SKILL.md 进入 tool_result]
+        SK --> T[查询变换或直接检索]
         T --> V[向量检索<br/>laws + cases]
         T --> BM[BM25 检索<br/>laws + cases]
         V --> R[RRF 融合与去重]
@@ -627,9 +697,10 @@ flowchart LR
         Q --> KG[识别盗窃罪<br/>查询 CrimeKG]
         R --> RR[轻量或云端重排]
         KG --> RR
-        RR --> CTX[构建证据上下文]
+        RR --> CTX[Budget → Snip → Micro → Summary]
         CTX --> GEN[Qwen 生成结构化法律回答]
-        GEN --> OUT[返回结论、法条、分析<br/>来源和阶段指标]
+        GEN --> SAVE[更新短期 Memory]
+        SAVE --> OUT[返回结论、法条、分析<br/>来源和阶段指标]
     end
 
     D1 -.法规与罪名知识.-> V
@@ -645,10 +716,12 @@ flowchart LR
 2. **离线整理罪名知识**：CrimeKG 中“盗窃罪”的 `gainian`、`tezheng`、`chufa`、`fatiao` 等字段被展开为可检索文本，同时建立以“盗窃罪”为键的内存索引；
 3. **离线整理案例**：CAIL2018 中罪名为盗窃、关联法条为264的案件被转换为案例文档，保留案件事实、罪名、刑期和来源信息；
 4. **分别写入数据库**：刑法条文和 CrimeKG 文本写入 ChromaDB `laws`，裁判案例写入 `cases`；两类 Collection 共用 `text-embedding-v3` 的向量空间；
-5. **在线混合召回**：用户问题经过 Embedding 后查询 `laws + cases`，同时使用 BM25 匹配“入室盗窃”“数额”等关键词，RRF 合并两路排名；
-6. **知识增强与重排**：系统识别“盗窃罪”，补充 CrimeKG 的构成要件和处罚知识，再通过 `simple` 或 `cloud` 将刑法第二百六十四条、盗窃罪知识和相关案例排到前列；
-7. **基于证据生成**：`structured_legal` Prompt 要求模型按照“法律结论—适用法律—详细分析—注意事项”组织答案，并引用召回来源；
-8. **返回与评测**：接口返回答案、来源、重排分数和阶段耗时；评测任务进一步计算 Recall@5、MRR@10、P95 Latency 和 Faithfulness。
+5. **恢复会话并加载 Skill**：系统按 `conversation_id` 读取最近问答；模型从 system prompt 的技能目录中选择 `criminal_law` 并调用 `load_skill`，完整刑事规则以 `tool_result` 进入消息列表；
+6. **在线混合召回**：补全后的问题经过 Embedding 后查询 `laws + cases`，同时使用 BM25 匹配“入室盗窃”“数额”等关键词，RRF 合并两路排名；
+7. **知识增强与重排**：系统识别“盗窃罪”，补充 CrimeKG 的构成要件和处罚知识，再通过 `simple` 或 `cloud` 将刑法第二百六十四条、盗窃罪知识和相关案例排到前列；
+8. **四阶段压缩**：系统计算 Token 预算，限制单篇文档长度，去除重复证据，并在超限时抽取案例关键原句；法条原文和来源标识保持可追溯；
+9. **基于证据生成**：`structured_legal` Prompt 同时接收领域 Skill、短期记忆和压缩证据，按照“法律结论—适用法律—详细分析—注意事项”组织答案；
+10. **更新记忆与评测**：答案、问题和来源 ID 写回短期 Memory；接口返回 Skill、压缩统计、来源和阶段耗时，评测任务计算 Recall@5、MRR@10、P95 Latency 和 Faithfulness。
 
 该问题最终使用的证据上下文示意如下：
 
@@ -677,19 +750,23 @@ flowchart LR
 backend/
 ├── app/
 │   ├── api/                 # 问答、知识库、性能接口
+│   ├── context/             # Budget、Snip、Micro、Summary 四阶段压缩
 │   ├── core/                # LLM、Embedding、ChromaDB、检索器
+│   ├── memory/              # 带 TTL 的短期会话记忆
 │   ├── models/              # Pydantic 请求与响应模型
 │   ├── services/            # RAG 管线及各项策略
+│   ├── skills/              # frontmatter 扫描器、按需加载器与 load_skill 工具
 │   ├── utils/               # 法律分块和元数据工具
 │   ├── config.py            # 环境变量与默认配置
 │   └── main.py              # FastAPI 应用入口
+├── skills/                  # 各法律领域的 SKILL.md 与 config.json
 ├── scripts/                 # 数据准备、导入和评测脚本
 ├── tests/                   # 单元测试
 ├── data/                    # 本地数据和运行产物
 └── chroma_db/               # 本地向量数据库
 ```
 
-`services/pipeline.py` 是在线问答主入口。它通过枚举和 `PipelineConfig` 将查询变换、重排序、生成策略解耦，使前端能够组合不同流程，而无需复制整套问答代码。
+`services/pipeline.py` 是在线问答主入口。它串联 Memory 恢复、Skill Loading、查询变换、检索、重排序、Context Compact、生成和 Memory 更新，同时通过 `PipelineConfig` 保持各项策略可配置。
 
 ### 5.2 主要 API
 
@@ -700,6 +777,7 @@ backend/
 | `GET` | `/` | 项目基本信息 |
 | `GET` | `/health` | 服务和模型配置状态 |
 | `POST` | `/api/chat` | 执行可配置 RAG 问答 |
+| `DELETE` | `/api/chat/memory/{conversation_id}` | 清除指定会话的短期记忆 |
 | `POST` | `/api/chat/save-record` | 保存问答记录 |
 | `GET` | `/api/chat/records` | 查询问答记录 |
 | `POST` | `/api/knowledge/upload` | 上传法规或案例文件 |
@@ -722,6 +800,8 @@ backend/
   "rerank_strategy": "simple",
   "generation_strategy": "standard",
   "use_kg": false,
+  "conversation_id": "7ed4fef8aab44f20831b78495cebd8f2",
+  "skill_name": "auto",
   "top_k": 5,
   "evaluate_quality": false
 }
@@ -729,7 +809,7 @@ backend/
 
 ### 5.3 前端页面
 
-- **智能问答**：输入问题，配置 Collection、查询变换、重排、KG 和生成策略，查看回答、来源及阶段耗时；
+- **智能问答**：复用同一 `conversation_id` 完成多轮追问，可自动或手动选择领域 Skill，并查看回答、来源及阶段耗时；
 - **知识库管理**：查看文件与 Chunk 数量，上传 TXT、Markdown 或 JSON 文件，删除文件并重建索引；
 - **性能监控**：查看 CPU/内存，执行基准测试，展示延迟分解和质量指标，导出历史报告。
 
@@ -772,6 +852,9 @@ DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 RERANKER_MODEL=qwen3.7-text-rerank
 RERANKER_CANDIDATE_K=20
 RERANKER_DOCUMENT_MAX_CHARS=1200
+CONTEXT_MAX_TOKENS=4000
+MEMORY_TTL_SECONDS=86400
+MEMORY_MAX_TURNS=6
 ```
 
 复制 `backend/.env.example` 为 `backend/.env` 并填写环境变量。真实密钥仅保存在 `.env`，该文件已被 Git 忽略。云端 Reranker 使用带业务空间 ID 的独立文本排序 Endpoint，Chat 和 Embedding 使用 OpenAI 兼容地址。
@@ -810,7 +893,7 @@ npm run dev
 - 后端文档：`http://127.0.0.1:8000/docs`
 - 健康检查：`http://127.0.0.1:8000/health`
 
-模型调用发生在问答、查询变换、云端重排、Faithfulness 评测和索引构建阶段；Recall@5、MRR@10 与 P95 Latency 的计算不额外调用模型。
+模型调用发生在自动 Skill 选择、问答、查询变换、云端重排、Faithfulness 评测和索引构建阶段；手动指定 Skill 可以跳过自动选择调用，Recall@5、MRR@10 与 P95 Latency 的计算不额外调用模型。
 
 ---
 
@@ -830,6 +913,7 @@ npm run dev
 | `test_kg.py` | 犯罪知识加载和罪名查找 |
 | `test_cloud_reranker.py` | 云端排序请求格式、响应映射、配置检查和无网络降级 |
 | `test_rag_evaluation.py` | Recall@5、MRR@10、指标聚合和 P95 计算 |
+| `test_context_memory_skills.py` | 四阶段压缩、TTL Memory、frontmatter 扫描、按需正文加载和 `load_skill` Tool |
 
 ```powershell
 cd backend
@@ -864,6 +948,9 @@ python -m scripts.run_quality_eval
 项目通过以下机制保证管线稳定性和结果可分析性：
 
 - **策略可替换**：查询变换、重排序和生成分别由枚举配置，支持独立组合与对比；
+- **上下文有预算**：四阶段压缩限制输入规模，保留法条原文、来源标签和高相关证据；
+- **多轮可隔离**：会话以 `conversation_id` 隔离，仅保存最近 6 轮并使用 TTL 自动过期；
+- **能力按需加载**：启动时只有技能目录进入 system prompt，完整 `SKILL.md` 仅在 `load_skill` 调用后以 tool_result 注入；
 - **云端调用隔离**：模型客户端按需初始化，服务启动与单元测试保持零外部调用；
 - **重排自动降级**：云端排序异常时切换到轻量算法，并将降级状态写入响应指标；
 - **请求可观测**：记录查询变换、检索、知识增强、重排、生成和总耗时；

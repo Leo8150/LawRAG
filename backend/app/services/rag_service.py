@@ -23,6 +23,8 @@ async def rag_query(
     rerank_strategy: str = "simple",
     generation_strategy: str = "standard",
     use_kg: bool = False,
+    conversation_id: str | None = None,
+    skill_name: str = "auto",
 ) -> ChatResponse:
     """
     执行完整的 RAG 查询流程（向后兼容入口）
@@ -47,7 +49,8 @@ async def rag_query(
         use_kg=use_kg,
         top_k=top_k,
         collection_names=resolve_collections(collection),
+        skill_name=skill_name,
     )
 
     pipeline = RAGPipeline(config)
-    return await pipeline.execute(question)
+    return await pipeline.execute(question, conversation_id=conversation_id)

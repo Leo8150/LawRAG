@@ -1,6 +1,7 @@
 """Pydantic 数据模型"""
 
 from datetime import datetime
+from uuid import uuid4
 from pydantic import BaseModel, Field
 
 
@@ -69,6 +70,11 @@ class ChatRequest(BaseModel):
     rerank_strategy: str = Field("simple", pattern=r"^(none|simple|cloud)$")
     generation_strategy: str = Field("standard", pattern=r"^(standard|self_reflect|structured_legal)$")
     use_kg: bool = False
+    conversation_id: str = Field(default_factory=lambda: uuid4().hex, min_length=8, max_length=64)
+    skill_name: str = Field(
+        "auto",
+        pattern=r"^(auto|general_legal|criminal_law|labor_law|contract_law|traffic_law)$",
+    )
 
 
 class SourceDocument(BaseModel):
@@ -94,6 +100,10 @@ class StageMetrics(BaseModel):
     rerank_candidates: int = 0
     rerank_tokens: int = 0
     rerank_fallback: bool = False
+    context_compact_ms: float = 0.0
+    context_tokens_before: int = 0
+    context_tokens_after: int = 0
+    memory_turns: int = 0
 
 
 class ChatResponse(BaseModel):
@@ -108,6 +118,10 @@ class ChatResponse(BaseModel):
     kg_entities: list[str] | None = None
     generation_strategy: str | None = None
     pipeline_config: dict | None = None
+    conversation_id: str | None = None
+    resolved_question: str | None = None
+    active_skill: str | None = None
+    context_compaction: dict | None = None
 
 
 # ===================== 知识库 =====================

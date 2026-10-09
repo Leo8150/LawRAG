@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { Send, Activity, ChevronDown, ChevronUp, Download, Save, Clock, FileText } from 'lucide-react'
-import { sendChat, getSystemInfo, saveChatRecord, listChatRecords, getChatRecordDownloadUrl } from '../services/api'
+import { sendChat, clearConversationMemory, getSystemInfo, saveChatRecord, listChatRecords, getChatRecordDownloadUrl } from '../services/api'
 
 export default function ChatPage() {
   const [messages, setMessages] = useState([])
@@ -18,6 +18,10 @@ export default function ChatPage() {
   const [rerankStrategy, setRerankStrategy] = useState('simple')
   const [generationStrategy, setGenerationStrategy] = useState('standard')
   const [useKg, setUseKg] = useState(false)
+  const [skillName, setSkillName] = useState('auto')
+  const conversationIdRef = useRef(
+    globalThis.crypto?.randomUUID?.() || `lawrag-${Date.now()}`
+  )
 
   // 实时监控
   const [liveMonitor, setLiveMonitor] = useState(null)
@@ -95,6 +99,8 @@ export default function ChatPage() {
         rerankStrategy,
         generationStrategy,
         useKg,
+        conversationId: conversationIdRef.current,
+        skillName,
       })
 
       // 停止实时监控
@@ -113,6 +119,8 @@ export default function ChatPage() {
         kgEntities: result.kg_entities,
         generationStrategy: result.generation_strategy,
         pipelineConfig: result.pipeline_config,
+        activeSkill: result.active_skill,
+        contextCompaction: result.context_compaction,
       }])
     } catch (err) {
       stopLiveMonitor()
@@ -130,6 +138,15 @@ export default function ChatPage() {
       e.preventDefault()
       handleSend()
     }
+  }
+
+  const handleNewConversation = async () => {
+    const previousId = conversationIdRef.current
+    conversationIdRef.current = globalThis.crypto?.randomUUID?.() || `lawrag-${Date.now()}`
+    setMessages([])
+    try {
+      await clearConversationMemory(previousId)
+    } catch { /* 新会话已经完成，旧会话交给 TTL 回收 */ }
   }
 
   // 保存单条记录
@@ -186,6 +203,15 @@ export default function ChatPage() {
             <input type="checkbox" checked={useKg} onChange={e => setUseKg(e.target.checked)} />
             KG增强
           </label>
+          <select className="select-small" value={skillName} onChange={e => setSkillName(e.target.value)} title="按需加载法律领域 Skill">
+            <option value="auto">Skill 自动路由</option>
+            <option value="general_legal">通用法律</option>
+            <option value="criminal_law">刑事法律</option>
+            <option value="labor_law">劳动法律</option>
+            <option value="contract_law">合同法律</option>
+            <option value="traffic_law">交通法律</option>
+          </select>
+          <button className="btn-sm" onClick={handleNewConversation} disabled={loading}>新会话</button>
         </div>
         <div className="option-group">
           <span className="option-group-label">生成配置</span>
@@ -239,6 +265,9 @@ export default function ChatPage() {
                   {msg.metrics?.was_corrected && (
                     <span className="badge badge-corrected">已修正</span>
                   )}
+                  {msg.activeSkill && (
+                    <span className="badge badge-strategy">Skill: {msg.activeSkill}</span>
+                  )}
                 </div>
               )}
 
@@ -277,6 +306,8 @@ export default function ChatPage() {
                   {msg.metrics.reranker_model && <span className="metric-tag">{msg.metrics.reranker_model}</span>}
                   {msg.metrics.rerank_tokens > 0 && <span className="metric-tag">重排 {msg.metrics.rerank_tokens} tokens</span>}
                   {msg.metrics.rerank_fallback && <span className="metric-tag">重排已降级</span>}
+                  <span className="metric-tag">上下文 {msg.metrics.context_tokens_before}→{msg.metrics.context_tokens_after} tokens</span>
+                  <span className="metric-tag">Memory {msg.metrics.memory_turns} 轮</span>
                   <span className="metric-tag">生成 {msg.metrics.generation_ms}ms</span>
                   {msg.metrics.self_reflect_ms != null && <span className="metric-tag">反思 {msg.metrics.self_reflect_ms}ms</span>}
                   <span className="metric-tag">总计 {msg.metrics.total_ms}ms</span>

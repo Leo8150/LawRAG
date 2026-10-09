@@ -3,6 +3,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
+from app.skills import skill_loader
 from app.api import chat, knowledge, performance
 
 app = FastAPI(
@@ -12,6 +13,10 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+# 启动时只扫描 SKILL.md frontmatter，将 name + description 缓存为技能目录。
+# 完整正文仅在运行期调用 load_skill(name) 时读取。
+skill_loader.scan()
 
 # CORS 中间件
 app.add_middleware(

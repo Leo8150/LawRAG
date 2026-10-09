@@ -1,0 +1,6 @@
+{
+  "display_name": "刑事法律问答",
+  "collection_names": ["laws", "cases"],
+  "use_kg": true,
+  "context_priority": {"kg": 0, "law": 1, "statute": 1, "case": 2}
+}

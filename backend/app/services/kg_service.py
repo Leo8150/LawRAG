@@ -73,7 +73,7 @@ def _load_crime_kg() -> dict[str, dict]:
 
 # ===================== 实体提取 =====================
 
-async def extract_crime_entities(question: str) -> list[str]:
+async def extract_crime_entities(question: str, allow_llm_fallback: bool = True) -> list[str]:
     """从用户问题中提取涉及的罪名，模糊匹配 KG 中的标准罪名"""
     kg = _load_crime_kg()
     if not kg:
@@ -86,6 +86,10 @@ async def extract_crime_entities(question: str) -> list[str]:
             matched.append(crime_name)
     if matched:
         return matched[:3]
+
+    # Skill 自动开启 KG 时只执行本地精确匹配，避免引入隐式模型调用。
+    if not allow_llm_fallback:
+        return []
 
     # LLM 提取
     try:

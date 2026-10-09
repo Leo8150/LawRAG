@@ -34,6 +34,8 @@ async def chat(req: ChatRequest):
             rerank_strategy=req.rerank_strategy,
             generation_strategy=req.generation_strategy,
             use_kg=req.use_kg,
+            conversation_id=req.conversation_id,
+            skill_name=req.skill_name,
         )
 
         # 系统快照（问答后）
@@ -58,6 +60,15 @@ async def chat(req: ChatRequest):
         return APIResponse(data=result.model_dump())
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"问答服务异常: {e}")
+
+
+@router.delete("/memory/{conversation_id}", response_model=APIResponse)
+async def clear_conversation_memory(conversation_id: str):
+    """清除指定会话的短期记忆。"""
+    from app.memory import memory_service
+
+    cleared = memory_service.clear(conversation_id)
+    return APIResponse(data={"conversation_id": conversation_id, "cleared": cleared})
 
 
 @router.post("/save-record", response_model=APIResponse)

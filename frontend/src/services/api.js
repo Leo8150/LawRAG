@@ -19,6 +19,8 @@ export async function sendChat({
   rerankStrategy = 'simple',
   generationStrategy = 'standard',
   useKg = false,
+  conversationId,
+  skillName = 'auto',
 }) {
   const res = await api.post('/chat', {
     question,
@@ -32,7 +34,14 @@ export async function sendChat({
     rerank_strategy: rerankStrategy,
     generation_strategy: generationStrategy,
     use_kg: useKg,
+    conversation_id: conversationId,
+    skill_name: skillName,
   })
+  return res.data.data
+}
+
+export async function clearConversationMemory(conversationId) {
+  const res = await api.delete(`/chat/memory/${encodeURIComponent(conversationId)}`)
   return res.data.data
 }
 
