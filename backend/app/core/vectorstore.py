@@ -25,3 +25,16 @@ def get_vectorstore(collection_name: str) -> Chroma:
 def reset_store_cache():
     """清空向量库缓存（在重建索引后调用）"""
     _store_cache.clear()
+
+
+def add_child_documents(collection_name: str, documents: list, child_ids: list[str]) -> None:
+    """Index child chunks with child_chunk_id as the vector record ID."""
+    if len(documents) != len(child_ids):
+        raise ValueError("documents 与 child_ids 数量不一致")
+    if documents:
+        get_vectorstore(collection_name).add_documents(documents, ids=child_ids)
+
+
+def delete_child_vectors(collection_name: str, child_ids: list[str]) -> None:
+    if child_ids:
+        get_vectorstore(collection_name).delete(ids=child_ids)

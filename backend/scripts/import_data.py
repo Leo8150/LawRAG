@@ -17,8 +17,8 @@ import json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.config import settings
-from app.core.vectorstore import get_vectorstore, reset_store_cache
-from app.utils.legal_chunker import split_legal_document
+from app.db.repository import get_parent_child_repository
+from app.services.ingestion_service import persist_and_index, prepare_document
 
 
 def read_file(filepath: str) -> str:
@@ -45,13 +45,7 @@ def collect_files(dir_path: str, extensions: set[str]) -> list[str]:
     return results
 
 
-def _batch_add_documents(store, chunks, batch_size: int = 5000):
-    """分批添加文档，避免超出 ChromaDB 单批限制"""
-    for i in range(0, len(chunks), batch_size):
-        store.add_documents(chunks[i:i + batch_size])
-
-
-def import_laws(store, dir_path: str) -> int:
+def import_laws(repository, dir_path: str) -> int:
     """导入法律条文 (.txt 文件)"""
     files = collect_files(dir_path, {".txt", ".md"})
     if not files:
@@ -63,11 +57,20 @@ def import_laws(store, dir_path: str) -> int:
         fname = os.path.basename(fpath)
         try:
             text = read_file(fpath)
-            chunks = split_legal_document(text, doc_type="law", filename=fname)
-            if chunks:
-                _batch_add_documents(store, chunks)
-                total_chunks += len(chunks)
-                print(f"  ✓ {fname}: {len(chunks)} 个分块")
+            tree = prepare_document(
+                text,
+                doc_type="law",
+                source_file=fname,
+                source_path=fpath,
+                dataset_name="laws",
+            )
+            persist_and_index(
+                tree,
+                collection_name=settings.LAWS_COLLECTION,
+                repository=repository,
+            )
+            total_chunks += len(tree.child_ids)
+            print(f"  ✓ {fname}: {len(tree.document.parents)} 个父块 / {len(tree.child_ids)} 个子块")
         except Exception as e:
             print(f"  ✗ {fname}: {e}")
 
@@ -115,7 +118,7 @@ def _extract_case_text(obj: dict) -> tuple[str, dict]:
     return "", extra_meta
 
 
-def import_cases_jsonl(store, dir_path: str, max_cases: int = 5000) -> int:
+def import_cases_jsonl(repository, dir_path: str, max_cases: int = 5000) -> int:
     """导入 JSONL 格式的案例文件
 
     自动识别多种格式（CAIL2019-SCM, CAIL2018, 通用JSONL）。
@@ -134,7 +137,6 @@ def import_cases_jsonl(store, dir_path: str, max_cases: int = 5000) -> int:
 
         try:
             with open(fpath, "r", encoding="utf-8") as f:
-                batch_chunks = []
                 for line_no, line in enumerate(f, 1):
                     if case_count >= max_cases:
                         break
@@ -150,28 +152,26 @@ def import_cases_jsonl(store, dir_path: str, max_cases: int = 5000) -> int:
                     if not text or len(text) < 50:
                         continue
 
-                    case_label = f"案例{case_count + 1}"
-                    chunks = split_legal_document(
-                        text, doc_type="case", filename=f"{fname}:{case_label}"
+                    tree = prepare_document(
+                        text,
+                        doc_type="case",
+                        source_file=fname,
+                        source_path=fpath,
+                        dataset_name="cases",
+                        source_record_id=str(line_no),
                     )
-                    # 附加额外元数据
-                    for chunk in chunks:
-                        chunk.metadata.update(extra_meta)
-
-                    batch_chunks.extend(chunks)
+                    tree.document.document_metadata.update(extra_meta)
+                    for parent in tree.document.parents:
+                        parent.chunk_metadata.update(extra_meta)
+                    persist_and_index(
+                        tree,
+                        collection_name=settings.CASES_COLLECTION,
+                        repository=repository,
+                    )
                     case_count += 1
-
-                    # 批量写入
-                    if len(batch_chunks) >= 200:
-                        store.add_documents(batch_chunks)
-                        total_chunks += len(batch_chunks)
-                        print(f"    已导入 {case_count} 条案例 ({total_chunks} 个分块)")
-                        batch_chunks = []
-
-                # 写入剩余
-                if batch_chunks:
-                    store.add_documents(batch_chunks)
-                    total_chunks += len(batch_chunks)
+                    total_chunks += len(tree.child_ids)
+                    if case_count % 100 == 0:
+                        print(f"    已导入 {case_count} 条案例 ({total_chunks} 个子块)")
 
                 print(f"  ✓ {fname}: {case_count} 条案例, {total_chunks} 个分块")
 
@@ -190,20 +190,20 @@ def main():
     print("LawRAG — 法律检索增强问答系统 — 数据导入")
     print("=" * 55)
 
-    reset_store_cache()
+    repository = get_parent_child_repository()
+    repository.create_schema()
 
     # --- 法律条文 ---
     print(f"\n[1/2] 导入法律条文 ({settings.LAWS_DIR})")
-    laws_store = get_vectorstore(settings.LAWS_COLLECTION)
-    laws_count = import_laws(laws_store, settings.LAWS_DIR)
+    laws_count = import_laws(repository, settings.LAWS_DIR)
 
     # --- 案例 ---
     print(f"\n[2/2] 导入案例 ({settings.CASES_DIR})")
-    cases_store = get_vectorstore(settings.CASES_COLLECTION)
-    cases_count = import_cases_jsonl(cases_store, settings.CASES_DIR, max_cases=5000)
+    cases_count = import_cases_jsonl(repository, settings.CASES_DIR, max_cases=5000)
 
     print(f"\n{'=' * 55}")
-    print(f"导入完成: 法律条文 {laws_count} 块, 案例 {cases_count} 块")
+    print(f"导入完成: 法律子块 {laws_count} 块, 案例子块 {cases_count} 块")
+    print(f"MySQL: {settings.MYSQL_URL.split('@')[-1]}")
     print(f"向量数据库: {settings.CHROMA_PERSIST_DIR}")
 
 

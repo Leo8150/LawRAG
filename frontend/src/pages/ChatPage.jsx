@@ -308,6 +308,8 @@ export default function ChatPage() {
                   {msg.metrics.rerank_fallback && <span className="metric-tag">重排已降级</span>}
                   <span className="metric-tag">上下文 {msg.metrics.context_tokens_before}→{msg.metrics.context_tokens_after} tokens</span>
                   <span className="metric-tag">Memory {msg.metrics.memory_turns} 轮</span>
+                  <span className="metric-tag">Child {msg.metrics.retrieved_child_count}→{msg.metrics.reranked_child_count}</span>
+                  <span className="metric-tag">Parent {msg.metrics.parent_candidate_count}</span>
                   <span className="metric-tag">生成 {msg.metrics.generation_ms}ms</span>
                   {msg.metrics.self_reflect_ms != null && <span className="metric-tag">反思 {msg.metrics.self_reflect_ms}ms</span>}
                   <span className="metric-tag">总计 {msg.metrics.total_ms}ms</span>

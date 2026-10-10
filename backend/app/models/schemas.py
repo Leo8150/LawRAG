@@ -104,6 +104,9 @@ class StageMetrics(BaseModel):
     context_tokens_before: int = 0
     context_tokens_after: int = 0
     memory_turns: int = 0
+    retrieved_child_count: int = 0
+    reranked_child_count: int = 0
+    parent_candidate_count: int = 0
 
 
 class ChatResponse(BaseModel):

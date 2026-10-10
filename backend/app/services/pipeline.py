@@ -22,6 +22,7 @@ from app.config import settings
 from app.context import FourStageContextCompactor
 from app.memory import memory_service
 from app.skills import LegalSkill, load_skill, skill_loader
+from app.db.repository import ParentChildRepository, get_parent_child_repository
 
 
 # ===================== 策略枚举 =====================
@@ -75,8 +76,13 @@ class PipelineConfig:
 class RAGPipeline:
     """可插拔 RAG 管线，按配置调度各阶段策略"""
 
-    def __init__(self, config: PipelineConfig):
+    def __init__(
+        self,
+        config: PipelineConfig,
+        repository: ParentChildRepository | None = None,
+    ):
         self.config = config
+        self.repository = repository
         self.metrics: dict = {
             "query_rewrite_ms": None,
             "retrieval_ms": 0,
@@ -97,6 +103,9 @@ class RAGPipeline:
             "context_tokens_before": 0,
             "context_tokens_after": 0,
             "memory_turns": 0,
+            "retrieved_child_count": 0,
+            "reranked_child_count": 0,
+            "parent_candidate_count": 0,
         }
 
     async def execute(self, question: str, conversation_id: str | None = None) -> ChatResponse:
@@ -117,34 +126,39 @@ class RAGPipeline:
         search_queries, hyde_doc, rewritten_queries = await self._query_transform(resolved_question)
         self.metrics["llm_calls"] += self._count_transform_calls()
 
-        # Stage 2: 检索（纯检索，零 LLM 调用）
-        all_docs = await self._retrieve(search_queries, hyde_doc)
+        # Stage 2: Child 检索；Chroma 返回 ID，MySQL 批量回查权威 Child 文本。
+        child_docs = await self._retrieve(search_queries, hyde_doc)
+        self.metrics["retrieved_child_count"] = len(child_docs)
 
         # Stage 2.5: KG 查找（并入检索结果）
         kg_entities: list[str] = []
+        kg_docs: list[Document] = []
         effective_use_kg = self.config.use_kg or skill.use_kg
         if effective_use_kg:
             kg_entities, kg_docs = await self._kg_lookup(
                 resolved_question,
                 allow_llm_fallback=self.config.use_kg,
             )
-            # KG 精确匹配命中时节省 1 次 LLM 调用
+            # KG 是结构化父级证据，不进入 Child Reranker。
             if kg_docs:
                 self.metrics["llm_calls_saved"] += 1
-                existing_keys = {hash(d.page_content[:200]) for d in all_docs}
-                for kd in kg_docs:
-                    key = hash(kd.page_content[:200])
-                    if key not in existing_keys:
-                        all_docs.insert(0, kd)
-                        existing_keys.add(key)
 
-        # Stage 3: 重排序
-        reranked_docs = await self._rerank(resolved_question, all_docs)
+        # Stage 3: 只重排 Child，然后按 parent_chunk_id 聚合并回查 Parent。
+        reranked_children = await self._rerank(
+            resolved_question,
+            child_docs,
+            top_k=max(self.config.top_k, settings.CHILD_RERANK_TOP_K),
+        )
+        self.metrics["reranked_child_count"] = len(reranked_children)
+        parent_docs = self._aggregate_and_hydrate_parents(reranked_children)
+        self.metrics["parent_candidate_count"] = len(parent_docs)
+        if kg_docs:
+            parent_docs = kg_docs + parent_docs
 
         # Stage 4: 四阶段上下文压缩（Budget -> Snip -> Micro -> Summary）
         compact_start = time.time()
         compact_result = FourStageContextCompactor(settings.CONTEXT_MAX_TOKENS).compact(
-            reranked_docs,
+            parent_docs,
             question=resolved_question,
             memory_context=memory_context,
             skill_instructions=skill.instructions,
@@ -301,13 +315,23 @@ class RAGPipeline:
     async def _retrieve(self, search_queries: list[str], hyde_doc: str | None) -> list[Document]:
         t0 = time.time()
         # 重排序需要更大的候选池；不重排时只召回最终所需数量。
-        candidate_k = self.config.top_k
+        candidate_k = max(self.config.top_k, settings.CHILD_RERANK_TOP_K)
         if self.config.rerank_strategy != RerankStrategy.NONE:
-            candidate_k = max(candidate_k, settings.RERANKER_CANDIDATE_K)
-        retriever = get_hybrid_retriever(self.config.collection_names, k=candidate_k)
+            candidate_k = max(
+                candidate_k,
+                settings.RERANKER_CANDIDATE_K,
+                settings.CHILD_RERANK_TOP_K * 2,
+            )
+        repository = self.repository or get_parent_child_repository()
+        self.repository = repository
+        retriever = get_hybrid_retriever(
+            self.config.collection_names,
+            k=candidate_k,
+            repository=repository,
+        )
 
         all_docs: list[Document] = []
-        seen_contents: set[int] = set()
+        seen_child_ids: set[str] = set()
 
         if hyde_doc:
             # 使用 split query: BM25 用原始查询, 向量用假设文档
@@ -316,18 +340,18 @@ class RAGPipeline:
                 vector_query=hyde_doc,
             )
             for doc in docs:
-                key = hash(doc.page_content[:200])
-                if key not in seen_contents:
-                    seen_contents.add(key)
+                key = str(doc.metadata.get("child_chunk_id", ""))
+                if key and key not in seen_child_ids:
+                    seen_child_ids.add(key)
                     all_docs.append(doc)
 
         # 常规多查询检索
         for q in search_queries:
             docs = retriever.invoke(q)
             for doc in docs:
-                key = hash(doc.page_content[:200])
-                if key not in seen_contents:
-                    seen_contents.add(key)
+                key = str(doc.metadata.get("child_chunk_id", ""))
+                if key and key not in seen_child_ids:
+                    seen_child_ids.add(key)
                     all_docs.append(doc)
 
         self.metrics["retrieval_ms"] = round((time.time() - t0) * 1000, 1)
@@ -353,9 +377,14 @@ class RAGPipeline:
 
     # ---- Stage 3: 重排序 ----
 
-    async def _rerank(self, question: str, all_docs: list[Document]) -> list[Document]:
+    async def _rerank(
+        self,
+        question: str,
+        all_docs: list[Document],
+        top_k: int | None = None,
+    ) -> list[Document]:
         strategy = self.config.rerank_strategy
-        top_k = self.config.top_k
+        top_k = top_k or self.config.top_k
 
         if strategy == RerankStrategy.NONE or not all_docs:
             return all_docs[:top_k]
@@ -388,6 +417,7 @@ class RAGPipeline:
                 reranked.append(doc)
             self.metrics["rerank_ms"] = round((time.time() - t0) * 1000, 1)
             return reranked
+
         except Exception:
             # 云端重排不可用时回退到零云调用的轻量重排。
             self.metrics["rerank_fallback"] = True
@@ -401,6 +431,53 @@ class RAGPipeline:
                 reranked.append(doc)
             self.metrics["rerank_ms"] = round((time.time() - t0) * 1000, 1)
             return reranked
+
+    def _aggregate_and_hydrate_parents(self, children: list[Document]) -> list[Document]:
+        """Rank parents by their best child score plus a capped coverage bonus."""
+        if not children:
+            return []
+        groups: dict[str, list[Document]] = {}
+        legacy: list[Document] = []
+        for child in children:
+            parent_id = str(child.metadata.get("parent_chunk_id", ""))
+            if not parent_id:
+                legacy.append(child)
+                continue
+            groups.setdefault(parent_id, []).append(child)
+
+        parent_scores: dict[str, float] = {}
+        for parent_id, hits in groups.items():
+            scores = [
+                float(hit.metadata.get("rerank_score", hit.metadata.get("rrf_score", 0.0)) or 0.0)
+                for hit in hits
+            ]
+            coverage = min(max(len(hits) - 1, 0), 3)
+            parent_scores[parent_id] = max(scores, default=0.0) + settings.PARENT_HIT_BONUS * coverage
+
+        parent_limit = max(self.config.top_k, settings.PARENT_TOP_K)
+        parent_ids = [
+            parent_id for parent_id, _ in
+            sorted(parent_scores.items(), key=lambda item: item[1], reverse=True)[:parent_limit]
+        ]
+        if not parent_ids:
+            return legacy[:parent_limit]
+
+        repository = self.repository or get_parent_child_repository()
+        self.repository = repository
+        parents = repository.fetch_parents(parent_ids)
+        for parent in parents:
+            parent_id = str(parent.metadata.get("parent_chunk_id", ""))
+            hits = groups.get(parent_id, [])
+            parent.metadata["parent_score"] = round(parent_scores.get(parent_id, 0.0), 6)
+            parent.metadata["rerank_score"] = round(parent_scores.get(parent_id, 0.0), 6)
+            parent.metadata["matched_child_ids"] = [
+                hit.metadata.get("child_chunk_id") for hit in hits
+            ]
+            parent.metadata["matched_child_count"] = len(hits)
+            parent.metadata["matched_child_preview"] = [
+                hit.page_content[:180] for hit in hits[:3]
+            ]
+        return parents + legacy[: max(0, parent_limit - len(parents))]
 
     # ---- Stage 4: 生成 ----
 

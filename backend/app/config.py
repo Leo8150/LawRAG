@@ -39,6 +39,16 @@ class Settings(BaseSettings):
     LAWS_COLLECTION: str = "laws"
     CASES_COLLECTION: str = "cases"
 
+    # --- MySQL 原文库（唯一事实来源）---
+    MYSQL_URL: str = "mysql+pymysql://root:password@127.0.0.1:3306/lawrag?charset=utf8mb4"
+    MYSQL_ECHO: bool = False
+    CHUNKER_VERSION: str = "parent-child-v1"
+    CHILD_CHUNK_SIZE: int = 320
+    CHILD_CHUNK_OVERLAP: int = 64
+    CHILD_RERANK_TOP_K: int = 15
+    PARENT_TOP_K: int = 5
+    PARENT_HIT_BONUS: float = 0.02
+
     # --- 检索 ---
     RETRIEVAL_TOP_K: int = 10
     BM25_WEIGHT: float = 0.5

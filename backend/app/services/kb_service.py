@@ -4,9 +4,9 @@ import os
 import json
 from pathlib import Path
 from langchain_core.documents import Document
-from app.core.vectorstore import get_vectorstore, reset_store_cache
-from app.core.embeddings import get_embeddings
-from app.utils.legal_chunker import split_legal_document
+from app.core.vectorstore import delete_child_vectors, reset_store_cache
+from app.db.repository import get_parent_child_repository
+from app.services.ingestion_service import persist_and_index, prepare_document
 from app.models.schemas import KnowledgeFileInfo, KnowledgeStats
 from app.config import settings
 
@@ -63,18 +63,17 @@ def _count_files(dir_path: str) -> int:
 def get_kb_stats() -> KnowledgeStats:
     """获取知识库统计信息"""
     stats = KnowledgeStats()
-    for name in [settings.LAWS_COLLECTION, settings.CASES_COLLECTION]:
-        try:
-            store = get_vectorstore(name)
-            count = store._collection.count()
-            if name == settings.LAWS_COLLECTION:
-                stats.laws_chunks = count
-            else:
-                stats.cases_chunks = count
-            stats.total_chunks += count
-            stats.collections.append(name)
-        except Exception:
-            continue
+    try:
+        counts = get_parent_child_repository().child_counts_by_doc_type()
+        stats.laws_chunks = counts.get("law", 0)
+        stats.cases_chunks = counts.get("case", 0)
+        stats.total_chunks = stats.laws_chunks + stats.cases_chunks
+        if stats.laws_chunks:
+            stats.collections.append(settings.LAWS_COLLECTION)
+        if stats.cases_chunks:
+            stats.collections.append(settings.CASES_COLLECTION)
+    except Exception:
+        pass
 
     stats.total_files = _count_files(settings.LAWS_DIR) + _count_files(settings.CASES_DIR)
     return stats
@@ -99,20 +98,25 @@ async def upload_document(
     with open(filepath, "wb") as f:
         f.write(content)
 
-    # 读取并分块
+    # MySQL 保存原文与父子块，ChromaDB 只索引 Child。
     text = _read_text_file(filepath)
-    chunks = split_legal_document(text, doc_type=doc_type, filename=filename)
-
-    # 写入向量库
+    tree = prepare_document(
+        text,
+        doc_type=doc_type,
+        source_file=filename,
+        source_path=filepath,
+        dataset_name="upload",
+    )
     collection_name = settings.CASES_COLLECTION if doc_type == "case" else settings.LAWS_COLLECTION
-    store = get_vectorstore(collection_name)
-    store.add_documents(chunks)
+    repository = get_parent_child_repository()
+    repository.create_schema()
+    persist_and_index(tree, collection_name=collection_name, repository=repository)
 
     return KnowledgeFileInfo(
         filename=filename,
         doc_type=doc_type,
         size_bytes=len(content),
-        chunk_count=len(chunks),
+        chunk_count=len(tree.child_ids),
     )
 
 
@@ -138,20 +142,29 @@ def list_documents() -> list[KnowledgeFileInfo]:
 # ===================== 删除文档 =====================
 
 def delete_document(filename: str) -> bool:
-    """删除文档文件（需要重建索引才能从向量库移除）"""
+    """Delete source file, its MySQL tree and all derived child vectors."""
+    repository = get_parent_child_repository()
+    for doc_id, doc_type in repository.document_ids_by_source_file(os.path.basename(filename)):
+        child_ids = repository.child_ids_for_document(doc_id)
+        collection = settings.CASES_COLLECTION if doc_type == "case" else settings.LAWS_COLLECTION
+        delete_child_vectors(collection, child_ids)
+        repository.delete_document(doc_id)
+
+    removed = False
     for dir_path in [settings.LAWS_DIR, settings.CASES_DIR]:
         fpath = os.path.join(dir_path, filename)
         if os.path.isfile(fpath):
             os.remove(fpath)
-            return True
-    return False
+            removed = True
+    return removed
 
 
 # ===================== 重建索引 =====================
 
 async def rebuild_index() -> KnowledgeStats:
-    """从 data/ 目录重建全部向量索引"""
+    """Rebuild MySQL parent-child data and derived Child vector indexes."""
     import chromadb
+    from scripts.import_data import import_cases_jsonl, import_laws
 
     # 清除现有数据
     reset_store_cache()
@@ -161,70 +174,11 @@ async def rebuild_index() -> KnowledgeStats:
             client.delete_collection(name)
         except Exception:
             pass
-
-    # --- 法律条文 ---
-    law_chunks: list[Document] = []
-    for fpath in _collect_files(settings.LAWS_DIR, {".txt", ".md"}):
-        try:
-            text = _read_text_file(fpath)
-            chunks = split_legal_document(text, doc_type="law", filename=os.path.basename(fpath))
-            law_chunks.extend(chunks)
-        except Exception:
-            continue
-
-    if law_chunks:
-        reset_store_cache()
-        store = get_vectorstore(settings.LAWS_COLLECTION)
-        batch_size = 100
-        for i in range(0, len(law_chunks), batch_size):
-            store.add_documents(law_chunks[i : i + batch_size])
-
-    # --- 案例 (JSONL) ---
-    case_chunks: list[Document] = []
-    case_count = 0
-    max_cases = 500
-    for fpath in _collect_files(settings.CASES_DIR, {".json"}):
-        try:
-            with open(fpath, "r", encoding="utf-8") as f:
-                for line in f:
-                    if case_count >= max_cases:
-                        break
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    text = obj.get("A", "")
-                    if not text or len(text) < 50:
-                        continue
-                    chunks = split_legal_document(
-                        text, doc_type="case",
-                        filename=f"{os.path.basename(fpath)}:案例{case_count + 1}",
-                    )
-                    case_chunks.extend(chunks)
-                    case_count += 1
-        except Exception:
-            continue
-        if case_count >= max_cases:
-            break
-
-    # 也导入 txt 格式案例
-    for fpath in _collect_files(settings.CASES_DIR, {".txt", ".md"}):
-        try:
-            text = _read_text_file(fpath)
-            chunks = split_legal_document(text, doc_type="case", filename=os.path.basename(fpath))
-            case_chunks.extend(chunks)
-        except Exception:
-            continue
-
-    if case_chunks:
-        reset_store_cache()
-        store = get_vectorstore(settings.CASES_COLLECTION)
-        batch_size = 100
-        for i in range(0, len(case_chunks), batch_size):
-            store.add_documents(case_chunks[i : i + batch_size])
-
+    repository = get_parent_child_repository()
+    repository.create_schema()
+    repository.reset_all()
+    reset_store_cache()
+    import_laws(repository, settings.LAWS_DIR)
+    import_cases_jsonl(repository, settings.CASES_DIR, max_cases=5000)
     reset_store_cache()
     return get_kb_stats()

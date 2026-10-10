@@ -122,3 +122,15 @@ export async function listChatRecords() {
 export function getChatRecordDownloadUrl(recordId) {
   return `/api/chat/records/${encodeURIComponent(recordId)}`
 }
+
+// ===================== 来源追溯 =====================
+
+export async function getChunkSource(chunkId) {
+  const res = await api.get(`/sources/chunks/${encodeURIComponent(chunkId)}`)
+  return res.data.data
+}
+
+export async function getDocumentSource(docId) {
+  const res = await api.get(`/sources/documents/${encodeURIComponent(docId)}`)
+  return res.data.data
+}

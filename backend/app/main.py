@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.skills import skill_loader
-from app.api import chat, knowledge, performance
+from app.api import chat, knowledge, performance, sources
 
 app = FastAPI(
     title=f"LawRAG — {settings.APP_NAME}",
@@ -31,6 +31,7 @@ app.add_middleware(
 app.include_router(chat.router, prefix=settings.API_PREFIX)
 app.include_router(knowledge.router, prefix=settings.API_PREFIX)
 app.include_router(performance.router, prefix=settings.API_PREFIX)
+app.include_router(sources.router, prefix=settings.API_PREFIX)
 
 
 @app.get("/")

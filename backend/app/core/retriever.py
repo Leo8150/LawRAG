@@ -1,4 +1,4 @@
-"""混合检索器 — BM25 稀疏检索 + 向量稠密检索 + RRF 融合"""
+"""Child-level hybrid retrieval with authoritative MySQL hydration."""
 
 import jieba
 from langchain_core.documents import Document
@@ -7,6 +7,7 @@ from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from rank_bm25 import BM25Okapi
 from app.core.vectorstore import get_vectorstore
 from app.config import settings
+from app.db.repository import ParentChildRepository, get_parent_child_repository
 
 
 class BM25ChineseRetriever(BaseRetriever):
@@ -46,7 +47,7 @@ class BM25ChineseRetriever(BaseRetriever):
 
 
 class HybridRetriever(BaseRetriever):
-    """混合检索器：BM25 + 向量检索 + RRF 融合"""
+    """Retrieve child IDs, fuse ranks, then batch-hydrate text from MySQL."""
 
     bm25_retriever: BM25ChineseRetriever | None = None
     collection_names: list[str] = ["laws", "cases"]
@@ -54,6 +55,7 @@ class HybridRetriever(BaseRetriever):
     vector_weight: float = settings.VECTOR_WEIGHT
     k: int = settings.RETRIEVAL_TOP_K
     all_documents: list[Document] = []
+    repository: object | None = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -62,6 +64,7 @@ class HybridRetriever(BaseRetriever):
         self,
         collection_names: list[str] | None = None,
         k: int | None = None,
+        repository: ParentChildRepository | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -69,22 +72,17 @@ class HybridRetriever(BaseRetriever):
             self.collection_names = collection_names
         if k is not None:
             self.k = k
+        self.repository = repository or get_parent_child_repository()
         self._load_bm25_corpus()
 
     def _load_bm25_corpus(self):
-        """从向量库加载文档构建 BM25 索引"""
-        all_docs = []
-        for name in self.collection_names:
-            try:
-                store = get_vectorstore(name)
-                result = store._collection.get(include=["documents", "metadatas"])
-                if result and result["documents"]:
-                    for doc_text, meta in zip(
-                        result["documents"], result["metadatas"] or [{}] * len(result["documents"])
-                    ):
-                        all_docs.append(Document(page_content=doc_text, metadata=meta or {}))
-            except Exception:
-                continue
+        """Load authoritative child text from MySQL for the sparse index."""
+        doc_types = []
+        if settings.LAWS_COLLECTION in self.collection_names:
+            doc_types.append("law")
+        if settings.CASES_COLLECTION in self.collection_names:
+            doc_types.append("case")
+        all_docs = self.repository.list_children(doc_types)  # type: ignore[union-attr]
         self.all_documents = all_docs
         if all_docs:
             self.bm25_retriever = BM25ChineseRetriever(documents=all_docs, k=self.k)
@@ -92,38 +90,45 @@ class HybridRetriever(BaseRetriever):
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun
     ) -> list[Document]:
-        """RRF (Reciprocal Rank Fusion) 混合检索"""
-        results_map: dict[str, dict] = {}  # content_hash -> {doc, rrf_score}
+        """RRF by child_chunk_id, followed by one MySQL batch lookup."""
+        return self._search(query, query)
+
+    def _search(self, bm25_query: str, vector_query: str) -> list[Document]:
+        results_map: dict[str, float] = {}
         rrf_k = 60  # RRF 常数
 
         # BM25 检索
         if self.bm25_retriever:
-            bm25_results = self.bm25_retriever.invoke(query)
+            bm25_results = self.bm25_retriever.invoke(bm25_query)
             for rank, doc in enumerate(bm25_results):
-                key = hash(doc.page_content[:200])
+                key = str(doc.metadata.get("child_chunk_id", ""))
+                if not key:
+                    continue
                 score = self.bm25_weight / (rrf_k + rank + 1)
-                if key in results_map:
-                    results_map[key]["score"] += score
-                else:
-                    results_map[key] = {"doc": doc, "score": score}
+                results_map[key] = results_map.get(key, 0.0) + score
 
         # 向量检索
         for name in self.collection_names:
             try:
-                vec_results = get_vectorstore(name).similarity_search(query, k=self.k)
+                vec_results = get_vectorstore(name).similarity_search(vector_query, k=self.k)
                 for rank, doc in enumerate(vec_results):
-                    key = hash(doc.page_content[:200])
+                    key = str(doc.metadata.get("child_chunk_id", ""))
+                    if not key:
+                        continue
                     score = self.vector_weight / (rrf_k + rank + 1)
-                    if key in results_map:
-                        results_map[key]["score"] += score
-                    else:
-                        results_map[key] = {"doc": doc, "score": score}
+                    results_map[key] = results_map.get(key, 0.0) + score
             except Exception:
                 continue
 
-        # 按 RRF 分数排序
-        sorted_results = sorted(results_map.values(), key=lambda x: x["score"], reverse=True)
-        return [item["doc"] for item in sorted_results[: self.k]]
+        ranked_ids = [
+            child_id for child_id, _ in
+            sorted(results_map.items(), key=lambda item: item[1], reverse=True)[: self.k]
+        ]
+        hydrated = self.repository.fetch_children(ranked_ids)  # type: ignore[union-attr]
+        for doc in hydrated:
+            child_id = str(doc.metadata.get("child_chunk_id", ""))
+            doc.metadata["rrf_score"] = round(results_map.get(child_id, 0.0), 8)
+        return hydrated
 
     def search_with_split_queries(
         self, bm25_query: str, vector_query: str
@@ -132,42 +137,14 @@ class HybridRetriever(BaseRetriever):
 
         用于 HyDE 场景：bm25_query 为原始问题，vector_query 为假设文档。
         """
-        results_map: dict[int, dict] = {}
-        rrf_k = 60
-
-        # BM25 检索（使用原始查询）
-        if self.bm25_retriever:
-            bm25_results = self.bm25_retriever.invoke(bm25_query)
-            for rank, doc in enumerate(bm25_results):
-                key = hash(doc.page_content[:200])
-                score = self.bm25_weight / (rrf_k + rank + 1)
-                if key in results_map:
-                    results_map[key]["score"] += score
-                else:
-                    results_map[key] = {"doc": doc, "score": score}
-
-        # 向量检索（使用假设文档 / HyDE 文本）
-        for name in self.collection_names:
-            try:
-                vec_results = get_vectorstore(name).similarity_search(vector_query, k=self.k)
-                for rank, doc in enumerate(vec_results):
-                    key = hash(doc.page_content[:200])
-                    score = self.vector_weight / (rrf_k + rank + 1)
-                    if key in results_map:
-                        results_map[key]["score"] += score
-                    else:
-                        results_map[key] = {"doc": doc, "score": score}
-            except Exception:
-                continue
-
-        sorted_results = sorted(results_map.values(), key=lambda x: x["score"], reverse=True)
-        return [item["doc"] for item in sorted_results[: self.k]]
+        return self._search(bm25_query, vector_query)
 
 
 def get_hybrid_retriever(
     collection_names: list[str] | None = None,
     k: int | None = None,
+    repository: ParentChildRepository | None = None,
 ) -> HybridRetriever:
     """获取混合检索器"""
     names = collection_names or ["laws", "cases"]
-    return HybridRetriever(collection_names=names, k=k)
+    return HybridRetriever(collection_names=names, k=k, repository=repository)

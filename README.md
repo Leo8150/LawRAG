@@ -2,7 +2,7 @@
 
 LawRAG 是一个面向中国法律咨询场景的检索增强生成（Retrieval-Augmented Generation，RAG）项目。系统将法律法规、裁判案例和犯罪知识整理为可检索知识库，在回答问题前先查找依据，再由大语言模型结合检索结果生成回答。
 
-项目采用前后端分离架构：后端使用 FastAPI 和 LangChain 编排 RAG 流程，ChromaDB 保存向量索引，DashScope 提供生成与向量模型；前端使用 React 构建问答、知识库管理和性能评测页面。
+项目采用前后端分离架构：后端使用 FastAPI 和 LangChain 编排 RAG 流程，MySQL 保存原始文档及父子 Chunk，ChromaDB 仅保存 Child Chunk 向量索引，两个存储通过稳定 ID 关联；DashScope 提供生成、向量与可选重排模型，前端使用 React 构建问答、来源追溯、知识库管理和性能评测页面。
 
 > 一句话理解：LawRAG 不是让模型仅凭参数记忆回答法律问题，而是先从法律知识库寻找证据，再基于证据组织答案。
 
@@ -38,6 +38,8 @@ LawRAG 围绕法律文本特点实现以下能力：
 
 - 以法律“编、章、节、条、款、项”结构进行分块，尽量保持法条语义完整；
 - 对法律法规和裁判案例采用不同的分块策略；
+- 使用 Document → Parent Chunk → Child Chunk 三级结构，兼顾召回精度和证据完整性；
+- 以 MySQL 作为原文事实库，以 `child_chunk_id`、`parent_chunk_id` 关联 ChromaDB 派生索引；
 - 结合 BM25 关键词检索与向量语义检索，提高精确匹配和语义召回能力；
 - 支持多查询改写、HyDE、问题分解等查询变换策略；
 - 使用结构化犯罪知识补充罪名定义、构成要件和量刑信息；
@@ -50,21 +52,13 @@ LawRAG 围绕法律文本特点实现以下能力：
 
 ### 1.3 数据规模
 
-系统建立了两类 ChromaDB Collection：
-
-| Collection | 内容 | 向量记录数 |
-|---|---|---:|
-| `laws` | 法律法规、司法材料、犯罪结构化知识 | 35,242 |
-| `cases` | 经过预处理的裁判案例 | 5,000 |
-| 合计 | 法律知识库 | 40,242 |
-
-原始数据与向量库通过 `.gitignore` 和代码仓库分离，部署流程使用数据准备脚本构建独立的本地索引。
+知识库采用三层统计口径：MySQL `documents` 记录原始文档，`parent_chunks` 记录进入生成阶段的完整法律证据，`child_chunks` 记录参与 BM25 和向量召回的细粒度片段。ChromaDB 的 `laws`、`cases` Collection 与 MySQL Child 一一对应，向量记录 ID 等于 `child_chunk_id`。`GET /api/knowledge/stats` 动态返回当前已导入的 Child 数量，不在文档中固化易失效的数据规模。
 
 ---
 
 ## 2. 系统架构与技术选型
 
-**本章使用的核心技术**：React、FastAPI、Pydantic、LangChain、ChromaDB、BM25、DashScope。系统按表现层、接口层、业务编排层、能力层和数据层分层，离线建库与在线问答共用同一套知识存储。
+**本章使用的核心技术**：React、FastAPI、Pydantic、LangChain、SQLAlchemy、MySQL、ChromaDB、BM25、DashScope。系统按表现层、接口层、业务编排层、能力层和数据层分层，MySQL 是权威事实库，ChromaDB 是可重建的 Child 向量索引。
 
 ### 2.1 总体架构
 
@@ -110,26 +104,37 @@ flowchart TB
 
     subgraph CORE[检索与模型能力层 · core]
         HYBRID[HybridRetriever<br/>retriever.py]
-        BM25[BM25Okapi + jieba]
-        VECTOR[Chroma 相似度检索]
-        RRF[RRF 排名融合]
+        BM25[MySQL Child 语料<br/>BM25Okapi + jieba]
+        VECTOR[Chroma Child 向量召回<br/>返回 child_chunk_id]
+        RRF[Child ID 级 RRF 融合]
+        HYDRATE[MySQL 批量回查 Child]
+        CHILD_RERANK[Child Reranker]
+        PARENT[按 parent_chunk_id 聚合<br/>回查 Parent]
         LLM[ChatOpenAI<br/>qwen-turbo]
         EMB[OpenAIEmbeddings<br/>text-embedding-v3]
         HYBRID --> BM25
         HYBRID --> VECTOR
         BM25 --> RRF
         VECTOR --> RRF
+        RRF --> HYDRATE --> CHILD_RERANK --> PARENT
     end
 
     subgraph DATA[数据与存储层]
         RAW[法规 / 案例 / QA 原始数据]
         PREP[prepare_datasets.py<br/>清洗与格式转换]
-        SPLIT[LegalArticleSplitter<br/>LegalCaseSplitter]
-        LAWS[(ChromaDB · laws)]
-        CASES[(ChromaDB · cases)]
+        SPLIT[ParentChildChunker<br/>稳定 doc / parent / child ID]
+        MYSQL_DOC[(MySQL documents<br/>原始全文)]
+        MYSQL_PARENT[(MySQL parent_chunks<br/>完整证据)]
+        MYSQL_CHILD[(MySQL child_chunks<br/>细粒度文本)]
+        LAWS[(ChromaDB · laws<br/>Child vectors)]
+        CASES[(ChromaDB · cases<br/>Child vectors)]
         KGDATA[(CrimeKG 结构化知识)]
         REPORTS[(评测报告 / 问答记录)]
-        RAW --> PREP --> SPLIT --> EMB
+        RAW --> PREP --> SPLIT
+        SPLIT --> MYSQL_DOC
+        SPLIT --> MYSQL_PARENT
+        SPLIT --> MYSQL_CHILD
+        MYSQL_CHILD --> EMB
         EMB --> LAWS
         EMB --> CASES
         PREP --> KGDATA
@@ -148,7 +153,7 @@ flowchart TB
     PERFAPI --> QUALITY
     PIPE --> HYBRID
     PIPE --> QUALITY
-    RRF --> PIPE
+    PARENT --> PIPE
     KGS --> KGDATA
     VECTOR --> LAWS
     VECTOR --> CASES
@@ -160,8 +165,8 @@ flowchart TB
 
 系统包含两条主链路：
 
-- **离线建库链路**：原始数据 → 格式转换 → 元数据提取 → 结构化分块 → Embedding → ChromaDB；
-- **在线问答链路**：用户问题 → 查询变换 → 混合检索 → 知识增强 → 重排序 → 答案生成。
+- **离线建库链路**：原始数据 → Parent/Child 分块 → MySQL 持久化 → Child Embedding → ChromaDB；
+- **在线问答链路**：问题 → Child 混合召回 → MySQL 回查 Child → Child 重排序 → Parent 聚合与回查 → 上下文压缩 → 答案生成。
 
 离线建库只在首次导入或知识库变化时执行，在线问答则在每次用户提问时执行。
 
@@ -172,13 +177,14 @@ flowchart TB
 | 前端 | React 18、Vite、Axios、Recharts | 交互界面、接口调用、性能图表 |
 | Web 后端 | FastAPI、Pydantic | REST API、参数校验、响应模型 |
 | RAG 编排 | LangChain | 文档对象、Prompt、模型链和检索器接口 |
+| 原文事实库 | MySQL 8、SQLAlchemy 2、PyMySQL | 保存 Documents、Parent Chunks、Child Chunks 和来源位置 |
 | 上下文工程 | Budget、Snip、Micro、Summary | Token 预算、单文档裁剪、证据去重和抽取式摘要 |
 | 会话记忆 | TTL Memory | 保存最近 6 轮问答、来源 ID 与当前 Skill，支持连续追问 |
 | 领域能力 | YAML frontmatter、`load_skill`、ToolMessage | 技能目录进入 system prompt，完整 SKILL.md 按需进入 tool_result |
 | 生成模型 | DashScope `qwen-turbo` | 查询改写、答案生成、可选评测 |
 | 向量模型 | DashScope `text-embedding-v3` | 文本向量化和语义查询 |
-| 向量数据库 | ChromaDB | 保存法规与案例向量及元数据 |
-| 云端重排 | DashScope `qwen3.7-text-rerank` | 对混合检索候选文档进行二次精排 |
+| 向量数据库 | ChromaDB | 仅保存 Child Embedding、`child_chunk_id` 和过滤字段 |
+| 云端重排 | DashScope `qwen3.7-text-rerank` | 对 MySQL 回查的 Child 文本精排，不重复重排 Parent |
 | 稀疏检索 | `rank-bm25`、jieba | 中文分词和关键词匹配 |
 | RAG 评测 | 人工相关文档标注、LLM Judge | Recall@5、MRR@10、P95 Latency、Faithfulness |
 | 系统监控 | psutil | CPU 和内存使用率采集 |
@@ -199,7 +205,7 @@ RRF_score = weight / (60 + rank + 1)
 
 ## 3. 数据准备与知识库构建
 
-**本章使用的核心技术**：Python 文件处理、PyArrow、JSON/JSONL、正则表达式、LangChain `RecursiveCharacterTextSplitter`、`OpenAIEmbeddings` 和 ChromaDB。目标是把不同格式的原始数据转换为统一的 `Document + metadata + vector` 结构。
+**本章使用的核心技术**：Python 文件处理、PyArrow、JSON/JSONL、正则表达式、LangChain `RecursiveCharacterTextSplitter`、SQLAlchemy、MySQL、`OpenAIEmbeddings` 和 ChromaDB。目标是把多源原始数据转换为可追溯的 Document、Parent、Child 与 Child Vector。
 
 ### 3.1 数据来源
 
@@ -241,7 +247,7 @@ backend/data/
 《中华人民共和国反家庭暴力法》第二条规定，本法所称家庭暴力，是指……
 ```
 
-导入后形成 `law_name`、`article_number`、`source_file` 等元数据，并写入 ChromaDB 的 `laws` Collection。
+导入后形成 `law_name`、`article_number`、`source_file` 等元数据；原文和父子块写入 MySQL，Child 向量写入 ChromaDB `laws` Collection。
 
 #### 3.1.2 Chinese Law and Regulations：法规 Parquet
 
@@ -335,7 +341,7 @@ CAIL2018 每行是一份刑事案件及其裁判标签：
 }
 ```
 
-预处理后保留案件事实、罪名、相关法条、被告人和刑期，案例分块后写入 `cases` Collection。
+预处理后保留案件事实、罪名、相关法条、被告人和刑期；案例 Parent / Child 写入 MySQL，Child 向量写入 ChromaDB `cases` Collection。
 
 #### 3.1.5 CAIL2019 与 RAG 评测标注
 
@@ -391,37 +397,41 @@ flowchart TD
     A4 --> B
     B --> C{文档类型判断}
 
-    C -->|law| D1[LegalArticleSplitter<br/>按编章节目条款项切分]
-    C -->|case| D2[LegalCaseSplitter<br/>按案情与裁判结构切分]
+    C -->|law| D1[生成 Parent<br/>完整法条或法律结构单元]
+    C -->|case| D2[生成 Parent<br/>案情、裁判理由或结果]
     C -->|crime knowledge| D3[解析罪名、定义、构成要件<br/>量刑和相关法条]
 
     D1 --> E[正则提取元数据]
     D2 --> E
     D3 --> E
-    E --> F[加入 source_file、doc_type<br/>law_name、article_number 等字段]
-    F --> G[注入结构化上下文标头]
-    G --> H[按批次调用 text-embedding-v3]
+    E --> F[生成稳定 doc_id<br/>parent_chunk_id]
+    F --> G[Parent 切分为 Child<br/>生成 child_chunk_id]
+    G --> M1[(MySQL documents)]
+    G --> M2[(MySQL parent_chunks)]
+    G --> M3[(MySQL child_chunks)]
+    M3 --> H[Child 注入上下文标头<br/>调用 text-embedding-v3]
     H --> I{目标 Collection}
     I -->|法规与犯罪知识| J[(ChromaDB · laws)]
     I -->|裁判案例| K[(ChromaDB · cases)]
-    J --> L[供 BM25 语料加载<br/>和向量相似度检索]
+    J --> L[只保存 Child 向量<br/>vector ID = child_chunk_id]
     K --> L
 ```
 
-这条链路体现了三个技术层次：格式转换解决数据源不统一，领域分块解决法律语义边界，Embedding 与 ChromaDB 则负责把文本转换为可执行的语义检索索引。
+这条链路体现了四个技术层次：格式转换解决数据源不统一，Parent 保留法律证据完整性，Child 提高检索粒度，MySQL 与 ChromaDB 则分别承担事实存储和派生向量索引。
 
 ### 3.3 法律结构化分块
 
 普通 RAG 常按固定字符或 Token 窗口切分文档。但如果在法条中间直接切开，适用条件与法律后果可能被分到两个 Chunk，检索后只能得到半条规则。
 
-LawRAG 为两类文本分别设计分块器：
+LawRAG 为两类文本分别设计 Parent，再将每个 Parent 切为更小的 Child：
 
-| 文档类型 | 优先分隔结构 | 默认分块参数 |
+| 文档类型 | Parent 单位 | Child 参数 |
 |---|---|---|
-| 法律法规 | 编 → 章 → 节 → 条 → 款 → 项 → 换行 | 512 字符，64 字符重叠 |
-| 裁判案例 | 裁判要旨 → 基本案情 → 裁判理由 → 裁判结果 | 1,024 字符，128 字符重叠 |
+| 法律法规 | 完整法条；超长法条按款项形成父级结构单元 | 320 字符，64 字符重叠 |
+| 裁判案例 | 裁判要旨、基本案情、裁判理由、裁判结果 | 320 字符，64 字符重叠 |
+| CrimeKG | 一个罪名知识条目 | 概念、构成、认定、处罚和法条片段 |
 
-分块后还会保存法律名称、章节、条号、生效日期、源文件、案例名称、案号、关键词、段落类型和 Chunk 序号等元数据。
+`doc_id`、`parent_chunk_id` 和 `child_chunk_id` 由源数据哈希、分块器版本和序号通过 UUIDv5 确定性生成。重复执行相同导入会得到相同 ID；升级 `CHUNKER_VERSION` 后生成新索引版本。Parent 保存法律名称、条号、案号和原文位置，Child 保存其所属 Parent ID 以及自身字符范围。
 
 ### 3.4 上下文标头注入
 
@@ -434,7 +444,7 @@ LawRAG 为两类文本分别设计分块器：
 
 标头来自文档结构和正则提取结果，不需要额外调用 LLM。
 
-### 3.5 向量入库
+### 3.5 MySQL持久化与Child向量入库
 
 `scripts.import_data` 负责最终导入：
 
@@ -442,12 +452,14 @@ LawRAG 为两类文本分别设计分块器：
 读取本地文件
   → 尝试 UTF-8 / GBK / GB2312 编码
   → 判断法规或案例类型
-  → 结构化分块和元数据增强
-  → 批量请求 text-embedding-v3
-  → 写入 laws 或 cases Collection
+  → 构建 Document / Parent / Child
+  → 先写入 MySQL 事实库
+  → 仅对 Child 批量请求 text-embedding-v3
+  → 以 child_chunk_id 写入 laws 或 cases Collection
+  → 将 Document 状态更新为 indexed
 ```
 
-法规以批次写入 `laws`，案例从 JSONL 中抽取事实、罪名、法条等信息后写入 `cases`。当前脚本默认最多导入 5,000 条案例。
+MySQL 写入与向量索引之间通过 `pending → chunked → indexed / failed` 状态衔接。向量阶段失败时，原始数据和父子块仍保留在 MySQL，可根据稳定 ID 幂等重试。ChromaDB 中即使保存了 Child 文本派生副本，在线检索仍根据返回的 `child_chunk_id` 批量回查 MySQL，不把向量库副本作为权威正文。
 
 > 资源说明：`python -m scripts.import_data` 会为全部 Chunk 请求 Embedding。索引与 Embedding 模型版本绑定，数据或模型发生变化时执行重建。
 
@@ -469,9 +481,9 @@ flowchart TD
     B4 --> B5[完整 SKILL.md 作为 tool_result<br/>追加到 messages]
     B5 --> C[根据已加载 Skill 构造 PipelineConfig]
     C --> C0{collection 检索范围}
-    C0 -->|all| C1[ChromaDB<br/>laws + cases]
-    C0 -->|laws| C2[ChromaDB<br/>laws 法律法规库]
-    C0 -->|cases| C3[ChromaDB<br/>cases 裁判案例库]
+    C0 -->|all| C1[laws + cases]
+    C0 -->|laws| C2[laws 法律法规]
+    C0 -->|cases| C3[cases 裁判案例]
     C1 --> D{查询变换策略}
     C2 --> D
     C3 --> D
@@ -493,23 +505,23 @@ flowchart TD
     D3 --> E2
     D4 --> E2
 
-    E1 --> F1[中文分词 + BM25Okapi<br/>检索所选 Collection 的内存索引]
-    E2 --> F2[text-embedding-v3<br/>检索所选 ChromaDB Collection]
-    F1 --> G[RRF 融合排名]
+    E1 --> F1[MySQL child_chunks<br/>jieba + BM25Okapi]
+    E2 --> F2[text-embedding-v3<br/>ChromaDB Child 向量召回]
+    F1 --> G[按 child_chunk_id<br/>RRF 融合与去重]
     F2 --> G
-    G --> H[多查询结果去重]
-    H --> I{是否启用 use_kg}
-
+    G --> H[MySQL 批量回查<br/>Child 权威文本]
+    H --> K{Child 重排序策略}
+    K -->|none| K0[按融合分数截取]
+    K -->|simple| K1[Jaccard + 法律元数据加权]
+    K -->|cloud| K2[qwen3.7-text-rerank<br/>批量精排 Child]
+    K0 --> PA[按 parent_chunk_id 聚合<br/>max 子块分数 + 命中加成]
+    K1 --> PA
+    K2 --> PA
+    PA --> PH[MySQL 批量回查 Top Parent<br/>恢复完整证据]
+    PH --> I{是否启用 use_kg}
     I -->|是| J[识别罪名<br/>查询 CrimeKG 结构化知识]
-    I -->|否| K{重排序策略}
-    J --> K
-
-    K -->|none| K0[直接截取 Top K]
-    K -->|simple| K1[Jaccard 词项重合<br/>元数据加权]
-    K -->|cloud| K2[qwen3.7-text-rerank<br/>云端专用模型精排]
-    K0 --> L0[Budget<br/>计算证据 Token 预算]
-    K1 --> L0
-    K2 --> L0
+    I -->|否| L0[Budget<br/>计算证据 Token 预算]
+    J --> L0
     L0 --> L1[Snip<br/>限制单篇文档占用]
     L1 --> L2[Micro<br/>去重、排序与证据合并]
     L2 --> L3[Summary<br/>案例与 KG 抽取式摘要]
@@ -534,15 +546,15 @@ flowchart TD
     R --> S([React 渲染回答与监控信息])
 ```
 
-每次问答都访问同一个本地 ChromaDB 持久化目录 `backend/chroma_db`，具体查询哪个 Collection 由请求参数 `collection` 决定：
+每次问答同时使用 MySQL 事实库与本地 ChromaDB 派生索引。`collection` 决定 Child 的数据范围，两个存储通过相同的 `child_chunk_id`、`parent_chunk_id` 和 `doc_id` 关联：
 
-| `collection` 参数 | 实际查询的 ChromaDB Collection | 数据内容 |
+| `collection` 参数 | ChromaDB Child Collection | MySQL 权威数据范围 |
 |---|---|---|
-| `all` | `laws` + `cases` | 同时查询法律法规与裁判案例，分别召回后统一融合 |
-| `laws` | `laws` | 法律法规、司法解释和犯罪结构化知识 |
-| `cases` | `cases` | 裁判案例与指导案例 |
+| `all` | `laws` + `cases` | 同时读取法规与案例 Child，聚合后回查对应 Parent |
+| `laws` | `laws` | 法律法规、司法解释和犯罪结构化知识的 Child / Parent |
+| `cases` | `cases` | 裁判案例与指导案例的 Child / Parent |
 
-查询变换产生的每个原始问题、改写问题或子问题，都会在上述选定 Collection 中执行检索。普通向量查询使用问题文本，HyDE 使用生成的假设法律文档作为向量查询文本。BM25 不访问另一套数据库，而是从同一批 ChromaDB Collection 文档加载并构建内存关键词索引，因此稀疏检索和向量检索的数据范围保持一致。
+查询变换产生的每个原始问题、改写问题或子问题都会在选定范围内检索。普通向量查询使用问题文本，HyDE 使用生成的假设法律文档。BM25 从 MySQL `child_chunks` 构建内存索引，向量检索从 ChromaDB 只取候选 `child_chunk_id`；RRF 按 ID 融合后批量回查 MySQL Child 正文。Reranker 只比较 Query 与 Child，随后按 `parent_chunk_id` 聚合得分并从 MySQL 回查完整 Parent，Parent 不再重复重排。
 
 流程图中的每个阶段都可以定位到具体实现：
 
@@ -555,12 +567,13 @@ flowchart TD
 | 多查询改写 | LangChain Prompt、`ChatOpenAI` | `services/query_rewriter.py` | 是 |
 | HyDE | 假设文档生成、查询与文档空间对齐 | `services/hyde.py` | 是 |
 | 问题分解 | LLM 结构化拆分 | `services/query_rewriter.py` | 是 |
-| BM25 召回 | jieba、`rank_bm25.BM25Okapi`；索引范围与所选 Collection 一致 | `core/retriever.py` | 否 |
-| 向量召回 | `OpenAIEmbeddings`；按请求查询 ChromaDB 的 `laws`、`cases` 或两者 | `core/embeddings.py`、`core/vectorstore.py` | 每个向量查询文本需要一次 Embedding |
-| 融合与去重 | RRF、内容哈希、Top K | `core/retriever.py`、`services/pipeline.py` | 否 |
+| BM25 召回 | MySQL Child 语料、jieba、`rank_bm25.BM25Okapi` | `core/retriever.py`、`db/repository.py` | 否 |
+| 向量召回 | `OpenAIEmbeddings`；ChromaDB 返回 Child ID 与相似度 | `core/embeddings.py`、`core/vectorstore.py` | 每个向量查询文本需要一次 Embedding |
+| Child 融合与回查 | 按 `child_chunk_id` 执行 RRF、去重，批量回查 MySQL Child | `core/retriever.py`、`db/repository.py` | 否 |
 | 犯罪知识增强 | 罪名识别、内存字典查找、LangChain `Document` | `services/kg_service.py` | 罪名识别会调用 LLM |
-| 轻量重排序 | Jaccard、jieba、法律元数据加权 | `services/reranker.py` | 否 |
-| 云端专用重排序 | HTTPX、`qwen3.7-text-rerank` | `services/cloud_reranker.py` | 仅选择 `cloud` 时调用 |
+| Child 轻量重排序 | Jaccard、jieba、法律元数据加权 | `services/reranker.py` | 否 |
+| Child 云端重排序 | HTTPX、`qwen3.7-text-rerank` | `services/cloud_reranker.py` | 仅选择 `cloud` 时调用 |
+| Parent 聚合与回查 | `parent_chunk_id` 分组、最高 Child 分数、命中数加成、MySQL 批量查询 | `services/pipeline.py`、`db/repository.py` | 否 |
 | 上下文压缩 | Budget、Snip、Micro、Summary、来源格式化 | `context/compactor.py` | 否 |
 | 答案生成 | LCEL `prompt \| llm`、Qwen | `services/prompts.py`、`core/llm.py` | 是 |
 | 自我反思 | 引用检查、一次纠错上限 | `services/self_reflect.py` | 仅 `self_reflect` 策略调用 |
@@ -617,15 +630,15 @@ HyDE 采用“分离式检索”：原始问题交给 BM25，以保留关键词�
 
 ### 4.3 混合检索
 
-混合检索器从 ChromaDB 读取指定 Collection 的文档，并用 jieba 分词建立内存 BM25 索引。收到查询后：
+混合检索围绕 Child 展开：MySQL 保存可参与关键词匹配的 Child 权威正文，ChromaDB 保存同一批 Child 的向量及稳定 ID。收到查询后：
 
-1. BM25 返回关键词匹配排名；
-2. ChromaDB 返回向量相似度排名；
-3. RRF 根据排名和权重累加分数；
-4. 按融合分数排序并返回候选文档；
-5. 多查询产生的重复文档按内容去重。
+1. BM25 在 MySQL Child 语料构建的内存索引中返回关键词排名；
+2. ChromaDB 返回向量相似度排名和 `child_chunk_id`；
+3. RRF 按 `child_chunk_id` 累加两路排名分数；
+4. 多查询结果仍按 `child_chunk_id` 合并，避免同一 Child 重复出现；
+5. 根据候选 ID 一次批量回查 MySQL，得到用于重排序的 Child 原文与完整元数据。
 
-用户可以只检索法规、只检索案例，或者同时检索两个 Collection。
+因此 ChromaDB 可以随时由 MySQL 数据重建，在线答案不会依赖向量库中的正文副本。用户可以只检索法规、只检索案例，或者同时检索两个 Collection。
 
 ### 4.4 犯罪知识增强
 
@@ -635,17 +648,23 @@ HyDE 采用“分离式检索”：原始问题交给 BM25，以保留关键词�
 
 ### 4.5 重排序
 
-初步召回强调“尽量找到”，重排序强调“把最有用的资料放在前面”：
+初步召回强调“尽量找到”，重排序强调“从细粒度 Child 中选出与 Query 最相关的命中”：
 
 - `none`：直接截取前 `top_k` 条；
 - `simple`：根据词项重合度和法律名称、条号、案号等元数据加权；
-- `cloud`：将融合后的候选文档批量提交给 `qwen3.7-text-rerank`，根据返回的 `relevance_score` 取 Top K。
+- `cloud`：将 Query 与回查后的 Child 原文批量提交给 `qwen3.7-text-rerank`，根据 `relevance_score` 取 Top K。
 
-三种策略分别承担实验基线、零云调用轻量排序和生产级云端精排职责。启用重排后，管线将混合检索候选池扩大到 20 条，再选出最终 Top K。默认 `simple` 提供零云端调用的快速路径；`cloud` 调用专用排序模型完成高精度排序。管线内置自动降级机制，云端超时、限流或服务异常时切换到 `simple`，并通过 `rerank_fallback` 指标记录实际执行路径。
+三种策略分别承担实验基线、零云调用轻量排序和云端精排职责。管线先保留 20～50 个 Child 候选，默认精排到 15 个 Child。随后按 `parent_chunk_id` 分组，使用“组内最高 Child 重排分数 + 封顶的多 Child 命中加成”计算 Parent 分数：
+
+```text
+parent_score = max(child_rerank_score) + min(hit_count - 1, 3) × 0.02
+```
+
+系统按 Parent 分数选择 Top 5，并批量回查 MySQL `parent_chunks` 恢复完整法条、案件事实或知识段落。Parent 不再进入 Reranker：相关性判断由更聚焦的 Child 完成，Parent 只承担证据扩展与上下文完整性，避免长文本稀释排序信号和产生第二次云端费用。`cloud` 异常时自动切换到 `simple`，并通过 `rerank_fallback` 记录实际执行路径。
 
 ### 4.6 四阶段上下文压缩与答案生成
 
-重排序结果进入 `FourStageContextCompactor`，以默认 4,000 Token 证据窗口执行四阶段压缩。整个过程使用确定性算法，不调用模型：
+Child 重排序并聚合回查得到的 Parent，与 CrimeKG 精确命中结果合并后进入 `FourStageContextCompactor`，以默认 4,000 Token 证据窗口执行四阶段压缩。整个过程使用确定性算法，不调用模型：
 
 | 阶段 | 处理方式 | 法律场景约束 |
 |---|---|---|
@@ -676,11 +695,15 @@ flowchart LR
         A1[刑法第二百六十四条 TXT] --> B1[法条结构化分块]
         A2[CrimeKG 盗窃罪 JSON] --> B2[展开概念、构成要件、处罚和法条]
         A3[CAIL2018 盗窃案例 JSONL] --> B3[案例事实与裁判标签分块]
-        B1 --> C1[text-embedding-v3]
-        B2 --> C1
-        B3 --> C2[text-embedding-v3]
-        C1 --> D1[(ChromaDB laws)]
-        C2 --> D2[(ChromaDB cases)]
+        B1 --> PC[生成 Document、Parent、Child<br/>及稳定 ID]
+        B2 --> PC
+        B3 --> PC
+        PC --> M1[(MySQL documents)]
+        PC --> M2[(MySQL parent_chunks)]
+        PC --> M3[(MySQL child_chunks)]
+        PC --> C1[text-embedding-v3<br/>仅编码 Child]
+        C1 --> D1[(ChromaDB laws<br/>Child ID + Vector)]
+        C1 --> D2[(ChromaDB cases<br/>Child ID + Vector)]
         B2 --> D3[CrimeKG 罪名内存索引]
     end
 
@@ -690,35 +713,39 @@ flowchart LR
         CAT --> CALL[LLM 调用 load_skill criminal_law]
         CALL --> SK[完整 SKILL.md 进入 tool_result]
         SK --> T[查询变换或直接检索]
-        T --> V[向量检索<br/>laws + cases]
-        T --> BM[BM25 检索<br/>laws + cases]
-        V --> R[RRF 融合与去重]
+        T --> V[ChromaDB 向量召回<br/>Child ID]
+        T --> BM[MySQL Child 语料<br/>BM25 检索]
+        V --> R[按 child_chunk_id<br/>RRF 融合]
         BM --> R
+        R --> CH[MySQL 批量回查 Child 原文]
+        CH --> RR[仅重排序 Child]
+        RR --> PA[按 parent_chunk_id 聚合]
+        PA --> PH[MySQL 回查 Top Parent]
         Q --> KG[识别盗窃罪<br/>查询 CrimeKG]
-        R --> RR[轻量或云端重排]
-        KG --> RR
-        RR --> CTX[Budget → Snip → Micro → Summary]
+        PH --> CTX[Budget → Snip → Micro → Summary]
+        KG --> CTX
         CTX --> GEN[Qwen 生成结构化法律回答]
         GEN --> SAVE[更新短期 Memory]
         SAVE --> OUT[返回结论、法条、分析<br/>来源和阶段指标]
     end
 
-    D1 -.法规与罪名知识.-> V
-    D1 -.BM25 语料.-> BM
-    D2 -.案例向量.-> V
-    D2 -.BM25 语料.-> BM
+    D1 -.法规 Child 向量.-> V
+    D2 -.案例 Child 向量.-> V
+    M3 -.权威 Child 正文.-> BM
+    M3 -.按 ID 回查.-> CH
+    M2 -.恢复完整证据.-> PH
     D3 -.精确罪名知识.-> KG
 ```
 
 具体执行过程如下：
 
-1. **离线整理法规**：刑法第二百六十四条按法条边界切分，生成带有 `law_name=中华人民共和国刑法`、`article_number=二百六十四` 的 Chunk；
+1. **离线整理法规**：刑法第二百六十四条按法条边界形成 Parent，再切成适合召回的 Child，并保留 `law_name=中华人民共和国刑法`、`article_number=二百六十四` 等元数据；
 2. **离线整理罪名知识**：CrimeKG 中“盗窃罪”的 `gainian`、`tezheng`、`chufa`、`fatiao` 等字段被展开为可检索文本，同时建立以“盗窃罪”为键的内存索引；
 3. **离线整理案例**：CAIL2018 中罪名为盗窃、关联法条为264的案件被转换为案例文档，保留案件事实、罪名、刑期和来源信息；
-4. **分别写入数据库**：刑法条文和 CrimeKG 文本写入 ChromaDB `laws`，裁判案例写入 `cases`；两类 Collection 共用 `text-embedding-v3` 的向量空间；
+4. **双库存储**：原文、Parent 和 Child 先写入 MySQL；仅 Child 调用 `text-embedding-v3`，法规与 CrimeKG Child 写入 ChromaDB `laws`，案例 Child 写入 `cases`，向量记录 ID 等于 `child_chunk_id`；
 5. **恢复会话并加载 Skill**：系统按 `conversation_id` 读取最近问答；模型从 system prompt 的技能目录中选择 `criminal_law` 并调用 `load_skill`，完整刑事规则以 `tool_result` 进入消息列表；
-6. **在线混合召回**：补全后的问题经过 Embedding 后查询 `laws + cases`，同时使用 BM25 匹配“入室盗窃”“数额”等关键词，RRF 合并两路排名；
-7. **知识增强与重排**：系统识别“盗窃罪”，补充 CrimeKG 的构成要件和处罚知识，再通过 `simple` 或 `cloud` 将刑法第二百六十四条、盗窃罪知识和相关案例排到前列；
+6. **在线 Child 召回**：问题 Embedding 查询 ChromaDB `laws + cases` 得到 Child ID，同时 BM25 在 MySQL Child 语料中匹配“入室盗窃”“数额”等关键词，RRF 按 ID 合并两路排名；
+7. **回查、精排与 Parent 扩展**：系统从 MySQL 批量取得候选 Child 原文，仅对 Child 执行 `simple` 或 `cloud` 重排；再按 `parent_chunk_id` 聚合命中，从 MySQL 回查刑法完整条文和完整案例事实，同时合并 CrimeKG 的构成要件与处罚知识；
 8. **四阶段压缩**：系统计算 Token 预算，限制单篇文档长度，去除重复证据，并在超限时抽取案例关键原句；法条原文和来源标识保持可追溯；
 9. **基于证据生成**：`structured_legal` Prompt 同时接收领域 Skill、短期记忆和压缩证据，按照“法律结论—适用法律—详细分析—注意事项”组织答案；
 10. **更新记忆与评测**：答案、问题和来源 ID 写回短期 Memory；接口返回 Skill、压缩统计、来源和阶段耗时，评测任务计算 Recall@5、MRR@10、P95 Latency 和 Faithfulness。
@@ -749,14 +776,15 @@ flowchart LR
 ```text
 backend/
 ├── app/
-│   ├── api/                 # 问答、知识库、性能接口
+│   ├── api/                 # 问答、知识库、来源追溯、性能接口
 │   ├── context/             # Budget、Snip、Micro、Summary 四阶段压缩
 │   ├── core/                # LLM、Embedding、ChromaDB、检索器
+│   ├── db/                  # SQLAlchemy 表模型与 Parent/Child Repository
 │   ├── memory/              # 带 TTL 的短期会话记忆
 │   ├── models/              # Pydantic 请求与响应模型
-│   ├── services/            # RAG 管线及各项策略
+│   ├── services/            # 导入服务、RAG 管线及各项策略
 │   ├── skills/              # frontmatter 扫描器、按需加载器与 load_skill 工具
-│   ├── utils/               # 法律分块和元数据工具
+│   ├── utils/               # 法律分块、Parent/Child 分块和元数据工具
 │   ├── config.py            # 环境变量与默认配置
 │   └── main.py              # FastAPI 应用入口
 ├── skills/                  # 各法律领域的 SKILL.md 与 config.json
@@ -766,7 +794,7 @@ backend/
 └── chroma_db/               # 本地向量数据库
 ```
 
-`services/pipeline.py` 是在线问答主入口。它串联 Memory 恢复、Skill Loading、查询变换、检索、重排序、Context Compact、生成和 Memory 更新，同时通过 `PipelineConfig` 保持各项策略可配置。
+`services/ingestion_service.py` 负责“先写 MySQL、再建 Child 向量索引”的离线链路；`services/pipeline.py` 是在线问答主入口，串联 Memory、Skill Loading、查询变换、Child 召回与回查、Child 重排序、Parent 聚合与回查、Context Compact、生成和 Memory 更新。
 
 ### 5.2 主要 API
 
@@ -785,6 +813,8 @@ backend/
 | `DELETE` | `/api/knowledge/{filename}` | 删除指定文件 |
 | `POST` | `/api/knowledge/rebuild` | 重建向量索引 |
 | `GET` | `/api/knowledge/stats` | 查询文件和 Chunk 数量 |
+| `GET` | `/api/sources/chunks/{chunk_id}` | 根据 Child 或 Parent ID 查询正文、位置和所属文档 |
+| `GET` | `/api/sources/documents/{doc_id}` | 查询原始文档全文、元数据及父子块结构 |
 | `GET` | `/api/performance/system` | 查询 CPU 和内存状态 |
 | `POST` | `/api/performance/bench` | 执行性能或质量测试 |
 | `POST` | `/api/performance/report` | 生成并保存测试报告 |
@@ -825,6 +855,7 @@ Vite 开发服务器默认运行在 `http://127.0.0.1:5173`，并将 `/api` 请�
 
 - Python 3.10 或更高版本；
 - Node.js 18 或更高版本；
+- MySQL 8.0 或更高版本，字符集使用 `utf8mb4`；
 - 可访问 DashScope 的网络环境和 API Key；
 - 8 GB 以上磁盘空间，用于保存数据、依赖和向量索引。
 
@@ -855,6 +886,13 @@ RERANKER_DOCUMENT_MAX_CHARS=1200
 CONTEXT_MAX_TOKENS=4000
 MEMORY_TTL_SECONDS=86400
 MEMORY_MAX_TURNS=6
+MYSQL_URL=mysql+pymysql://root:your-password@127.0.0.1:3306/lawrag?charset=utf8mb4
+MYSQL_ECHO=false
+CHUNKER_VERSION=parent-child-v1
+CHILD_CHUNK_SIZE=320
+CHILD_CHUNK_OVERLAP=64
+CHILD_RERANK_TOP_K=15
+PARENT_TOP_K=5
 ```
 
 复制 `backend/.env.example` 为 `backend/.env` 并填写环境变量。真实密钥仅保存在 `.env`，该文件已被 Git 忽略。云端 Reranker 使用带业务空间 ID 的独立文本排序 Endpoint，Chat 和 Embedding 使用 OpenAI 兼容地址。
@@ -863,11 +901,13 @@ MEMORY_MAX_TURNS=6
 
 ```powershell
 cd "D:\LLM study\LawRAG\LawRAG\backend"
+mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS lawrag CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+python -m scripts.init_mysql
 python -m scripts.prepare_datasets
 python -m scripts.import_data
 ```
 
-第一条命令完成本地格式转换，第二条命令批量调用 `text-embedding-v3` 并生成 ChromaDB 索引。索引构建完成后可直接启动问答服务。
+`init_mysql` 创建 Documents、Parent Chunks 和 Child Chunks 三张表，不调用模型。`prepare_datasets` 完成本地格式转换；`import_data` 先把原文及父子块写入 MySQL，再批量调用 `text-embedding-v3` 生成 Child 向量并写入 ChromaDB。旧版 ChromaDB 记录不含稳定 Child ID，升级后需要重新执行一次 `import_data`。
 
 ### 6.4 启动后端和前端
 
@@ -914,6 +954,7 @@ npm run dev
 | `test_cloud_reranker.py` | 云端排序请求格式、响应映射、配置检查和无网络降级 |
 | `test_rag_evaluation.py` | Recall@5、MRR@10、指标聚合和 P95 计算 |
 | `test_context_memory_skills.py` | 四阶段压缩、TTL Memory、frontmatter 扫描、按需正文加载和 `load_skill` Tool |
+| `test_parent_child_storage.py` | 稳定父子 ID、MySQL 回查、Child 权威正文、Child 精排与 Parent 聚合 |
 
 ```powershell
 cd backend
@@ -948,6 +989,9 @@ python -m scripts.run_quality_eval
 项目通过以下机制保证管线稳定性和结果可分析性：
 
 - **策略可替换**：查询变换、重排序和生成分别由枚举配置，支持独立组合与对比；
+- **事实库与索引分离**：MySQL 是原文、Parent 和 Child 的唯一事实来源，ChromaDB 是可重建的 Child 向量索引；
+- **父子索引**：短 Child 负责精确召回与重排，完整 Parent 负责生成证据，兼顾检索精度与语义完整性；
+- **稳定 ID 关联**：`doc_id → parent_chunk_id → child_chunk_id` 使用确定性 ID 串联导入、检索、删除、重建和来源回查；
 - **上下文有预算**：四阶段压缩限制输入规模，保留法条原文、来源标签和高相关证据；
 - **多轮可隔离**：会话以 `conversation_id` 隔离，仅保存最近 6 轮并使用 TTL 自动过期；
 - **能力按需加载**：启动时只有技能目录进入 system prompt，完整 `SKILL.md` 仅在 `load_skill` 调用后以 tool_result 注入；
@@ -955,6 +999,6 @@ python -m scripts.run_quality_eval
 - **重排自动降级**：云端排序异常时切换到轻量算法，并将降级状态写入响应指标；
 - **请求可观测**：记录查询变换、检索、知识增强、重排、生成和总耗时；
 - **效果可量化**：统一计算 Recall@5、MRR@10、P95 Latency 和 Faithfulness；
-- **结果可追溯**：回答同步返回来源内容、法律元数据、重排分数和排序位置；
+- **结果可追溯**：回答返回 Parent 来源、命中 Child ID、法律元数据和排序分数，并可通过 Source API 回查原始文档；
 - **报告可沉淀**：性能测试、质量指标和问答记录均可保存并下载为 JSON；
 - **数据与代码分离**：数据集、向量索引、密钥和运行产物通过目录规范独立管理。
