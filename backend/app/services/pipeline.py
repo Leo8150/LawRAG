@@ -2,7 +2,7 @@
 
 import time
 from uuid import uuid4
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from enum import Enum
 
 from langchain_core.documents import Document
@@ -16,11 +16,9 @@ from app.services.prompts import (
     LEGAL_QA_PROMPT,
     LEGAL_STRUCTURED_PROMPT,
 )
-from app.utils.metadata import format_source_display
-from app.models.schemas import ChatResponse, SourceDocument, StageMetrics
+from app.models.schemas import ChatResponse
 from app.config import settings
 from app.context import FourStageContextCompactor
-from app.memory import memory_service
 from app.skills import LegalSkill, load_skill, skill_loader
 from app.db.repository import ParentChildRepository, get_parent_child_repository
 
@@ -106,112 +104,19 @@ class RAGPipeline:
             "retrieved_child_count": 0,
             "reranked_child_count": 0,
             "parent_candidate_count": 0,
+            "evidence_grade_ms": 0,
+            "grounding_check_ms": 0,
+            "agent_tool_calls": 0,
+            "agent_rounds": 0,
+            "retrieval_rounds": 0,
+            "grounding_passed": False,
         }
 
     async def execute(self, question: str, conversation_id: str | None = None) -> ChatResponse:
-        total_start = time.time()
+        """Execute the single Agentic RAG graph; no linear workflow route exists."""
+        from app.agentic import AgenticRAGRunner
 
-        # Stage 0: 恢复短期记忆；目录进入 system prompt，完整 Skill 通过 tool_result 注入。
-        conversation_id = conversation_id or uuid4().hex
-        memory = memory_service.load(conversation_id)
-        resolved_question, memory_context = memory_service.resolve_question(question, memory)
-        self.metrics["memory_turns"] = len(memory.turns)
-        skill, skill_messages = await self._select_skill(resolved_question)
-
-        # Skill 可以收窄数据源；调用方显式选择单库时保持调用方选择。
-        if set(self.config.collection_names) == {settings.LAWS_COLLECTION, settings.CASES_COLLECTION}:
-            self.config.collection_names = list(skill.collection_names)
-
-        # Stage 1: 查询变换
-        search_queries, hyde_doc, rewritten_queries = await self._query_transform(resolved_question)
-        self.metrics["llm_calls"] += self._count_transform_calls()
-
-        # Stage 2: Child 检索；Chroma 返回 ID，MySQL 批量回查权威 Child 文本。
-        child_docs = await self._retrieve(search_queries, hyde_doc)
-        self.metrics["retrieved_child_count"] = len(child_docs)
-
-        # Stage 2.5: KG 查找（并入检索结果）
-        kg_entities: list[str] = []
-        kg_docs: list[Document] = []
-        effective_use_kg = self.config.use_kg or skill.use_kg
-        if effective_use_kg:
-            kg_entities, kg_docs = await self._kg_lookup(
-                resolved_question,
-                allow_llm_fallback=self.config.use_kg,
-            )
-            # KG 是结构化父级证据，不进入 Child Reranker。
-            if kg_docs:
-                self.metrics["llm_calls_saved"] += 1
-
-        # Stage 3: 只重排 Child，然后按 parent_chunk_id 聚合并回查 Parent。
-        reranked_children = await self._rerank(
-            resolved_question,
-            child_docs,
-            top_k=max(self.config.top_k, settings.CHILD_RERANK_TOP_K),
-        )
-        self.metrics["reranked_child_count"] = len(reranked_children)
-        parent_docs = self._aggregate_and_hydrate_parents(reranked_children)
-        self.metrics["parent_candidate_count"] = len(parent_docs)
-        if kg_docs:
-            parent_docs = kg_docs + parent_docs
-
-        # Stage 4: 四阶段上下文压缩（Budget -> Snip -> Micro -> Summary）
-        compact_start = time.time()
-        compact_result = FourStageContextCompactor(settings.CONTEXT_MAX_TOKENS).compact(
-            parent_docs,
-            question=resolved_question,
-            memory_context=memory_context,
-            skill_instructions=skill.instructions,
-            priority=skill.context_priority,
-        )
-        self.metrics["context_compact_ms"] = round((time.time() - compact_start) * 1000, 1)
-        self.metrics["context_tokens_before"] = compact_result.tokens_before
-        self.metrics["context_tokens_after"] = compact_result.tokens_after
-
-        # Stage 5: 生成
-        answer, was_corrected = await self._generate(
-            resolved_question,
-            compact_result.context,
-            memory_context,
-            skill_messages,
-            skill_loader.catalog_prompt(),
-        )
-        self.metrics["was_corrected"] = was_corrected
-        self.metrics["llm_calls"] += 1  # 生成至少 1 次
-        if was_corrected:
-            self.metrics["llm_calls"] += 2  # 反思验证 + 修正
-
-        # 总耗时
-        self.metrics["total_ms"] = round((time.time() - total_start) * 1000, 1)
-
-        # 构建来源
-        sources = []
-        for doc in compact_result.documents:
-            sources.append(SourceDocument(
-                content=doc.page_content[:500],
-                metadata=doc.metadata,
-                score=doc.metadata.get("rerank_score"),
-            ))
-
-        # Stage 6: 只保存有限轮次和来源 ID，不复制整篇证据。
-        source_ids = [format_source_display(doc.metadata) for doc in compact_result.documents]
-        memory_service.append(conversation_id, question, answer, source_ids, skill.name)
-
-        config_dict = self.config.to_dict()
-        config_dict["use_kg"] = effective_use_kg
-        return ChatResponse(
-            answer=answer,
-            sources=sources,
-            metrics=StageMetrics(**self.metrics),
-            rewritten_queries=rewritten_queries,
-            kg_entities=kg_entities or None,
-            generation_strategy=self.config.generation_strategy.value,
-            pipeline_config=config_dict,
-            conversation_id=conversation_id,
-            resolved_question=resolved_question if resolved_question != question else None,
-            active_skill=skill.name,
-            context_compaction=compact_result.to_dict(),
-        )
+        return await AgenticRAGRunner(self).run(question, conversation_id)
 
     async def _select_skill(self, question: str) -> tuple[LegalSkill, list[BaseMessage]]:
         """Ask the model to call load_skill, then append the result as a ToolMessage."""

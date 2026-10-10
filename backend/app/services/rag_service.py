@@ -1,4 +1,4 @@
-"""RAG 主服务 — 向后兼容的入口，委托给 RAGPipeline 执行"""
+"""Agentic RAG 主服务入口。"""
 
 from app.models.schemas import ChatResponse
 from app.services.pipeline import (
@@ -27,7 +27,7 @@ async def rag_query(
     skill_name: str = "auto",
 ) -> ChatResponse:
     """
-    执行完整的 RAG 查询流程（向后兼容入口）
+    执行唯一的 Agentic RAG 状态图。
 
     遗留参数映射：
     - use_rerank=False  → rerank_strategy="none"

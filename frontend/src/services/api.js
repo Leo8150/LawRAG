@@ -9,31 +9,23 @@ const api = axios.create({
 
 export async function sendChat({
   question,
-  useRerank = true,
-  useQueryRewrite = false,
   topK = 5,
   collection = 'all',
   evaluateQuality = false,
   monitorSystem = false,
-  queryTransform = 'none',
   rerankStrategy = 'simple',
   generationStrategy = 'standard',
-  useKg = false,
   conversationId,
   skillName = 'auto',
 }) {
   const res = await api.post('/chat', {
     question,
-    use_rerank: useRerank,
-    use_query_rewrite: useQueryRewrite,
     top_k: topK,
     collection,
     evaluate_quality: evaluateQuality,
     monitor_system: monitorSystem,
-    query_transform: queryTransform,
     rerank_strategy: rerankStrategy,
     generation_strategy: generationStrategy,
-    use_kg: useKg,
     conversation_id: conversationId,
     skill_name: skillName,
   })

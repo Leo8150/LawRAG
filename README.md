@@ -2,7 +2,7 @@
 
 LawRAG 是一个面向中国法律咨询场景的检索增强生成（Retrieval-Augmented Generation，RAG）项目。系统将法律法规、裁判案例和犯罪知识整理为可检索知识库，在回答问题前先查找依据，再由大语言模型结合检索结果生成回答。
 
-项目采用前后端分离架构：后端使用 FastAPI 和 LangChain 编排 RAG 流程，MySQL 保存原始文档及父子 Chunk，ChromaDB 仅保存 Child Chunk 向量索引，两个存储通过稳定 ID 关联；DashScope 提供生成、向量与可选重排模型，前端使用 React 构建问答、来源追溯、知识库管理和性能评测页面。
+项目采用前后端分离架构：后端使用 FastAPI、LangChain 与 LangGraph 构建单一 Agentic RAG 状态图，LLM 在有界循环中选择本地法律检索、CrimeKG、来源回查以及外部法律 MCP 工具，并根据证据充分性动态补充检索；MySQL 保存原始文档及父子 Chunk，ChromaDB 仅保存 Child Chunk 向量索引。外部工具池连接国家法律法规数据库、人民法院案例库和 Tavily 官方站点搜索，DashScope 提供生成、向量、工具决策和可选重排模型，前端使用 React 展示答案、来源、Agent Trace 与评测指标。
 
 > 一句话理解：LawRAG 不是让模型仅凭参数记忆回答法律问题，而是先从法律知识库寻找证据，再基于证据组织答案。
 
@@ -41,12 +41,14 @@ LawRAG 围绕法律文本特点实现以下能力：
 - 使用 Document → Parent Chunk → Child Chunk 三级结构，兼顾召回精度和证据完整性；
 - 以 MySQL 作为原文事实库，以 `child_chunk_id`、`parent_chunk_id` 关联 ChromaDB 派生索引；
 - 结合 BM25 关键词检索与向量语义检索，提高精确匹配和语义召回能力；
-- 支持多查询改写、HyDE、问题分解等查询变换策略；
+- 使用 LangGraph 编排 Skill Loading、工具决策、证据评估、查询改写、生成和引用校验；
+- 由 LLM 动态选择法律检索、CrimeKG 与原始来源回查工具，策略层强制至少执行一次权威知识检索；
+- 证据不足时自动生成针对性查询并重新检索，所有循环均设置硬上限；
 - 使用结构化犯罪知识补充罪名定义、构成要件和量刑信息；
-- 支持不重排、轻量重排和云端专用 Reranker，并提供多种答案生成方式；
+- 在法律检索工具内部支持不重排、轻量重排和云端专用 Reranker；
 - 使用带 TTL 的短期会话 Memory 理解“如果已经退赃呢”等连续追问；
 - 根据问题领域按需加载刑事、劳动、合同、交通或通用法律 Skill；
-- 通过 Budget、Snip、Micro、Summary 四阶段压缩控制证据上下文；
+- 通过 Budget、Snip、Micro、Summary 四阶段压缩 Tool Result 与最终证据上下文；
 - 返回参考来源和各阶段耗时，便于分析系统行为；
 - 提供知识库管理、问答配置、性能测试和报告导出页面。
 
@@ -58,7 +60,7 @@ LawRAG 围绕法律文本特点实现以下能力：
 
 ## 2. 系统架构与技术选型
 
-**本章使用的核心技术**：React、FastAPI、Pydantic、LangChain、SQLAlchemy、MySQL、ChromaDB、BM25、DashScope。系统按表现层、接口层、业务编排层、能力层和数据层分层，MySQL 是权威事实库，ChromaDB 是可重建的 Child 向量索引。
+**本章使用的核心技术**：React、FastAPI、Pydantic、LangChain、LangGraph、SQLAlchemy、MySQL、ChromaDB、BM25、DashScope。系统按表现层、接口层、Agentic 编排层、检索工具层和数据层分层，MySQL 是权威事实库，ChromaDB 是可重建的 Child 向量索引。
 
 ### 2.1 总体架构
 
@@ -83,27 +85,31 @@ flowchart TB
         SCHEMA[Pydantic Schema<br/>models/schemas.py]
     end
 
-    subgraph SERVICE[业务编排层 · services]
-        PIPE[RAGPipeline<br/>pipeline.py]
+    subgraph SERVICE[Agentic 编排层 · LangGraph]
+        PIPE[AgenticRAGRunner<br/>agentic/runtime.py]
+        STATE[AgenticRAGState<br/>agentic/state.py]
+        ROUTER[LLM Tool Router]
+        GRADER[Evidence Grader]
+        REWRITE[Query Rewriter]
+        VERIFY[Grounding Checker]
         MEMORY[短期会话 Memory<br/>memory/service.py]
         SKILL[Skill Catalog + load_skill Tool<br/>skills/loader.py / tool.py]
         COMPACT[四阶段 Context Compact<br/>context/compactor.py]
-        QTS[查询变换<br/>query_rewriter.py / hyde.py]
-        KGS[犯罪知识增强<br/>kg_service.py]
-        RRS[重排序<br/>reranker.py]
         PROMPT[Prompt 与生成<br/>prompts.py]
         QUALITY[RAG 评测与报告<br/>quality_service.py / report_service.py]
-        PIPE --> QTS
+        PIPE --> STATE
         PIPE --> MEMORY
         PIPE --> SKILL
+        PIPE --> ROUTER --> GRADER
+        GRADER -->|证据不足| REWRITE --> ROUTER
+        GRADER -->|证据充分| COMPACT --> PROMPT --> VERIFY
+        VERIFY -->|未通过且未超限| PROMPT
         PIPE --> COMPACT
-        PIPE --> KGS
-        PIPE --> RRS
-        PIPE --> PROMPT
     end
 
     subgraph CORE[检索与模型能力层 · core]
-        HYBRID[HybridRetriever<br/>retriever.py]
+        TOOLS[Agent Tool Registry<br/>检索 / CrimeKG / 来源回查]
+        HYBRID[retrieve_legal_evidence]
         BM25[MySQL Child 语料<br/>BM25Okapi + jieba]
         VECTOR[Chroma Child 向量召回<br/>返回 child_chunk_id]
         RRF[Child ID 级 RRF 融合]
@@ -112,6 +118,7 @@ flowchart TB
         PARENT[按 parent_chunk_id 聚合<br/>回查 Parent]
         LLM[ChatOpenAI<br/>qwen-turbo]
         EMB[OpenAIEmbeddings<br/>text-embedding-v3]
+        TOOLS --> HYBRID
         HYBRID --> BM25
         HYBRID --> VECTOR
         BM25 --> RRF
@@ -151,10 +158,10 @@ flowchart TB
     CHATAPI --> SCHEMA --> PIPE
     KBAPI --> SPLIT
     PERFAPI --> QUALITY
-    PIPE --> HYBRID
+    ROUTER --> TOOLS
     PIPE --> QUALITY
     PARENT --> PIPE
-    KGS --> KGDATA
+    TOOLS --> KGDATA
     VECTOR --> LAWS
     VECTOR --> CASES
     PROMPT --> LLM
@@ -166,7 +173,7 @@ flowchart TB
 系统包含两条主链路：
 
 - **离线建库链路**：原始数据 → Parent/Child 分块 → MySQL 持久化 → Child Embedding → ChromaDB；
-- **在线问答链路**：问题 → Child 混合召回 → MySQL 回查 Child → Child 重排序 → Parent 聚合与回查 → 上下文压缩 → 答案生成。
+- **在线问答链路**：问题 → Skill Loading → LLM 工具决策 → Child 混合召回与 Parent 回查 → 证据充分性判断 → 必要时改写并重试 → Tool Result 与最终上下文压缩 → 答案生成 → Grounding 校验。
 
 离线建库只在首次导入或知识库变化时执行，在线问答则在每次用户提问时执行。
 
@@ -176,7 +183,7 @@ flowchart TB
 |---|---|---|
 | 前端 | React 18、Vite、Axios、Recharts | 交互界面、接口调用、性能图表 |
 | Web 后端 | FastAPI、Pydantic | REST API、参数校验、响应模型 |
-| RAG 编排 | LangChain | 文档对象、Prompt、模型链和检索器接口 |
+| Agentic 编排 | LangGraph、LangChain | 有界状态图、工具决策、证据评估、检索纠错与 Grounding 校验 |
 | 原文事实库 | MySQL 8、SQLAlchemy 2、PyMySQL | 保存 Documents、Parent Chunks、Child Chunks 和来源位置 |
 | 上下文工程 | Budget、Snip、Micro、Summary | Token 预算、单文档裁剪、证据去重和抽取式摘要 |
 | 会话记忆 | TTL Memory | 保存最近 6 轮问答、来源 ID 与当前 Skill，支持连续追问 |
@@ -467,9 +474,9 @@ MySQL 写入与向量索引之间通过 `pending → chunked → indexed / faile
 
 ## 4. 一次问答的完整执行流程
 
-**本章使用的核心技术**：FastAPI 异步接口、Pydantic 参数校验、短期会话 Memory、Skill Loading、四阶段 Context Compact、LangChain LCEL、BM25、向量检索、RRF、Prompt Engineering 和 LLM-as-a-Judge。
+**本章使用的核心技术**：LangGraph `StateGraph`、LangChain Tool Calling、FastAPI、短期 Memory、Skill Loading、父子检索、证据充分性判断、四阶段 Context Compact、Grounding Check 和有界自纠错循环。
 
-用户提交问题后，请求会发送到 `POST /api/chat`。后端根据 `conversation_id` 恢复短期记忆，补全追问语义并按需加载领域 Skill，随后由 `RAGPipeline.execute()` 完成检索、重排、四阶段上下文压缩和答案生成。
+用户提交问题后，请求进入唯一的 `AgenticRAGRunner`。系统不提供传统 RAG 分支：每次问答都经过 LangGraph 状态图，由 LLM 选择高层工具，策略层强制至少执行一次权威知识检索，并根据证据评估结果决定生成答案或改写查询后再次检索。
 
 ```mermaid
 flowchart TD
@@ -479,70 +486,51 @@ flowchart TD
     B2 --> B3[system prompt 注入技能目录<br/>仅 name + description]
     B3 --> B4[LLM 调用 load_skill name]
     B4 --> B5[完整 SKILL.md 作为 tool_result<br/>追加到 messages]
-    B5 --> C[根据已加载 Skill 构造 PipelineConfig]
-    C --> C0{collection 检索范围}
-    C0 -->|all| C1[laws + cases]
-    C0 -->|laws| C2[laws 法律法规]
-    C0 -->|cases| C3[cases 裁判案例]
-    C1 --> D{查询变换策略}
-    C2 --> D
-    C3 --> D
+    B5 --> C[LLM Tool Router]
+    C --> C1{选择高层工具}
+    C1 --> T1[retrieve_legal_evidence]
+    C1 --> T2[lookup_crime_knowledge]
+    C1 --> T3[get_original_source]
+    C1 --> T4[国家法律法规数据库 MCP]
+    C1 --> T5[人民法院案例库 MCP]
+    C1 --> T6[Tavily 官方域名搜索 MCP]
+    C1 -.未选择检索.-> GUARD[策略层补充强制检索]
+    GUARD --> T1
 
-    D -->|none| D0[保留原始问题]
-    D -->|multi_query| D1[LLM 生成多个检索问题]
-    D -->|hyde| D2[LLM 生成假设法律文档]
-    D -->|decompose| D3[LLM 拆分法律子问题]
-    D -->|multi_query_hyde| D4[asyncio 并行执行<br/>多查询 + HyDE]
-
-    D0 --> E1[BM25 查询文本]
-    D1 --> E1
-    D2 --> E1
-    D3 --> E1
-    D4 --> E1
-    D0 --> E2[向量查询文本]
-    D1 --> E2
-    D2 --> E2
-    D3 --> E2
-    D4 --> E2
-
-    E1 --> F1[MySQL child_chunks<br/>jieba + BM25Okapi]
-    E2 --> F2[text-embedding-v3<br/>ChromaDB Child 向量召回]
-    F1 --> G[按 child_chunk_id<br/>RRF 融合与去重]
-    F2 --> G
-    G --> H[MySQL 批量回查<br/>Child 权威文本]
-    H --> K{Child 重排序策略}
-    K -->|none| K0[按融合分数截取]
-    K -->|simple| K1[Jaccard + 法律元数据加权]
-    K -->|cloud| K2[qwen3.7-text-rerank<br/>批量精排 Child]
-    K0 --> PA[按 parent_chunk_id 聚合<br/>max 子块分数 + 命中加成]
-    K1 --> PA
-    K2 --> PA
-    PA --> PH[MySQL 批量回查 Top Parent<br/>恢复完整证据]
-    PH --> I{是否启用 use_kg}
-    I -->|是| J[识别罪名<br/>查询 CrimeKG 结构化知识]
-    I -->|否| L0[Budget<br/>计算证据 Token 预算]
-    J --> L0
+    T1 --> E1[MySQL Child BM25]
+    T1 --> E2[ChromaDB Child 向量召回]
+    E1 --> G[child_chunk_id 级 RRF]
+    E2 --> G
+    G --> H[MySQL 回查 Child 权威文本]
+    H --> K[Child Reranker]
+    K --> PA[parent_chunk_id 聚合]
+    PA --> PH[MySQL 回查完整 Parent]
+    T2 --> TR[四阶段压缩 Tool Result]
+    T3 --> TR
+    T4 --> TR
+    T5 --> TR
+    T6 --> TR
+    PH --> TR
+    TR --> TM[ToolMessage 写回状态图]
+    TM --> EG{Evidence Grader}
+    EG -->|证据不足且未超限| RW[生成针对性补充查询]
+    RW --> C
+    EG -->|证据充分或达到上限| L0[Budget<br/>计算最终证据预算]
     L0 --> L1[Snip<br/>限制单篇文档占用]
     L1 --> L2[Micro<br/>去重、排序与证据合并]
     L2 --> L3[Summary<br/>案例与 KG 抽取式摘要]
 
-    L3 --> M{生成策略}
-    M -->|standard| M0[标准法律问答 Prompt]
-    M -->|structured_legal| M2[结构化法律回答 Prompt]
-    M -->|self_reflect| M3[先生成初稿]
-    M3 --> N{引用与事实检查}
-    N -->|需要修正| N1[最多修正一轮]
-    N -->|无需修正| O[形成最终答案]
-    N1 --> O
-    M0 --> O
-    M2 --> O
+    L3 --> M[LLM 生成法律回答]
+    M --> N{Grounding 与引用检查}
+    N -->|未通过且未超限| M
+    N -->|通过或达到上限| O[形成最终答案]
     O --> O1[写入最近 6 轮 Memory<br/>刷新 24 小时 TTL]
 
     O1 --> P{是否开启 RAG 评测}
     P -->|是| P1["Recall@5 + MRR@10<br/>P95 Latency + Faithfulness"]
     P -->|否| Q[组装 ChatResponse]
     P1 --> Q
-    Q --> R[返回答案、来源、策略配置<br/>改写结果与各阶段耗时]
+    Q --> R[返回答案、来源、Agent Trace<br/>工具与各节点耗时]
     R --> S([React 渲染回答与监控信息])
 ```
 
@@ -554,29 +542,30 @@ flowchart TD
 | `laws` | `laws` | 法律法规、司法解释和犯罪结构化知识的 Child / Parent |
 | `cases` | `cases` | 裁判案例与指导案例的 Child / Parent |
 
-查询变换产生的每个原始问题、改写问题或子问题都会在选定范围内检索。普通向量查询使用问题文本，HyDE 使用生成的假设法律文档。BM25 从 MySQL `child_chunks` 构建内存索引，向量检索从 ChromaDB 只取候选 `child_chunk_id`；RRF 按 ID 融合后批量回查 MySQL Child 正文。Reranker 只比较 Query 与 Child，随后按 `parent_chunk_id` 聚合得分并从 MySQL 回查完整 Parent，Parent 不再重复重排。
+`retrieve_legal_evidence` 是一个高层检索工具。LLM 只决定检索 Query、`laws/cases/all` 范围和 Top K，工具内部固定执行 MySQL BM25、ChromaDB Child 向量召回、RRF、MySQL Child 回查、Child Reranker、Parent 聚合与 MySQL Parent 回查。底层步骤不会暴露给 LLM，避免其跳过来源恢复或任意拼装检索链路。
 
 流程图中的每个阶段都可以定位到具体实现：
 
 | 阶段 | 采用技术 | 主要源码 | 是否调用云模型 |
 |---|---|---|---|
 | 请求接收 | FastAPI、Pydantic | `api/chat.py`、`models/schemas.py` | 否 |
-| 管线配置 | Python `dataclass`、`Enum`、策略模式 | `services/pipeline.py` | 否 |
+| Agent 状态图 | LangGraph、TypedDict、条件边 | `agentic/runtime.py`、`agentic/state.py` | 否 |
 | 短期记忆 | TTL、最近轮次窗口、追问补全 | `memory/service.py` | 否 |
 | Skill 路由与加载 | frontmatter 目录、Tool Calling、`load_skill`、ToolMessage | `skills/loader.py`、`skills/tool.py`、`backend/skills/` | `auto` 模式调用 1 次 |
-| 多查询改写 | LangChain Prompt、`ChatOpenAI` | `services/query_rewriter.py` | 是 |
-| HyDE | 假设文档生成、查询与文档空间对齐 | `services/hyde.py` | 是 |
-| 问题分解 | LLM 结构化拆分 | `services/query_rewriter.py` | 是 |
+| 工具决策 | LangChain `bind_tools`、工具白名单、参数约束 | `agentic/tools.py`、`agentic/runtime.py` | 每个工具轮次 1 次 |
+| 证据充分性判断 | JSON 结构化判断、缺失信息提取 | `agentic/runtime.py`、`agentic/prompts.py` | 每轮检索后 1 次 |
+| 自适应查询改写 | 根据缺失证据生成针对性补充查询 | `agentic/runtime.py` | 必要时 1 次 |
 | BM25 召回 | MySQL Child 语料、jieba、`rank_bm25.BM25Okapi` | `core/retriever.py`、`db/repository.py` | 否 |
 | 向量召回 | `OpenAIEmbeddings`；ChromaDB 返回 Child ID 与相似度 | `core/embeddings.py`、`core/vectorstore.py` | 每个向量查询文本需要一次 Embedding |
 | Child 融合与回查 | 按 `child_chunk_id` 执行 RRF、去重，批量回查 MySQL Child | `core/retriever.py`、`db/repository.py` | 否 |
-| 犯罪知识增强 | 罪名识别、内存字典查找、LangChain `Document` | `services/kg_service.py` | 罪名识别会调用 LLM |
+| 犯罪知识工具 | `lookup_crime_knowledge`、本地 CrimeKG 精确查询 | `agentic/tools.py`、`services/kg_service.py` | 工具执行本身不调用模型 |
+| 外部法律 MCP | MCP Streamable HTTP、工具白名单、个人信息脱敏、官方域名限制 | `mcp/client.py`、`mcp/legal_tools.py` | 仅 LLM 选择外部工具时调用 |
 | Child 轻量重排序 | Jaccard、jieba、法律元数据加权 | `services/reranker.py` | 否 |
 | Child 云端重排序 | HTTPX、`qwen3.7-text-rerank` | `services/cloud_reranker.py` | 仅选择 `cloud` 时调用 |
 | Parent 聚合与回查 | `parent_chunk_id` 分组、最高 Child 分数、命中数加成、MySQL 批量查询 | `services/pipeline.py`、`db/repository.py` | 否 |
-| 上下文压缩 | Budget、Snip、Micro、Summary、来源格式化 | `context/compactor.py` | 否 |
+| Tool Result 与最终上下文压缩 | Budget、Snip、Micro、Summary、来源格式化 | `context/compactor.py` | 否 |
 | 答案生成 | LCEL `prompt \| llm`、Qwen | `services/prompts.py`、`core/llm.py` | 是 |
-| 自我反思 | 引用检查、一次纠错上限 | `services/self_reflect.py` | 仅 `self_reflect` 策略调用 |
+| Grounding 校验 | 证据支持判断、引用完整性检查、有界重新生成 | `agentic/runtime.py`、`agentic/prompts.py` | 每次生成后 1 次 |
 | RAG 评测 | 相关文档标注、排名指标、LLM-as-a-Judge | `services/quality_service.py`、`services/perf_service.py` | 检索和延迟指标否，Faithfulness 是 |
 | 响应展示 | Pydantic、Axios、React Markdown | `models/schemas.py`、`ChatPage.jsx` | 否 |
 
@@ -612,21 +601,25 @@ flowchart LR
 
 每个 `SKILL.md` 使用 YAML frontmatter 声明 `name` 和 `description`。服务启动时 `SkillLoader.scan()` 只读取这两项元数据，完整正文保持未加载；`skill_name=auto` 时，模型根据 system prompt 中的目录调用 `load_skill(name)`，Loader 才读取对应的完整 `SKILL.md`，并以 `ToolMessage` 追加到消息序列。下一次模型调用同时看到技能目录、`tool_result`、检索证据和当前问题。手动指定 `skill_name` 时跳过自动选择调用，但仍通过相同的 `load_skill → tool_result → messages` 路径加载正文。
 
-自动选择 Skill 会增加 1 次轻量 LLM 调用。刑事 Skill 自动启用 KG 时仅进行本地罪名精确匹配；只有请求显式设置 `use_kg=true` 且本地未命中时，才使用模型辅助识别罪名。
+自动选择 Skill 会增加 1 次轻量 LLM 调用。完整 Skill 进入状态图后，Tool Router 结合领域规则决定是否调用 CrimeKG；CrimeKG 工具本身只执行本地精确查询，不产生嵌套模型调用。
 
-### 4.2 查询变换
+### 4.2 工具决策与检索纠错
 
-查询变换用于缩小用户表达与法律材料之间的差异：
+Agent 只看到稳定的高层工具，底层 BM25、向量检索、重排、数据库回查和第三方 MCP 原始工具不会直接暴露：
 
-| 策略 | 执行方式 | 适用场景 |
+| 工具 | 输入 | 返回结果 |
 |---|---|---|
-| `none` | 直接使用原问题 | 问题清晰、追求低成本 |
-| `multi_query` | 从不同角度生成多个查询 | 表述模糊或涉及多个术语 |
-| `hyde` | 生成假设法律文本用于向量查询 | 口语问题与法条差异较大 |
-| `decompose` | 将复杂问题拆成多个子问题 | 一个问题包含多个法律关系 |
-| `multi_query_hyde` | 并行执行多查询和 HyDE | 追求召回范围，允许更高成本 |
+| `retrieve_legal_evidence` | Query、`laws/cases/all`、Top K | Child 精排后恢复的完整 Parent 证据 |
+| `lookup_crime_knowledge` | 罪名 | 概念、构成要件、认定、处罚和关联法条 |
+| `get_original_source` | Parent 或 Child ID | MySQL 中的完整来源和原始位置 |
+| `search_statutes` | Query、标题/全文范围、效力状态、Top K | 国家法律法规数据库中的法规列表与 `regulation_id` |
+| `get_statute_articles` | `regulation_id`、关键词 | 法规中直接命中的具体条文 |
+| `search_court_cases` | Query、Top K | 人民法院案例库中的指导性案例与参考案例 |
+| `get_court_case` | `case_id`、章节列表 | 裁判要点、基本案情、裁判理由和关联法条 |
+| `search_official_legal_web` | Query、Top K | 限定官方域名的最新法律网页结果 |
+| `fetch_official_legal_page` | 官方网页 URL | 可作为回答证据的网页正文 |
 
-HyDE 采用“分离式检索”：原始问题交给 BM25，以保留关键词；假设文档交给向量检索，以缩小问题文本与法律文本之间的语义差异。
+LLM 使用 `tool_choice=auto` 选择工具和参数。若首轮没有选择 `retrieve_legal_evidence`，策略层自动补充该调用，从而保证法律答案一定先经过本地知识库检索。本地证据缺失、需要核验效力状态或问题涉及最新政策时，LLM 再选择相应的外部 MCP。所有外部结果以 `Document` 进入同一 Evidence Grader、四阶段压缩和 Grounding 流程。工具轮次最多 3 轮、法律检索最多 2 轮，达到上限后使用现有证据继续生成，不会无限循环。
 
 ### 4.3 混合检索
 
@@ -640,9 +633,9 @@ HyDE 采用“分离式检索”：原始问题交给 BM25，以保留关键词�
 
 因此 ChromaDB 可以随时由 MySQL 数据重建，在线答案不会依赖向量库中的正文副本。用户可以只检索法规、只检索案例，或者同时检索两个 Collection。
 
-### 4.4 犯罪知识增强
+### 4.4 CrimeKG 工具
 
-启用 `use_kg` 后，系统从问题中识别罪名，并在 CrimeKG 转换得到的结构化知识中精确查找定义、构成要件、量刑和相关法条。命中结果会作为高优先级文档并入检索结果。
+Tool Router 判断问题需要罪名结构化知识时调用 `lookup_crime_knowledge`，在 CrimeKG 中精确查找定义、构成要件、量刑和相关法条。命中结果作为高优先级证据并入 Agent 状态。
 
 犯罪知识模块采用轻量结构化查找：将罪名映射到定义、构成要件、量刑和关联法条，以常数时间完成精确查询，省去独立图数据库的部署与维护成本。
 
@@ -664,7 +657,7 @@ parent_score = max(child_rerank_score) + min(hit_count - 1, 3) × 0.02
 
 ### 4.6 四阶段上下文压缩与答案生成
 
-Child 重排序并聚合回查得到的 Parent，与 CrimeKG 精确命中结果合并后进入 `FourStageContextCompactor`，以默认 4,000 Token 证据窗口执行四阶段压缩。整个过程使用确定性算法，不调用模型：
+四阶段压缩执行两次：第一次把检索、CrimeKG 和来源回查产生的大型 Tool Result 压缩到默认 1,800 Token 后写入 `ToolMessage`；第二次将 Agent 累积的 Parent 与 KG 证据压缩到默认 4,000 Token，供答案生成使用。整个压缩过程使用确定性算法，不调用模型：
 
 | 阶段 | 处理方式 | 法律场景约束 |
 |---|---|---|
@@ -679,11 +672,11 @@ Child 重排序并聚合回查得到的 Parent，与 CrimeKG 精确命中结果�
 |---|---|
 | `standard` | 基于资料直接回答 |
 | `structured_legal` | 输出法律结论、适用依据、分析和注意事项 |
-| `self_reflect` | 首次生成后检查引用和事实，必要时修正一次 |
+| `self_reflect` | 保留兼容的生成风格；所有输出仍统一经过 Graph Grounding 校验 |
 
 三种策略分别承担快速基线、法律场景结构化输出和高质量纠错职责。复杂法律分析统一由 `structured_legal` 输出结论、依据和详细分析，避免重复的生成路径。
 
-最终响应还包括 `conversation_id`、补全后的问题、当前 Skill、上下文压缩统计、来源文档、识别罪名，以及查询变换、检索、KG、重排、压缩、生成和总耗时。
+答案生成后，Grounding Checker 判断法律结论是否得到证据支持、关键结论是否具有来源；未通过时最多重新生成一次。最终响应包括 `agent_trace`、工具轮次、检索轮次、Grounding 状态、当前 Skill、上下文压缩统计、来源文档和各节点耗时。
 
 ### 4.7 贯穿示例：入室盗窃如何认定和处罚
 
@@ -707,25 +700,32 @@ flowchart LR
         B2 --> D3[CrimeKG 罪名内存索引]
     end
 
-    subgraph ONLINE[在线 RAG 问答]
+    subgraph ONLINE[在线 Agentic RAG]
         Q[用户问题<br/>入室盗窃数额不大会构成犯罪吗] --> MEM[加载短期 Memory]
         MEM --> CAT[system prompt 提供 Skill 目录]
         CAT --> CALL[LLM 调用 load_skill criminal_law]
         CALL --> SK[完整 SKILL.md 进入 tool_result]
-        SK --> T[查询变换或直接检索]
-        T --> V[ChromaDB 向量召回<br/>Child ID]
-        T --> BM[MySQL Child 语料<br/>BM25 检索]
+        SK --> T[LLM Tool Router]
+        T --> RT[调用 retrieve_legal_evidence<br/>laws + cases]
+        T --> KG[调用 lookup_crime_knowledge<br/>盗窃罪]
+        RT --> V[ChromaDB 向量召回<br/>Child ID]
+        RT --> BM[MySQL Child 语料<br/>BM25 检索]
         V --> R[按 child_chunk_id<br/>RRF 融合]
         BM --> R
         R --> CH[MySQL 批量回查 Child 原文]
         CH --> RR[仅重排序 Child]
         RR --> PA[按 parent_chunk_id 聚合]
         PA --> PH[MySQL 回查 Top Parent]
-        Q --> KG[识别盗窃罪<br/>查询 CrimeKG]
-        PH --> CTX[Budget → Snip → Micro → Summary]
-        KG --> CTX
+        PH --> TR[压缩为 ToolMessage]
+        KG --> TR
+        TR --> EG{证据是否充分}
+        EG -->|否| RW[改写检索 Query]
+        RW --> T
+        EG -->|是| CTX[Budget → Snip → Micro → Summary]
         CTX --> GEN[Qwen 生成结构化法律回答]
-        GEN --> SAVE[更新短期 Memory]
+        GEN --> GC{Grounding 与引用校验}
+        GC -->|未通过且未超限| GEN
+        GC -->|通过| SAVE[更新短期 Memory]
         SAVE --> OUT[返回结论、法条、分析<br/>来源和阶段指标]
     end
 
@@ -743,12 +743,12 @@ flowchart LR
 2. **离线整理罪名知识**：CrimeKG 中“盗窃罪”的 `gainian`、`tezheng`、`chufa`、`fatiao` 等字段被展开为可检索文本，同时建立以“盗窃罪”为键的内存索引；
 3. **离线整理案例**：CAIL2018 中罪名为盗窃、关联法条为264的案件被转换为案例文档，保留案件事实、罪名、刑期和来源信息；
 4. **双库存储**：原文、Parent 和 Child 先写入 MySQL；仅 Child 调用 `text-embedding-v3`，法规与 CrimeKG Child 写入 ChromaDB `laws`，案例 Child 写入 `cases`，向量记录 ID 等于 `child_chunk_id`；
-5. **恢复会话并加载 Skill**：系统按 `conversation_id` 读取最近问答；模型从 system prompt 的技能目录中选择 `criminal_law` 并调用 `load_skill`，完整刑事规则以 `tool_result` 进入消息列表；
-6. **在线 Child 召回**：问题 Embedding 查询 ChromaDB `laws + cases` 得到 Child ID，同时 BM25 在 MySQL Child 语料中匹配“入室盗窃”“数额”等关键词，RRF 按 ID 合并两路排名；
-7. **回查、精排与 Parent 扩展**：系统从 MySQL 批量取得候选 Child 原文，仅对 Child 执行 `simple` 或 `cloud` 重排；再按 `parent_chunk_id` 聚合命中，从 MySQL 回查刑法完整条文和完整案例事实，同时合并 CrimeKG 的构成要件与处罚知识；
-8. **四阶段压缩**：系统计算 Token 预算，限制单篇文档长度，去除重复证据，并在超限时抽取案例关键原句；法条原文和来源标识保持可追溯；
-9. **基于证据生成**：`structured_legal` Prompt 同时接收领域 Skill、短期记忆和压缩证据，按照“法律结论—适用法律—详细分析—注意事项”组织答案；
-10. **更新记忆与评测**：答案、问题和来源 ID 写回短期 Memory；接口返回 Skill、压缩统计、来源和阶段耗时，评测任务计算 Recall@5、MRR@10、P95 Latency 和 Faithfulness。
+5. **恢复会话并加载 Skill**：系统按 `conversation_id` 读取最近问答；模型选择 `criminal_law` 并调用 `load_skill`，完整刑事规则以 `ToolMessage` 进入 Agent 状态；
+6. **Agent 工具决策**：Tool Router 选择 `retrieve_legal_evidence(query, all, 5)`，并为罪名结构调用 `lookup_crime_knowledge(盗窃罪)`；策略层确保法律检索不会被跳过；
+7. **检索工具执行**：问题 Embedding 查询 ChromaDB 得到 Child ID，BM25 在 MySQL Child 中匹配关键词，RRF 融合后回查 Child 原文、完成 Child 精排并恢复完整 Parent；
+8. **证据评估与纠错检索**：大型工具结果先经过四阶段压缩再写回消息；Evidence Grader 判断法条、构成要件和案例是否足够，不足时生成针对性 Query 并在有界循环中补充检索；
+9. **基于证据生成与校验**：最终证据再次压缩，生成模型组织结构化答案；Grounding Checker 检查结论和引用，未通过时最多重新生成一次；
+10. **更新记忆与评测**：答案、问题和来源 ID 写回短期 Memory；接口返回 Agent Trace、工具与检索轮次、Grounding 状态、来源及阶段耗时，并计算 Recall@5、MRR@10、P95 Latency 和 Faithfulness。
 
 该问题最终使用的证据上下文示意如下：
 
@@ -776,13 +776,14 @@ flowchart LR
 ```text
 backend/
 ├── app/
+│   ├── agentic/             # LangGraph 状态、节点、Prompt 与高层工具注册表
 │   ├── api/                 # 问答、知识库、来源追溯、性能接口
 │   ├── context/             # Budget、Snip、Micro、Summary 四阶段压缩
 │   ├── core/                # LLM、Embedding、ChromaDB、检索器
 │   ├── db/                  # SQLAlchemy 表模型与 Parent/Child Repository
 │   ├── memory/              # 带 TTL 的短期会话记忆
 │   ├── models/              # Pydantic 请求与响应模型
-│   ├── services/            # 导入服务、RAG 管线及各项策略
+│   ├── services/            # 导入、检索执行与生成能力
 │   ├── skills/              # frontmatter 扫描器、按需加载器与 load_skill 工具
 │   ├── utils/               # 法律分块、Parent/Child 分块和元数据工具
 │   ├── config.py            # 环境变量与默认配置
@@ -794,7 +795,7 @@ backend/
 └── chroma_db/               # 本地向量数据库
 ```
 
-`services/ingestion_service.py` 负责“先写 MySQL、再建 Child 向量索引”的离线链路；`services/pipeline.py` 是在线问答主入口，串联 Memory、Skill Loading、查询变换、Child 召回与回查、Child 重排序、Parent 聚合与回查、Context Compact、生成和 Memory 更新。
+`services/ingestion_service.py` 负责“先写 MySQL、再建 Child 向量索引”的离线链路；`agentic/runtime.py` 是唯一在线问答入口，使用 LangGraph 串联 Memory、Skill Loading、工具决策、证据评估、自适应改写、上下文压缩、生成与 Grounding 校验。`services/pipeline.py` 提供检索、重排、Parent 聚合和生成等底层能力，不再暴露传统问答分支。
 
 ### 5.2 主要 API
 
@@ -826,10 +827,8 @@ backend/
 {
   "question": "公司拖欠工资三个月，员工应该如何维权？",
   "collection": "all",
-  "query_transform": "none",
   "rerank_strategy": "simple",
-  "generation_strategy": "standard",
-  "use_kg": false,
+  "generation_strategy": "structured_legal",
   "conversation_id": "7ed4fef8aab44f20831b78495cebd8f2",
   "skill_name": "auto",
   "top_k": 5,
@@ -886,6 +885,19 @@ RERANKER_DOCUMENT_MAX_CHARS=1200
 CONTEXT_MAX_TOKENS=4000
 MEMORY_TTL_SECONDS=86400
 MEMORY_MAX_TURNS=6
+AGENT_MAX_TOOL_ROUNDS=3
+AGENT_MAX_RETRIEVAL_ROUNDS=2
+AGENT_MAX_GENERATION_ROUNDS=2
+AGENT_TOOL_RESULT_MAX_TOKENS=1800
+EXTERNAL_MCP_ENABLED=true
+FLK_MCP_ENABLED=true
+FLK_MCP_URL=http://127.0.0.1:18062/mcp
+RMFYALK_MCP_ENABLED=true
+RMFYALK_MCP_URL=http://127.0.0.1:18061/mcp
+TAVILY_MCP_ENABLED=true
+TAVILY_MCP_URL=https://mcp.tavily.com/mcp
+TAVILY_API_KEY=tvly-your-api-key
+TAVILY_LEGAL_DOMAINS=["flk.npc.gov.cn","court.gov.cn","spp.gov.cn","gov.cn","moj.gov.cn"]
 MYSQL_URL=mysql+pymysql://root:your-password@127.0.0.1:3306/lawrag?charset=utf8mb4
 MYSQL_ECHO=false
 CHUNKER_VERSION=parent-child-v1
@@ -895,9 +907,31 @@ CHILD_RERANK_TOP_K=15
 PARENT_TOP_K=5
 ```
 
-复制 `backend/.env.example` 为 `backend/.env` 并填写环境变量。真实密钥仅保存在 `.env`，该文件已被 Git 忽略。云端 Reranker 使用带业务空间 ID 的独立文本排序 Endpoint，Chat 和 Embedding 使用 OpenAI 兼容地址。
+复制 `backend/.env.example` 为 `backend/.env` 并填写环境变量。真实密钥仅保存在 `.env`，该文件已被 Git 忽略。云端 Reranker 使用带业务空间 ID 的独立文本排序 Endpoint，Chat 和 Embedding 使用 OpenAI 兼容地址。`TAVILY_API_KEY` 留空时，Tavily 的两个工具不会注册到 LLM 工具池，也不会产生 Tavily 调用。
 
-### 6.3 准备数据与建立索引
+### 6.3 安装并启动法律 MCP
+
+项目通过官方 MCP Python SDK 连接 Streamable HTTP 服务。安装脚本把社区法律 MCP 下载到已忽略的 `backend/external/`，不会把第三方源码提交到本项目：
+
+```powershell
+cd "D:\LLM study\LawRAG\LawRAG\backend"
+.\.venv\Scripts\Activate.ps1
+.\scripts\setup_legal_mcps.ps1
+.\scripts\start_legal_mcps.ps1
+python -m scripts.check_mcp_servers
+```
+
+启动后使用以下端点：
+
+| 服务 | MCP 地址 | 本项目开放的工具 | 认证 |
+|---|---|---|---|
+| 国家法律法规数据库 MCP | `http://127.0.0.1:18062/mcp` | `search_statutes`、`get_statute_articles` | 无 |
+| 人民法院案例库 MCP | `http://127.0.0.1:18061/mcp` | `search_court_cases`、`get_court_case` | 首次使用需按上游说明配置 Token |
+| Tavily MCP | `https://mcp.tavily.com/mcp` | `search_official_legal_web`、`fetch_official_legal_page` | `TAVILY_API_KEY` |
+
+LawRAG 不暴露下载、导出、登录、全站爬取等 MCP 原始工具。适配层限制结果数，对查询中的手机号和身份证号进行脱敏，并拒绝 Tavily 提取白名单以外的 URL。服务启动只完成工具注册，不访问任何外部 MCP；实际调用只发生在 Tool Router 选择对应工具之后。
+
+### 6.4 准备数据与建立索引
 
 ```powershell
 cd "D:\LLM study\LawRAG\LawRAG\backend"
@@ -909,7 +943,7 @@ python -m scripts.import_data
 
 `init_mysql` 创建 Documents、Parent Chunks 和 Child Chunks 三张表，不调用模型。`prepare_datasets` 完成本地格式转换；`import_data` 先把原文及父子块写入 MySQL，再批量调用 `text-embedding-v3` 生成 Child 向量并写入 ChromaDB。旧版 ChromaDB 记录不含稳定 Child ID，升级后需要重新执行一次 `import_data`。
 
-### 6.4 启动后端和前端
+### 6.5 启动后端和前端
 
 后端：
 
@@ -933,7 +967,7 @@ npm run dev
 - 后端文档：`http://127.0.0.1:8000/docs`
 - 健康检查：`http://127.0.0.1:8000/health`
 
-模型调用发生在自动 Skill 选择、问答、查询变换、云端重排、Faithfulness 评测和索引构建阶段；手动指定 Skill 可以跳过自动选择调用，Recall@5、MRR@10 与 P95 Latency 的计算不额外调用模型。
+在线 Agentic RAG 的模型调用发生在 Skill 选择、工具决策、证据充分性判断、必要的查询改写、答案生成和 Grounding 校验阶段；每轮法律检索还会调用一次 Embedding，选择 `cloud` 时增加一次云端重排。工具与生成循环均有硬上限。Faithfulness 评测和索引构建也会独立调用模型；Recall@5、MRR@10 与 P95 Latency 的指标计算本身不额外调用模型。
 
 ---
 
@@ -948,13 +982,15 @@ npm run dev
 | 测试文件 | 覆盖内容 |
 |---|---|
 | `test_basic.py` | 配置、法律分块、案例分块、元数据格式化 |
-| `test_pipeline.py` | 管线默认值、策略枚举、兼容参数映射 |
+| `test_pipeline.py` | 底层检索与生成配置、策略枚举、兼容参数映射 |
 | `test_advanced_retrieval.py` | 法律术语规范化、上下文标头 |
 | `test_kg.py` | 犯罪知识加载和罪名查找 |
 | `test_cloud_reranker.py` | 云端排序请求格式、响应映射、配置检查和无网络降级 |
 | `test_rag_evaluation.py` | Recall@5、MRR@10、指标聚合和 P95 计算 |
 | `test_context_memory_skills.py` | 四阶段压缩、TTL Memory、frontmatter 扫描、按需正文加载和 `load_skill` Tool |
 | `test_parent_child_storage.py` | 稳定父子 ID、MySQL 回查、Child 权威正文、Child 精排与 Parent 聚合 |
+| `test_agentic_rag.py` | LangGraph 节点顺序、LLM 工具决策、强制检索策略、证据评估和 Grounding 校验 |
+| `test_external_mcp.py` | MCP 工具注册、底层参数映射、查询脱敏、结果上限和官方域名白名单 |
 
 ```powershell
 cd backend
@@ -988,7 +1024,10 @@ python -m scripts.run_quality_eval
 
 项目通过以下机制保证管线稳定性和结果可分析性：
 
-- **策略可替换**：查询变换、重排序和生成分别由枚举配置，支持独立组合与对比；
+- **单一 Agentic 主链路**：所有问答统一进入 LangGraph，不保留传统 RAG 路由；
+- **有界自主决策**：LLM 选择高层工具和补充查询，工具轮次、检索轮次与生成轮次均有硬上限；
+- **强制知识检索**：策略层保证每个法律回答至少调用一次 `retrieve_legal_evidence`；
+- **证据闭环**：Evidence Grader 控制补充检索，Grounding Checker 控制答案修正；
 - **事实库与索引分离**：MySQL 是原文、Parent 和 Child 的唯一事实来源，ChromaDB 是可重建的 Child 向量索引；
 - **父子索引**：短 Child 负责精确召回与重排，完整 Parent 负责生成证据，兼顾检索精度与语义完整性；
 - **稳定 ID 关联**：`doc_id → parent_chunk_id → child_chunk_id` 使用确定性 ID 串联导入、检索、删除、重建和来源回查；

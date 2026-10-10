@@ -7,17 +7,13 @@ export default function ChatPage() {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  const [useRerank, setUseRerank] = useState(true)
-  const [useRewrite, setUseRewrite] = useState(false)
   const [collection, setCollection] = useState('all')
   const [enableMonitor, setEnableMonitor] = useState(true)
   const [enableQuality, setEnableQuality] = useState(false)
 
-  // 高级管线选项
-  const [queryTransform, setQueryTransform] = useState('none')
+  // Agentic RAG 执行策略
   const [rerankStrategy, setRerankStrategy] = useState('simple')
   const [generationStrategy, setGenerationStrategy] = useState('standard')
-  const [useKg, setUseKg] = useState(false)
   const [skillName, setSkillName] = useState('auto')
   const conversationIdRef = useRef(
     globalThis.crypto?.randomUUID?.() || `lawrag-${Date.now()}`
@@ -90,15 +86,11 @@ export default function ChatPage() {
     try {
       const result = await sendChat({
         question: q,
-        useRerank,
-        useQueryRewrite: useRewrite,
         collection,
         evaluateQuality: enableQuality,
         monitorSystem: enableMonitor,
-        queryTransform,
         rerankStrategy,
         generationStrategy,
-        useKg,
         conversationId: conversationIdRef.current,
         skillName,
       })
@@ -121,6 +113,7 @@ export default function ChatPage() {
         pipelineConfig: result.pipeline_config,
         activeSkill: result.active_skill,
         contextCompaction: result.context_compaction,
+        agentTrace: result.agent_trace,
       }])
     } catch (err) {
       stopLiveMonitor()
@@ -172,16 +165,7 @@ export default function ChatPage() {
     <div className="chat-container">
       <div className="options-bar">
         <div className="option-group">
-          <span className="option-group-label">检索配置</span>
-          <label className="option-label" title="查询变换策略">
-            <select className="select-small" value={queryTransform} onChange={e => setQueryTransform(e.target.value)}>
-              <option value="none">无变换</option>
-              <option value="multi_query">多查询扩展</option>
-              <option value="hyde">HyDE</option>
-              <option value="decompose">子问题分解</option>
-              <option value="multi_query_hyde">多查询+HyDE</option>
-            </select>
-          </label>
+          <span className="option-group-label">Agentic RAG</span>
           <label className="option-label" title="重排策略">
             <select className="select-small" value={rerankStrategy} onChange={e => setRerankStrategy(e.target.value)}>
               <option value="none">不重排</option>
@@ -199,10 +183,6 @@ export default function ChatPage() {
             <option value="laws">法律条文</option>
             <option value="cases">指导案例</option>
           </select>
-          <label className="option-label">
-            <input type="checkbox" checked={useKg} onChange={e => setUseKg(e.target.checked)} />
-            KG增强
-          </label>
           <select className="select-small" value={skillName} onChange={e => setSkillName(e.target.value)} title="按需加载法律领域 Skill">
             <option value="auto">Skill 自动路由</option>
             <option value="general_legal">通用法律</option>
@@ -310,10 +290,32 @@ export default function ChatPage() {
                   <span className="metric-tag">Memory {msg.metrics.memory_turns} 轮</span>
                   <span className="metric-tag">Child {msg.metrics.retrieved_child_count}→{msg.metrics.reranked_child_count}</span>
                   <span className="metric-tag">Parent {msg.metrics.parent_candidate_count}</span>
+                  <span className="metric-tag">Agent {msg.metrics.agent_rounds} 轮 / {msg.metrics.agent_tool_calls} 工具</span>
+                  <span className="metric-tag">检索轮次 {msg.metrics.retrieval_rounds}</span>
+                  <span className="metric-tag">证据判断 {msg.metrics.evidence_grade_ms}ms</span>
+                  <span className="metric-tag">引用校验 {msg.metrics.grounding_passed ? '通过' : '未通过'}</span>
                   <span className="metric-tag">生成 {msg.metrics.generation_ms}ms</span>
                   {msg.metrics.self_reflect_ms != null && <span className="metric-tag">反思 {msg.metrics.self_reflect_ms}ms</span>}
                   <span className="metric-tag">总计 {msg.metrics.total_ms}ms</span>
                 </div>
+              )}
+
+              {msg.agentTrace?.length > 0 && (
+                <details style={{ marginTop: 10 }}>
+                  <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-muted)' }}>
+                    Agent Trace ({msg.agentTrace.length} 个节点)
+                  </summary>
+                  <div className="metrics-bar" style={{ marginTop: 6 }}>
+                    {msg.agentTrace.map((item, index) => (
+                      <span className="metric-tag" key={`${item.node}-${index}`}>
+                        {index + 1}. {item.node}
+                        {item.tools?.length > 0 && `: ${item.tools.join(', ')}`}
+                        {item.sufficient != null && `: ${item.sufficient ? '证据充分' : '证据不足'}`}
+                        {item.passed != null && `: ${item.passed ? '通过' : '未通过'}`}
+                      </span>
+                    ))}
+                  </div>
+                </details>
               )}
 
               {/* 内联性能监控面板 */}

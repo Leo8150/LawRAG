@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -94,3 +94,34 @@ class ChildChunk(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     parent: Mapped[ParentChunk] = relationship(back_populates="children")
+
+
+class MemoryEntry(Base):
+    """MySQL source of truth for semantic and episodic long-term memory."""
+
+    __tablename__ = "memory_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "memory_type", "content_hash", name="uk_memory_user_type_content"
+        ),
+        Index("idx_memory_user_type_active", "user_id", "memory_type", "is_active"),
+    )
+
+    memory_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(128), index=True)
+    memory_type: Mapped[str] = mapped_column(String(32), index=True)
+    category: Mapped[str] = mapped_column(String(32), default="")
+    content: Mapped[str] = mapped_column(LONG_TEXT)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True)
+    source_kind: Mapped[str] = mapped_column(String(32), default="user_confirmed")
+    is_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=1.0)
+    memory_metadata: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+    index_status: Mapped[str] = mapped_column(String(32), default="pending", index=True)
+    access_count: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+    last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

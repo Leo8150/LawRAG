@@ -1,6 +1,7 @@
 """Pydantic 数据模型"""
 
 from datetime import datetime
+from typing import Literal
 from uuid import uuid4
 from pydantic import BaseModel, Field
 
@@ -57,6 +58,12 @@ class QualityAggregated(BaseModel):
 
 # ===================== 问答 =====================
 
+class ConfirmedMemoryInput(BaseModel):
+    """Information the user explicitly authorized as long-term semantic memory."""
+
+    category: Literal["case_fact", "preference"]
+    content: str = Field(..., min_length=1, max_length=1000)
+
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     use_rerank: bool = True
@@ -71,6 +78,10 @@ class ChatRequest(BaseModel):
     generation_strategy: str = Field("standard", pattern=r"^(standard|self_reflect|structured_legal)$")
     use_kg: bool = False
     conversation_id: str = Field(default_factory=lambda: uuid4().hex, min_length=8, max_length=64)
+    thread_id: str | None = Field(default=None, min_length=8, max_length=64)
+    user_id: str | None = Field(default=None, min_length=1, max_length=128)
+    memory_mode: Literal["off", "read", "read_write"] = "off"
+    confirmed_memories: list[ConfirmedMemoryInput] = Field(default_factory=list, max_length=10)
     skill_name: str = Field(
         "auto",
         pattern=r"^(auto|general_legal|criminal_law|labor_law|contract_law|traffic_law)$",
@@ -107,6 +118,14 @@ class StageMetrics(BaseModel):
     retrieved_child_count: int = 0
     reranked_child_count: int = 0
     parent_candidate_count: int = 0
+    evidence_grade_ms: float = 0.0
+    grounding_check_ms: float = 0.0
+    agent_tool_calls: int = 0
+    agent_rounds: int = 0
+    retrieval_rounds: int = 0
+    grounding_passed: bool = False
+    long_term_memory_retrieved: int = 0
+    long_term_memory_written: int = 0
 
 
 class ChatResponse(BaseModel):
@@ -122,9 +141,14 @@ class ChatResponse(BaseModel):
     generation_strategy: str | None = None
     pipeline_config: dict | None = None
     conversation_id: str | None = None
+    thread_id: str | None = None
+    memory_mode: str = "off"
+    recalled_memory_ids: list[str] = []
+    written_memory_ids: list[str] = []
     resolved_question: str | None = None
     active_skill: str | None = None
     context_compaction: dict | None = None
+    agent_trace: list[dict] = []
 
 
 # ===================== 知识库 =====================

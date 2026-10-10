@@ -77,6 +77,38 @@ class Settings(BaseSettings):
     CONTEXT_MAX_TOKENS: int = 4000
     MEMORY_TTL_SECONDS: int = 86400
     MEMORY_MAX_TURNS: int = 6
+    SHORT_TERM_RECENT_TURNS: int = 3
+    SHORT_TERM_SUMMARY_MAX_CHARS: int = 2400
+    SHORT_TERM_MAX_CASE_FACTS: int = 20
+    LONG_TERM_MEMORY_ENABLED: bool = True
+    MEMORY_COLLECTION: str = "long_term_memory"
+    MEMORY_RECALL_TOP_K: int = 6
+    MEMORY_MAX_WRITES_PER_TURN: int = 8
+
+    # --- Agentic RAG 有界执行图 ---
+    AGENT_MAX_TOOL_ROUNDS: int = 3
+    AGENT_MAX_RETRIEVAL_ROUNDS: int = 2
+    AGENT_MAX_GENERATION_ROUNDS: int = 2
+    AGENT_TOOL_RESULT_MAX_TOKENS: int = 1800
+
+    # --- 外部法律 MCP（只读工具）---
+    EXTERNAL_MCP_ENABLED: bool = True
+    MCP_TIMEOUT_SECONDS: float = 30.0
+    MCP_TOOL_RESULT_MAX_CHARS: int = 12000
+    FLK_MCP_ENABLED: bool = True
+    FLK_MCP_URL: str = "http://127.0.0.1:18062/mcp"
+    RMFYALK_MCP_ENABLED: bool = True
+    RMFYALK_MCP_URL: str = "http://127.0.0.1:18061/mcp"
+    TAVILY_MCP_ENABLED: bool = True
+    TAVILY_MCP_URL: str = "https://mcp.tavily.com/mcp"
+    TAVILY_API_KEY: str = ""
+    TAVILY_LEGAL_DOMAINS: list[str] = [
+        "flk.npc.gov.cn",
+        "court.gov.cn",
+        "spp.gov.cn",
+        "gov.cn",
+        "moj.gov.cn",
+    ]
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

@@ -8,7 +8,7 @@ from app.api import chat, knowledge, performance, sources
 
 app = FastAPI(
     title=f"LawRAG — {settings.APP_NAME}",
-    description="基于 LangChain、DashScope 与 ChromaDB 的法律检索增强问答系统",
+    description="基于 LangGraph、LangChain、MySQL 与 ChromaDB 的法律 Agentic RAG 系统",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
