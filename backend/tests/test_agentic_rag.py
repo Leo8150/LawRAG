@@ -200,3 +200,37 @@ def test_agentic_graph_reads_and_writes_long_term_memory_only_when_authorized(mo
     assert result.written_memory_ids == ["memory-new", "episode-new"]
     assert result.metrics.long_term_memory_retrieved == 1
     assert result.metrics.long_term_memory_written == 2
+
+
+def test_agent_requested_compaction_runs_after_complete_tool_batch(monkeypatch, tmp_path):
+    from app.agentic import runtime as runtime_module
+
+    class CompactingAgentLLM(FakeAgentLLM):
+        async def ainvoke(self, messages):
+            system = str(messages[0].content)
+            if "上下文状态整理器" in system:
+                return AIMessage(content="已完成检索，保留合同效力证据。")
+            if "检索协调器" in system:
+                return AIMessage(content="", tool_calls=[
+                    {"name": "compact_history", "args": {}, "id": "compact-1"},
+                    {
+                        "name": "retrieve_legal_evidence",
+                        "args": {"query": "合同法律效力", "collection": "laws", "top_k": 5},
+                        "id": "retrieve-1",
+                    },
+                ])
+            return await super().ainvoke(messages)
+
+    monkeypatch.setattr(runtime_module, "get_llm", lambda **kwargs: CompactingAgentLLM())
+    runner = runtime_module.AgenticRAGRunner(FakePipeline())
+    runner.message_compactor = runtime_module.MessageContextCompactor(tmp_path)
+
+    result = asyncio.run(runner.run(
+        "合同成立后是否有效？",
+        thread_id="agent-compact-tool",
+    ))
+
+    message_stats = result.context_compaction["message_history"]
+    assert message_stats["stages"] == ["compact_history"]
+    assert message_stats["summary_used"] is True
+    assert message_stats["transcript_count"] == 1

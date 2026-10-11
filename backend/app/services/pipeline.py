@@ -18,7 +18,7 @@ from app.services.prompts import (
 )
 from app.models.schemas import ChatResponse
 from app.config import settings
-from app.context import FourStageContextCompactor
+from app.context import LegalEvidencePacker
 from app.skills import LegalSkill, load_skill, skill_loader
 from app.db.repository import ParentChildRepository, get_parent_child_repository
 
@@ -466,5 +466,5 @@ def resolve_collections(collection: str) -> list[str]:
 
 
 def build_context(docs: list[Document], max_length: int = 4000) -> str:
-    """兼容旧调用方式，内部统一使用四阶段上下文压缩器。"""
-    return FourStageContextCompactor(max_context_tokens=max_length).compact(docs).context
+    """兼容旧调用方式，内部统一使用法律证据打包器。"""
+    return LegalEvidencePacker(max_context_tokens=max_length).compact(docs).context

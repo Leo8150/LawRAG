@@ -40,6 +40,7 @@ class AgenticRAGState(TypedDict, total=False):
     compacted_context: str
     compacted_documents: list[Document]
     compaction: dict[str, Any]
+    message_compaction: dict[str, Any]
     answer: str
     grounding_feedback: str
     grounding_passed: bool

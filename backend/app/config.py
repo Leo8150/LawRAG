@@ -75,6 +75,15 @@ class Settings(BaseSettings):
 
     # --- 上下文工程与短期记忆 ---
     CONTEXT_MAX_TOKENS: int = 4000
+    CONTEXT_CHAR_LIMIT: int = 50000
+    CONTEXT_TARGET_RATIO: float = 0.8
+    CONTEXT_MAX_MESSAGES: int = 50
+    TOOL_RESULT_BUDGET_CHARS: int = 200000
+    LARGE_TOOL_RESULT_CHAR_LIMIT: int = 30000
+    TOOL_RESULT_PREVIEW_CHARS: int = 2000
+    CONTEXT_KEEP_RECENT_TOOL_RESULTS: int = 3
+    CONTEXT_MAX_REACTIVE_RETRIES: int = 1
+    CONTEXT_ARTIFACT_DIR: str = str(Path(__file__).resolve().parent.parent.parent)
     MEMORY_TTL_SECONDS: int = 86400
     MEMORY_MAX_TURNS: int = 6
     SHORT_TERM_RECENT_TURNS: int = 3
@@ -89,7 +98,6 @@ class Settings(BaseSettings):
     AGENT_MAX_TOOL_ROUNDS: int = 3
     AGENT_MAX_RETRIEVAL_ROUNDS: int = 2
     AGENT_MAX_GENERATION_ROUNDS: int = 2
-    AGENT_TOOL_RESULT_MAX_TOKENS: int = 1800
 
     # --- 外部法律 MCP（只读工具）---
     EXTERNAL_MCP_ENABLED: bool = True

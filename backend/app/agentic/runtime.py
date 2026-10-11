@@ -12,6 +12,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langgraph.graph import END, START, StateGraph
 
 from app.agentic.prompts import (
+    CONTEXT_SUMMARY_SYSTEM,
     EVIDENCE_GRADE_SYSTEM,
     GROUNDING_CHECK_SYSTEM,
     QUERY_REWRITE_SYSTEM,
@@ -20,7 +21,11 @@ from app.agentic.prompts import (
 from app.agentic.state import AgenticRAGState
 from app.agentic.tools import AgentToolRegistry, ToolExecution
 from app.config import settings
-from app.context import FourStageContextCompactor
+from app.context import (
+    LegalEvidencePacker,
+    MessageCompactionResult,
+    MessageContextCompactor,
+)
 from app.core.llm import get_llm
 from app.db.repository import get_parent_child_repository
 from app.memory import checkpoint_manager, long_term_memory, short_term_context
@@ -52,6 +57,16 @@ class AgenticRAGRunner:
     def __init__(self, pipeline: Any):
         self.pipeline = pipeline
         self.external_mcp = ExternalLegalMCPService()
+        self.message_compactor = MessageContextCompactor(
+            settings.CONTEXT_ARTIFACT_DIR,
+            context_char_limit=settings.CONTEXT_CHAR_LIMIT,
+            target_ratio=settings.CONTEXT_TARGET_RATIO,
+            tool_result_budget_chars=settings.TOOL_RESULT_BUDGET_CHARS,
+            large_result_char_limit=settings.LARGE_TOOL_RESULT_CHAR_LIMIT,
+            preview_chars=settings.TOOL_RESULT_PREVIEW_CHARS,
+            max_messages=settings.CONTEXT_MAX_MESSAGES,
+            keep_recent_results=settings.CONTEXT_KEEP_RECENT_TOOL_RESULTS,
+        )
         self.registry = AgentToolRegistry(
             retrieve=self._retrieve_tool,
             crime=self._crime_tool,
@@ -141,6 +156,7 @@ class AgenticRAGRunner:
             "compacted_context": "",
             "compacted_documents": [],
             "compaction": {},
+            "message_compaction": {},
             "answer": "",
             "grounding_feedback": "",
         }
@@ -300,13 +316,37 @@ class AgenticRAGRunner:
             f"当前已有证据数：{len(state.get('evidence', []))}\n"
             f"尚缺信息：{missing}"
         )
+        prepared = await self.message_compactor.prepare(
+            list(state.get("messages") or []),
+            state["resolved_question"],
+            self._summarize_message_history,
+        )
+        compacted_messages = prepared.messages
         llm = get_llm(temperature=0).bind_tools(self.registry.tools, tool_choice="auto")
-        decision = await llm.ainvoke([
-            SystemMessage(content=TOOL_ROUTER_SYSTEM),
-            *(state.get("messages") or []),
-            HumanMessage(content=prompt),
-        ])
-        self.pipeline.metrics["llm_calls"] += 1
+        reactive_retries = 0
+        while True:
+            try:
+                self.pipeline.metrics["llm_calls"] += 1
+                decision = await llm.ainvoke([
+                    SystemMessage(content=TOOL_ROUTER_SYSTEM),
+                    *compacted_messages,
+                    HumanMessage(content=prompt),
+                ])
+                break
+            except Exception as exc:
+                if (
+                    not self.message_compactor.is_context_limit_error(exc)
+                    or reactive_retries >= settings.CONTEXT_MAX_REACTIVE_RETRIES
+                ):
+                    raise
+                reactive = await self.message_compactor.reactive_compact(
+                    compacted_messages,
+                    state["resolved_question"],
+                    self._summarize_message_history,
+                )
+                compacted_messages = reactive.messages
+                prepared = reactive
+                reactive_retries += 1
         calls = [call for call in getattr(decision, "tool_calls", []) if self.registry.available(call.get("name", ""))]
         calls = calls[:3]
         for call in calls:
@@ -342,7 +382,8 @@ class AgenticRAGRunner:
         normalized = AIMessage(content="", tool_calls=calls)
         return {
             "tool_calls": calls,
-            "messages": [*(state.get("messages") or []), normalized],
+            "messages": [*compacted_messages, normalized],
+            "message_compaction": prepared.to_dict(),
             "trace": _trace(state, "decide_tools", tool_count=len(calls), tools=[c["name"] for c in calls]),
         }
 
@@ -352,6 +393,7 @@ class AgenticRAGRunner:
         messages = list(state.get("messages", []))
         retrieval_rounds = state.get("retrieval_rounds", 0)
         executed: list[str] = []
+        compact_requested = False
 
         for call in state.get("tool_calls", []):
             name = str(call.get("name", ""))
@@ -361,6 +403,8 @@ class AgenticRAGRunner:
                 execution = ToolExecution(content=f"工具执行失败：{type(exc).__name__}")
             if name == "retrieve_legal_evidence":
                 retrieval_rounds += 1
+            if name == "compact_history":
+                compact_requested = True
             evidence = self._merge_documents(evidence, execution.documents)
             entities = list(dict.fromkeys([*entities, *execution.entities]))
             messages.append(ToolMessage(
@@ -370,10 +414,37 @@ class AgenticRAGRunner:
             ))
             executed.append(name)
 
+        message_compaction = state.get("message_compaction", {})
+        if compact_requested:
+            requested = MessageCompactionResult(
+                messages=messages,
+                chars_before=self.message_compactor.estimate_chars(messages),
+                chars_after=0,
+                stages=["compact_history"],
+            )
+            requested.messages = await self.message_compactor.compact_history(
+                messages,
+                state["resolved_question"],
+                self._summarize_message_history,
+                requested,
+            )
+            requested.chars_after = self.message_compactor.estimate_chars(requested.messages)
+            messages = requested.messages
+            message_compaction = requested.to_dict()
+        else:
+            prepared = await self.message_compactor.prepare(
+                messages,
+                state["resolved_question"],
+                self._summarize_message_history,
+            )
+            messages = prepared.messages
+            message_compaction = prepared.to_dict()
+
         return {
             "evidence": evidence,
             "kg_entities": entities,
             "messages": messages,
+            "message_compaction": message_compaction,
             "tool_calls": [],
             "retrieval_rounds": retrieval_rounds,
             "tool_rounds": state.get("tool_rounds", 0) + 1,
@@ -391,7 +462,7 @@ class AgenticRAGRunner:
                 "trace": _trace(state, "grade_evidence", sufficient=False, evidence_count=0),
             }
 
-        preview = FourStageContextCompactor(2200).compact(
+        preview = LegalEvidencePacker(2200).compact(
             evidence,
             question=state["resolved_question"],
         ).context
@@ -446,7 +517,7 @@ class AgenticRAGRunner:
 
     async def _compact_context(self, state: AgenticRAGState) -> dict:
         started = time.time()
-        result = FourStageContextCompactor(settings.CONTEXT_MAX_TOKENS).compact(
+        result = LegalEvidencePacker(settings.CONTEXT_MAX_TOKENS).compact(
             state.get("evidence", []),
             question=state["resolved_question"],
             memory_context=state.get("memory_context", ""),
@@ -456,10 +527,12 @@ class AgenticRAGRunner:
         self.pipeline.metrics["context_compact_ms"] = round((time.time() - started) * 1000, 1)
         self.pipeline.metrics["context_tokens_before"] = result.tokens_before
         self.pipeline.metrics["context_tokens_after"] = result.tokens_after
+        compaction = result.to_dict()
+        compaction["message_history"] = state.get("message_compaction", {})
         return {
             "compacted_context": result.context,
             "compacted_documents": result.documents,
-            "compaction": result.to_dict(),
+            "compaction": compaction,
             "trace": _trace(state, "compact_context", document_count=len(result.documents)),
         }
 
@@ -512,6 +585,26 @@ class AgenticRAGRunner:
             return "finish"
         return "regenerate"
 
+    async def _summarize_message_history(
+        self,
+        messages: list[Any],
+        active_request: str,
+    ) -> str:
+        """Summarize archived history only after deterministic compaction is exhausted."""
+        transcript = "\n\n".join(
+            f"[{getattr(message, 'type', 'message')}] {str(message.content)}"
+            for message in messages
+        )
+        self.pipeline.metrics["llm_calls"] += 1
+        response = await get_llm(temperature=0).ainvoke([
+            SystemMessage(content=CONTEXT_SUMMARY_SYSTEM),
+            HumanMessage(content=(
+                f"当前用户请求：\n{active_request}\n\n"
+                f"需要整理的历史：\n{transcript}"
+            )),
+        ])
+        return str(response.content).strip()
+
     async def _retrieve_tool(self, query: str, collection: str, top_k: int) -> ToolExecution:
         original_collections = list(self.pipeline.config.collection_names)
         original_top_k = self.pipeline.config.top_k
@@ -535,22 +628,18 @@ class AgenticRAGRunner:
             self.pipeline.metrics["reranked_child_count"] += len(reranked)
             parents = self.pipeline._aggregate_and_hydrate_parents(reranked)
             self.pipeline.metrics["parent_candidate_count"] += len(parents)
-            compacted = FourStageContextCompactor(settings.AGENT_TOOL_RESULT_MAX_TOKENS).compact(
-                parents,
-                question=query,
-            )
-            return ToolExecution(content=compacted.context, documents=parents)
+            return ToolExecution(content=self._format_tool_documents(parents), documents=parents)
         finally:
             self.pipeline.config.collection_names = original_collections
             self.pipeline.config.top_k = original_top_k
 
     async def _crime_tool(self, crime_name: str) -> ToolExecution:
         entities, documents = await self.pipeline._kg_lookup(crime_name, allow_llm_fallback=False)
-        compacted = FourStageContextCompactor(settings.AGENT_TOOL_RESULT_MAX_TOKENS).compact(
-            documents,
-            question=crime_name,
+        return ToolExecution(
+            content=self._format_tool_documents(documents),
+            documents=documents,
+            entities=entities,
         )
-        return ToolExecution(content=compacted.context, documents=documents, entities=entities)
 
     async def _source_tool(self, chunk_id: str) -> ToolExecution:
         repository = self.pipeline.repository or get_parent_child_repository()
@@ -566,17 +655,22 @@ class AgenticRAGRunner:
             "doc_id": source.get("doc_id", ""),
             "source_file": source.get("source_file", ""),
         })
-        compacted = FourStageContextCompactor(settings.AGENT_TOOL_RESULT_MAX_TOKENS).compact([document])
-        return ToolExecution(content=compacted.context, documents=[document])
+        return ToolExecution(content=self._format_tool_documents([document]), documents=[document])
 
     async def _external_mcp_tool(self, name: str, arguments: dict) -> ToolExecution:
         result = await self.external_mcp.execute(name, arguments)
         document = Document(page_content=result.content, metadata=result.metadata)
-        compacted = FourStageContextCompactor(settings.AGENT_TOOL_RESULT_MAX_TOKENS).compact(
-            [document],
-            question=str(arguments.get("query") or arguments.get("keyword") or ""),
+        return ToolExecution(content=self._format_tool_documents([document]), documents=[document])
+
+    @staticmethod
+    def _format_tool_documents(documents: list[Document]) -> str:
+        """Keep tool evidence intact; the message compactor owns size reduction."""
+        if not documents:
+            return "未找到相关参考资料。"
+        return "\n\n".join(
+            f"[来源{index}] {format_source_display(document.metadata)}\n{document.page_content}"
+            for index, document in enumerate(documents, 1)
         )
-        return ToolExecution(content=compacted.context, documents=[document])
 
     @staticmethod
     def _merge_documents(current: list[Document], incoming: list[Document]) -> list[Document]:

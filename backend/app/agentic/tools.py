@@ -55,6 +55,10 @@ class AgentToolRegistry:
             """根据 parent_chunk_id 或 child_chunk_id 回查 MySQL 中的完整来源。"""
             return (await self._source(chunk_id)).content
 
+        async def compact_history() -> str:
+            """当前阶段结束后归档并压缩较早消息；仅在长任务上下文接近上限时使用。"""
+            return "Compaction requested after this tool batch."
+
         async def search_statutes(
             query: str,
             title_only: bool = False,
@@ -100,6 +104,11 @@ class AgentToolRegistry:
                 name="get_original_source",
                 description=get_original_source.__doc__,
             ),
+            StructuredTool.from_function(
+                coroutine=compact_history,
+                name="compact_history",
+                description=compact_history.__doc__,
+            ),
         ]
         external_functions = {
             "search_statutes": search_statutes,
@@ -134,6 +143,8 @@ class AgentToolRegistry:
             return await self._crime(str(arguments.get("crime_name", "")))
         if name == "get_original_source":
             return await self._source(str(arguments.get("chunk_id", "")))
+        if name == "compact_history":
+            return ToolExecution(content="Compaction requested after this tool batch.")
         if name in self._external_tool_names:
             return await self._call_external(name, arguments)
         raise ValueError(f"未注册的 Agent 工具: {name}")

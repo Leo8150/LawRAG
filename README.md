@@ -49,7 +49,8 @@ LawRAG 围绕法律文本特点实现以下能力：
 - 使用 LangGraph State + Checkpointer 按 `thread_id` 管理最近对话、摘要、已确认案件事实和 Agent 状态；
 - 使用 MySQL + 独立 ChromaDB Collection 管理 Semantic 与 Episodic 长期记忆，并通过 `memory_id` 关联；
 - 将领域 Skills 作为 Procedural Memory，按问题领域加载刑事、劳动、合同、交通或通用法律执行规范；
-- 通过 Budget、Snip、Micro、Summary 四阶段压缩 Tool Result 与最终证据上下文；
+- 通过 `tool_result_budget → snip_compact → micro_compact → compact_history` 四阶段管理 Agent 消息上下文，先转存、再裁剪、最后摘要；
+- 使用独立的 `LegalEvidencePacker` 为最终法律证据分配 Token 预算，保持法条原文和来源标签可追溯；
 - 返回参考来源和各阶段耗时，便于分析系统行为；
 - 提供知识库管理、问答配置、性能测试和报告导出页面。
 
@@ -96,7 +97,8 @@ flowchart TB
         MEMORY[短期 Memory<br/>LangGraph State + Checkpointer]
         LTM[长期 Memory<br/>Semantic + Episodic]
         SKILL[Skill Catalog + load_skill Tool<br/>skills/loader.py / tool.py]
-        COMPACT[四阶段 Context Compact<br/>context/compactor.py]
+        COMPACT[可恢复消息压缩<br/>context/message_compactor.py]
+        EVIDENCE_PACK[法律证据打包<br/>context/compactor.py]
         PROMPT[Prompt 与生成<br/>prompts.py]
         QUALITY[RAG 评测与报告<br/>quality_service.py / report_service.py]
         PIPE --> STATE
@@ -105,7 +107,7 @@ flowchart TB
         PIPE --> SKILL
         PIPE --> ROUTER --> GRADER
         GRADER -->|证据不足| REWRITE --> ROUTER
-        GRADER -->|证据充分| COMPACT --> PROMPT --> VERIFY
+        GRADER -->|证据充分| EVIDENCE_PACK --> PROMPT --> VERIFY
         VERIFY -->|未通过且未超限| PROMPT
         PIPE --> COMPACT
     end
@@ -181,7 +183,7 @@ flowchart TB
 系统包含两条主链路：
 
 - **离线建库链路**：原始数据 → Parent/Child 分块 → MySQL 持久化 → Child Embedding → ChromaDB；
-- **在线问答链路**：问题 → Skill Loading → LLM 工具决策 → Child 混合召回与 Parent 回查 → 证据充分性判断 → 必要时改写并重试 → Tool Result 与最终上下文压缩 → 答案生成 → Grounding 校验。
+- **在线问答链路**：问题 → Skill Loading → LLM 工具决策 → Child 混合召回与 Parent 回查 → 可恢复消息压缩 → 证据充分性判断 → 必要时改写并重试 → 法律证据打包 → 答案生成 → Grounding 校验。
 
 离线建库只在首次导入或知识库变化时执行，在线问答则在每次用户提问时执行。
 
@@ -193,7 +195,8 @@ flowchart TB
 | Web 后端 | FastAPI、Pydantic | REST API、参数校验、响应模型 |
 | Agentic 编排 | LangGraph、LangChain | 有界状态图、工具决策、证据评估、检索纠错与 Grounding 校验 |
 | 事实库 | MySQL 8、SQLAlchemy 2、PyMySQL | 保存 Documents、Parent Chunks、Child Chunks、来源位置与长期记忆正文 |
-| 上下文工程 | Budget、Snip、Micro、Summary | Token 预算、单文档裁剪、证据去重和抽取式摘要 |
+| Agent 上下文 | Tool Result Budget、Snip Compact、Micro Compact、Compact History | 大结果转存、消息归档、旧结果替换和超限历史摘要 |
+| 法律证据上下文 | `LegalEvidencePacker` | Token 预算、单文档裁剪、证据去重、排序和抽取式打包 |
 | 短期记忆 | LangGraph State、InMemorySaver、`thread_id`、TTL | 保存最近 3 轮、历史摘要、已确认案件事实和执行状态，支持追问与检查点恢复 |
 | 长期记忆 | MySQL、ChromaDB、`memory_id` | MySQL 保存权威正文和元数据，独立 Collection 负责 Semantic / Episodic 语义召回 |
 | 程序性记忆 | YAML frontmatter、`load_skill`、ToolMessage | 技能目录进入 system prompt，完整执行规范按需作为 tool_result 注入 |
@@ -483,7 +486,7 @@ MySQL 写入与向量索引之间通过 `pending → chunked → indexed / faile
 
 ## 4. 一次问答的完整执行流程
 
-**本章使用的核心技术**：LangGraph `StateGraph` 与 Checkpointer、LangChain Tool Calling、FastAPI、短期与长期 Memory、Skill Loading、父子检索、证据充分性判断、四阶段 Context Compact、Grounding Check 和有界自纠错循环。
+**本章使用的核心技术**：LangGraph `StateGraph` 与 Checkpointer、LangChain Tool Calling、FastAPI、短期与长期 Memory、Skill Loading、父子检索、证据充分性判断、可恢复四阶段消息压缩、法律证据打包、Grounding Check 和有界自纠错循环。
 
 用户提交问题后，请求进入唯一的 `AgenticRAGRunner`。系统不提供传统 RAG 分支：每次问答都经过 LangGraph 状态图，由 LLM 选择高层工具，策略层强制至少执行一次权威知识检索，并根据证据评估结果决定生成答案或改写查询后再次检索。
 
@@ -520,20 +523,27 @@ flowchart TD
     H --> K[Child Reranker]
     K --> PA[parent_chunk_id 聚合]
     PA --> PH[MySQL 回查完整 Parent]
-    T2 --> TR[四阶段压缩 Tool Result]
-    T3 --> TR
-    T4 --> TR
-    T5 --> TR
-    T6 --> TR
-    PH --> TR
-    TR --> TM[ToolMessage 写回状态图]
-    TM --> EG{Evidence Grader}
+    T2 --> TM[完整 Tool Result 写入 ToolMessage]
+    T3 --> TM
+    T4 --> TM
+    T5 --> TM
+    T6 --> TM
+    PH --> TM
+    TM --> MC0[tool_result_budget<br/>超大结果转存并保留预览]
+    MC0 --> MC1[snip_compact<br/>超长消息历史归档]
+    MC1 --> MC2{是否仍超过字符阈值}
+    MC2 -->|是| MC3[micro_compact<br/>旧结果替换为可恢复路径]
+    MC3 --> MC4{是否仍超过阈值}
+    MC4 -->|是| MC5[compact_history<br/>保存 transcript 并生成状态摘要]
+    MC2 -->|否| EG{Evidence Grader}
+    MC4 -->|否| EG
+    MC5 --> EG
     EG -->|证据不足且未超限| RW[生成针对性补充查询]
     RW --> C
-    EG -->|证据充分或达到上限| L0[Budget<br/>计算最终证据预算]
-    L0 --> L1[Snip<br/>限制单篇文档占用]
-    L1 --> L2[Micro<br/>去重、排序与证据合并]
-    L2 --> L3[Summary<br/>案例与 KG 抽取式摘要]
+    EG -->|证据充分或达到上限| L0[LegalEvidencePacker<br/>计算证据 Token 预算]
+    L0 --> L1[单文档裁剪]
+    L1 --> L2[证据去重与排序]
+    L2 --> L3[抽取式打包并保留来源]
 
     L3 --> M[LLM 生成法律回答]
     M --> N{Grounding 与引用检查}
@@ -584,7 +594,8 @@ flowchart TD
 | Child 轻量重排序 | Jaccard、jieba、法律元数据加权 | `services/reranker.py` | 否 |
 | Child 云端重排序 | HTTPX、`qwen3.7-text-rerank` | `services/cloud_reranker.py` | 仅选择 `cloud` 时调用 |
 | Parent 聚合与回查 | `parent_chunk_id` 分组、最高 Child 分数、命中数加成、MySQL 批量查询 | `services/pipeline.py`、`db/repository.py` | 否 |
-| Tool Result 与最终上下文压缩 | Budget、Snip、Micro、Summary、来源格式化 | `context/compactor.py` | 否 |
+| Agent 消息压缩 | `tool_result_budget`、`snip_compact`、`micro_compact`、`compact_history`、一次响应式补救 | `context/message_compactor.py` | 前三阶段否；仅第四阶段调用摘要模型 |
+| 最终法律证据打包 | Token Budget、单文档裁剪、去重排序、抽取式打包、来源格式化 | `context/compactor.py` | 否 |
 | 答案生成 | LCEL `prompt \| llm`、Qwen | `services/prompts.py`、`core/llm.py` | 是 |
 | Grounding 校验 | 证据支持判断、引用完整性检查、有界重新生成 | `agentic/runtime.py`、`agentic/prompts.py` | 每次生成后 1 次 |
 | RAG 评测 | 相关文档标注、排名指标、LLM-as-a-Judge | `services/quality_service.py`、`services/perf_service.py` | 检索和延迟指标否，Faithfulness 是 |
@@ -691,7 +702,7 @@ flowchart TD
 | 消息与工具 | `messages`、`pending_query`、`tool_calls` | 保存 Agent 消息、当前待检索 Query 和 LLM 生成的工具调用 |
 | 检索证据 | `evidence`、`kg_entities`、`rewritten_queries`、`missing_information` | 汇总法规、案例、CrimeKG、MCP 证据及证据缺口 |
 | 循环控制 | `evidence_sufficient`、`retrieval_rounds`、`tool_rounds`、`generation_rounds` | 控制检索纠错、工具执行和答案修正次数，防止无限循环 |
-| 上下文压缩 | `compacted_context`、`compacted_documents`、`compaction` | 保存压缩后的最终证据、来源文档及 Token 统计 |
+| 上下文压缩 | `message_compaction`、`compacted_context`、`compacted_documents`、`compaction` | 保存消息压缩统计、最终证据、来源文档及 Token 统计 |
 | 生成与校验 | `answer`、`grounding_feedback`、`grounding_passed` | 保存候选答案、校验反馈和最终通过状态 |
 | 可观测性 | `trace` | 按执行顺序记录节点、工具、判断结果和循环信息 |
 
@@ -703,11 +714,11 @@ flowchart TD
 |---|---|---|---|
 | `prepare` | `question`、短期记忆字段、`user_id`、`memory_mode` | 恢复线程上下文，识别连续追问并生成独立 Query；按授权模式从 ChromaDB 召回长期记忆，再按 `memory_id + user_id` 回查 MySQL | `resolved_question`、`pending_query`、`memory_context`、`recalled_memory_ids`、`trace` |
 | `load_skill` | `resolved_question`、请求指定的 Skill | 自动或手动选择法律领域，调用 `load_skill` 读取完整 `SKILL.md`，将程序性规范放入消息 | `skill`、`skill_messages`、`messages`、`trace` |
-| `decide_tools` | `pending_query`、`skill`、`messages`、已有证据 | 让 LLM 从高层工具池选择工具和参数；未选择权威法律检索时由策略层补充 `retrieve_legal_evidence` | `tool_calls`、`messages`、`tool_rounds`、`trace` |
-| `execute_tools` | `tool_calls`、当前 Query | 执行本地父子检索、CrimeKG、来源回查或外部 MCP；大型 Tool Result 经四阶段压缩后形成 `ToolMessage` | `evidence`、`kg_entities`、`messages`、`retrieval_rounds`、`trace` |
+| `decide_tools` | `pending_query`、`skill`、`messages`、已有证据 | 调用 LLM 前执行消息压缩管线，再从高层工具池选择工具和参数；未选择权威法律检索时由策略层补充 `retrieve_legal_evidence` | `tool_calls`、`messages`、`message_compaction`、`tool_rounds`、`trace` |
+| `execute_tools` | `tool_calls`、当前 Query | 完整执行本地父子检索、CrimeKG、来源回查或外部 MCP，闭合全部 Tool Call/Result 后统一压缩消息；若模型调用 `compact_history`，则在完整批次结束后主动归档摘要 | `evidence`、`kg_entities`、`messages`、`message_compaction`、`retrieval_rounds`、`trace` |
 | `grade_evidence` | `resolved_question`、`evidence`、循环次数 | 判断法条、案例和知识证据是否足以回答，提取缺失信息，并根据硬上限决定继续检索还是进入生成 | `evidence_sufficient`、`missing_information`、`pending_query`、`trace` |
 | `rewrite_query` | `resolved_question`、`missing_information`、`evidence` | 围绕缺失的法条、构成要件或案例生成针对性补充 Query | `pending_query`、`rewritten_queries`、`trace` |
-| `compact_context` | `evidence`、`memory_context`、`skill` | 对最终 Parent、案例、KG 和 MCP 证据执行 Budget、Snip、Micro、Summary 四阶段压缩 | `compacted_context`、`compacted_documents`、`compaction`、`trace` |
+| `compact_context` | `evidence`、`memory_context`、`skill` | 使用 `LegalEvidencePacker` 计算 Token 预算，对 Parent、案例、KG 与 MCP 证据裁剪、去重、排序并保留来源 | `compacted_context`、`compacted_documents`、`compaction`、`trace` |
 | `generate` | `resolved_question`、`compacted_context`、`memory_context`、`skill_messages` | 根据检索证据、按需记忆与领域规范生成带来源引用的法律回答 | `answer`、`generation_rounds`、`trace` |
 | `verify_grounding` | `answer`、`compacted_context`、`generation_rounds` | 检查关键结论是否得到证据支持、引用是否完整；未通过时生成修正反馈 | `grounding_passed`、`grounding_feedback`、`trace` |
 
@@ -722,6 +733,7 @@ Agent 只看到稳定的高层工具，底层 BM25、向量检索、重排、数
 | `retrieve_legal_evidence` | Query、`laws/cases/all`、Top K | Child 精排后恢复的完整 Parent 证据 |
 | `lookup_crime_knowledge` | 罪名 | 概念、构成要件、认定、处罚和关联法条 |
 | `get_original_source` | Parent 或 Child ID | MySQL 中的完整来源和原始位置 |
+| `compact_history` | 无 | 在当前工具批次闭合后主动归档并摘要较早消息 |
 | `search_statutes` | Query、标题/全文范围、效力状态、Top K | 国家法律法规数据库中的法规列表与 `regulation_id` |
 | `get_statute_articles` | `regulation_id`、关键词 | 法规中直接命中的具体条文 |
 | `search_court_cases` | Query、Top K | 人民法院案例库中的指导性案例与参考案例 |
@@ -729,7 +741,7 @@ Agent 只看到稳定的高层工具，底层 BM25、向量检索、重排、数
 | `search_official_legal_web` | Query、Top K | 限定官方域名的最新法律网页结果 |
 | `fetch_official_legal_page` | 官方网页 URL | 可作为回答证据的网页正文 |
 
-LLM 使用 `tool_choice=auto` 选择工具和参数。若首轮没有选择 `retrieve_legal_evidence`，策略层自动补充该调用，从而保证法律答案一定先经过本地知识库检索。本地证据缺失、需要核验效力状态或问题涉及最新政策时，LLM 再选择相应的外部 MCP。所有外部结果以 `Document` 进入同一 Evidence Grader、四阶段压缩和 Grounding 流程。工具轮次最多 3 轮、法律检索最多 2 轮，达到上限后使用现有证据继续生成，不会无限循环。
+LLM 使用 `tool_choice=auto` 选择工具和参数。若首轮没有选择 `retrieve_legal_evidence`，策略层自动补充该调用，从而保证法律答案一定先经过本地知识库检索。本地证据缺失、需要核验效力状态或问题涉及最新政策时，LLM 再选择相应的外部 MCP。所有外部结果以 `Document` 进入同一 Evidence Grader、消息压缩和 Grounding 流程。工具轮次最多 3 轮、法律检索最多 2 轮，达到上限后使用现有证据继续生成，不会无限循环。
 
 ### 4.4 混合检索
 
@@ -765,18 +777,42 @@ parent_score = max(child_rerank_score) + min(hit_count - 1, 3) × 0.02
 
 系统按 Parent 分数选择 Top 5，并批量回查 MySQL `parent_chunks` 恢复完整法条、案件事实或知识段落。Parent 不再进入 Reranker：相关性判断由更聚焦的 Child 完成，Parent 只承担证据扩展与上下文完整性，避免长文本稀释排序信号和产生第二次云端费用。`cloud` 异常时自动切换到 `simple`，并通过 `rerank_fallback` 记录实际执行路径。
 
-### 4.7 四阶段上下文压缩与答案生成
+### 4.7 可恢复的四阶段上下文压缩与答案生成
 
-四阶段压缩执行两次：第一次把检索、CrimeKG 和来源回查产生的大型 Tool Result 压缩到默认 1,800 Token 后写入 `ToolMessage`；第二次将 Agent 累积的 Parent 与 KG 证据压缩到默认 4,000 Token，供答案生成使用。整个压缩过程使用确定性算法，不调用模型：
+Agent 消息压缩采用 [learn-claude-code s08 Context Compact](https://github.com/shareAI-lab/learn-claude-code/blob/main/s08_context_compact/README.zh.md) 的核心设计：按照信息损失和调用成本从低到高固定执行 `tool_result_budget → snip_compact → micro_compact → compact_history`。前三阶段都是可恢复的本地操作，只有全部确定性手段仍无法满足上下文上限时，第四阶段才调用模型生成状态摘要。
 
-| 阶段 | 处理方式 | 法律场景约束 |
-|---|---|---|
-| Budget | 扣除问题、按需召回的短期/长期记忆和 Skill 指令占用，计算剩余证据预算 | 为最终答案预留上下文空间 |
-| Snip | 为法条、案例和 KG 设置单文档上限 | 法条只做原文截取，不改写法律原意 |
-| Micro | 内容归一化去重，按 Skill 的证据优先级和重排分数排序 | 防止同一法条或案例重复占用预算 |
-| Summary | 超出预算时对案例和 KG 做抽取式摘要 | 摘要仅选取原句；法律条文仍保持抽取式裁剪 |
+```mermaid
+flowchart LR
+    A[完整 messages] --> B[tool_result_budget]
+    B --> C[snip_compact]
+    C --> D{字符数是否超过 50000}
+    D -->|否| OUT[进入下一次 LLM 调用]
+    D -->|是| E[micro_compact]
+    E --> F[fit_tool_results]
+    F --> G{是否仍然超限}
+    G -->|否| OUT
+    G -->|是| H[compact_history]
+    H --> OUT
+```
 
-压缩后的每段证据保留 `[来源N]` 标签和原始元数据。接口返回 `tokens_before`、`tokens_after`、`token_budget` 和实际文档数，便于观察压缩效果。
+| 阶段 | 默认触发条件 | 处理方式 | 是否调用模型 |
+|---|---|---|---|
+| `tool_result_budget` | 每轮执行；最新一批 Tool Result 总计超过 200,000 字符 | 从最大的结果开始处理；单项超过 30,000 字符时完整写入 `.task_outputs/tool-results/`，消息中保留文件路径和前 2,000 字符预览 | 否 |
+| `snip_compact` | 每轮执行；消息超过 50 条 | 先将完整历史写入 `.transcripts/`，再保留最初 3 条、归档标记和最近 46 条；切点保护 `AIMessage(tool_calls)` 与 `ToolMessage` 的配对关系 | 否 |
+| `micro_compact` | 前两步后仍超过 50,000 字符 | 保留最近 3 条已经消费的 Tool Result，将更早结果完整落盘并替换为可恢复路径，直到接近阈值的 80% | 否 |
+| `compact_history` | Micro 和未读结果适配后仍然超限，或模型主动调用同名工具 | 保存完整 transcript，生成只包含目标、约束、确认事实、工具、来源、决定和剩余工作的状态摘要；当前用户请求与历史摘要分开保存 | 是，最多 1 次摘要调用 |
+
+最新一批尚未被模型读取的 Tool Result 不会被 `micro_compact` 直接删除。如果仅未读结果就足以撑满上下文，`fit_tool_results` 会把最大的结果完整落盘，在消息中保留 1,000 字符预览和路径，使模型至少看到一次结果概况。每次工具响应包含多个调用时，系统会先执行完整批次并为每个 Tool Call 写入对应的 Tool Result，再处理主动 `compact_history` 请求，避免出现孤立结果或重复执行具有副作用的工具。
+
+字符估算仍可能与模型 Tokenizer 存在误差。若模型接口返回 `prompt_too_long`、`too many tokens` 或 Context Length 错误，系统执行一次 `reactive_compact`：保存完整 transcript、摘要较早历史并保留最近 5 条消息，然后重新请求一次；再次失败则向上抛出异常，不进行无限重试。
+
+消息压缩与法律证据打包相互独立：
+
+- `MessageContextCompactor` 管理 `messages` 生命周期，产物保存在被 Git 忽略的 `.task_outputs/` 与 `.transcripts/`；
+- `LegalEvidencePacker` 在进入答案生成前，根据 `CONTEXT_MAX_TOKENS` 扣除问题、记忆和 Skill 占用，对 Parent、案例、CrimeKG 与 MCP 证据执行单文档裁剪、去重、优先级排序和抽取式打包；
+- 法律条文只进行原文裁剪，不使用生成式摘要改写；每段证据继续保留 `[来源N]` 与原始元数据。
+
+响应中的 `context_compaction` 同时返回法律证据的 `tokens_before`、`tokens_after`、`token_budget`，以及消息历史的 `chars_before`、`chars_after`、执行阶段、转存数量、Transcript 数量和是否使用摘要模型。
 
 | 生成策略 | 输出特点 |
 |---|---|
@@ -827,12 +863,13 @@ flowchart LR
         CH --> RR[仅重排序 Child]
         RR --> PA[按 parent_chunk_id 聚合]
         PA --> PH[MySQL 回查 Top Parent]
-        PH --> TR[压缩为 ToolMessage]
+        PH --> TR[完整 Tool Result 写入消息]
         KG --> TR
-        TR --> EG{证据是否充分}
+        TR --> MSG[消息压缩<br/>先转存、再裁剪、必要时摘要]
+        MSG --> EG{证据是否充分}
         EG -->|否| RW[改写检索 Query]
         RW --> T
-        EG -->|是| CTX[Budget → Snip → Micro → Summary]
+        EG -->|是| CTX[LegalEvidencePacker<br/>预算、裁剪、去重、抽取式打包]
         CTX --> GEN[Qwen 生成结构化法律回答]
         GEN --> GC{Grounding 与引用校验}
         GC -->|未通过且未超限| GEN
@@ -860,8 +897,8 @@ flowchart LR
 5. **恢复记忆并加载 Skill**：系统按 `thread_id` 恢复最近问答、摘要和确认事实；若本次为 `read` 或 `read_write`，再按 `user_id + 当前问题` 召回相关长期记忆；模型选择 `criminal_law` 并调用 `load_skill`，完整刑事执行规范以 `ToolMessage` 进入 Agent 状态；
 6. **Agent 工具决策**：Tool Router 选择 `retrieve_legal_evidence(query, all, 5)`，并为罪名结构调用 `lookup_crime_knowledge(盗窃罪)`；策略层确保法律检索不会被跳过；
 7. **检索工具执行**：问题 Embedding 查询 ChromaDB 得到 Child ID，BM25 在 MySQL Child 中匹配关键词，RRF 融合后回查 Child 原文、完成 Child 精排并恢复完整 Parent；
-8. **证据评估与纠错检索**：大型工具结果先经过四阶段压缩再写回消息；Evidence Grader 判断法条、构成要件和案例是否足够，不足时生成针对性 Query 并在有界循环中补充检索；
-9. **基于证据生成与校验**：最终证据再次压缩，生成模型组织结构化答案；Grounding Checker 检查结论和引用，未通过时最多重新生成一次；
+8. **消息压缩与证据评估**：完整 Tool Result 先闭合写入消息，再依次经过结果转存、历史归档、旧结果替换和必要的状态摘要；Evidence Grader 判断法条、构成要件和案例是否足够，不足时生成针对性 Query 并在有界循环中补充检索；
+9. **基于证据生成与校验**：`LegalEvidencePacker` 在独立 Token 预算内裁剪、去重、排序并打包最终证据，生成模型据此组织结构化答案；Grounding Checker 检查结论和引用，未通过时最多重新生成一次；
 10. **更新记忆与评测**：问题、答案、摘要和用户确认事实写回短期 Checkpoint；`read_write` 模式将显式确认信息作为 Semantic Memory、将任务摘要作为未确认的 Episodic Memory，以一个 Embedding 批次写入 MySQL 与 ChromaDB；接口返回 Agent Trace、记忆 ID、来源及阶段耗时，并计算 Recall@5、MRR@10、P95 Latency 和 Faithfulness。
 
 该问题最终使用的证据上下文示意如下：
@@ -892,7 +929,7 @@ backend/
 ├── app/
 │   ├── agentic/             # LangGraph 状态、节点、Prompt 与高层工具注册表
 │   ├── api/                 # 问答、知识库、来源追溯、性能接口
-│   ├── context/             # Budget、Snip、Micro、Summary 四阶段压缩
+│   ├── context/             # 可恢复消息压缩与法律证据 Token 打包
 │   ├── core/                # LLM、Embedding、ChromaDB、检索器
 │   ├── db/                  # SQLAlchemy 表模型与 Parent/Child Repository
 │   ├── memory/              # Checkpointer 短期状态、长期记忆服务与 MySQL Repository
@@ -1011,6 +1048,14 @@ RERANKER_MODEL=qwen3.7-text-rerank
 RERANKER_CANDIDATE_K=20
 RERANKER_DOCUMENT_MAX_CHARS=1200
 CONTEXT_MAX_TOKENS=4000
+CONTEXT_CHAR_LIMIT=50000
+CONTEXT_TARGET_RATIO=0.8
+CONTEXT_MAX_MESSAGES=50
+TOOL_RESULT_BUDGET_CHARS=200000
+LARGE_TOOL_RESULT_CHAR_LIMIT=30000
+TOOL_RESULT_PREVIEW_CHARS=2000
+CONTEXT_KEEP_RECENT_TOOL_RESULTS=3
+CONTEXT_MAX_REACTIVE_RETRIES=1
 MEMORY_TTL_SECONDS=86400
 SHORT_TERM_RECENT_TURNS=3
 SHORT_TERM_SUMMARY_MAX_CHARS=2400
@@ -1022,7 +1067,6 @@ MEMORY_MAX_WRITES_PER_TURN=8
 AGENT_MAX_TOOL_ROUNDS=3
 AGENT_MAX_RETRIEVAL_ROUNDS=2
 AGENT_MAX_GENERATION_ROUNDS=2
-AGENT_TOOL_RESULT_MAX_TOKENS=1800
 EXTERNAL_MCP_ENABLED=true
 FLK_MCP_ENABLED=true
 FLK_MCP_URL=http://127.0.0.1:18062/mcp
@@ -1121,7 +1165,7 @@ npm run dev
 | `test_kg.py` | 犯罪知识加载和罪名查找 |
 | `test_cloud_reranker.py` | 云端排序请求格式、响应映射、配置检查和无网络降级 |
 | `test_rag_evaluation.py` | Recall@5、MRR@10、指标聚合和 P95 计算 |
-| `test_context_memory_skills.py` | 四阶段压缩、兼容会话 Memory、frontmatter 扫描、按需正文加载和 `load_skill` Tool |
+| `test_context_memory_skills.py` | 大结果转存、消息归档、Tool Call/Result 配对保护、Micro 替换、历史摘要、法律证据打包与 Skill Loading |
 | `test_long_term_memory.py` | Checkpointer 线程隔离、历史摘要压缩、Semantic/Episodic 确认边界、去重、双存储关联与单批次写入 |
 | `test_parent_child_storage.py` | 稳定父子 ID、MySQL 回查、Child 权威正文、Child 精排与 Parent 聚合 |
 | `test_agentic_rag.py` | LangGraph 节点顺序、LLM 工具决策、强制检索策略、证据评估和 Grounding 校验 |
@@ -1166,7 +1210,8 @@ python -m scripts.run_quality_eval
 - **事实库与索引分离**：MySQL 是知识原文和记忆正文的事实来源，ChromaDB 中 Child 与 Memory Collection 均为可重建向量索引；
 - **父子索引**：短 Child 负责精确召回与重排，完整 Parent 负责生成证据，兼顾检索精度与语义完整性；
 - **稳定 ID 关联**：`doc_id → parent_chunk_id → child_chunk_id` 使用确定性 ID 串联导入、检索、删除、重建和来源回查；
-- **上下文有预算**：四阶段压缩限制输入规模，保留法条原文、来源标签和高相关证据；
+- **上下文可恢复**：四阶段消息压缩先把完整结果与 Transcript 落盘，再替换旧内容；仅在确定性手段耗尽后调用摘要模型；
+- **证据有预算**：`LegalEvidencePacker` 单独限制生成证据规模，保留法条原文、来源标签和高相关 Parent；
 - **短期状态可恢复**：LangGraph Checkpointer 以 `thread_id` 隔离线程，保存最近 3 轮、历史摘要、确认事实和 Agent 状态，并使用 TTL 自动过期；
 - **长期记忆双存储**：MySQL 是记忆正文和确认状态的事实库，ChromaDB 只负责按 `memory_id` 召回 Semantic / Episodic 记忆；
 - **写入需要授权**：默认 `memory_mode=off`；Semantic Memory 只接收用户显式确认内容，Agent 任务摘要固定标记为未确认；

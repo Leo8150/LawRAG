@@ -28,6 +28,8 @@ docs/
 backend/data/*
 !backend/data/rag_eval_dataset.json
 backend/external/
+.task_outputs/
+.transcripts/
 
 # Local config
 .claude/

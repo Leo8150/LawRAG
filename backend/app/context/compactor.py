@@ -1,4 +1,4 @@
-"""Deterministic four-stage context compaction for legal evidence.
+"""Deterministic legal-evidence packing for the generation prompt.
 
 The compactor deliberately performs no model calls.  Statute text is only
 extractively clipped; it is never rewritten, which keeps quoted legal evidence
@@ -64,7 +64,12 @@ class CompactionResult:
     token_budget: int
     tokens_before: int
     tokens_after: int
-    stages: list[str] = field(default_factory=lambda: ["budget", "snip", "micro", "summary"])
+    stages: list[str] = field(default_factory=lambda: [
+        "evidence_budget",
+        "per_document_snip",
+        "deduplicate",
+        "extractive_pack",
+    ])
 
     def to_dict(self) -> dict:
         return {
@@ -76,8 +81,8 @@ class CompactionResult:
         }
 
 
-class FourStageContextCompactor:
-    """Budget -> Snip -> Micro -> Summary context compaction."""
+class LegalEvidencePacker:
+    """Pack source documents without rewriting quoted legal evidence."""
 
     DEFAULT_PRIORITY = {"kg": 0, "law": 1, "statute": 1, "case": 2}
     PER_DOCUMENT_BUDGET = {"law": 1400, "statute": 1400, "case": 900, "kg": 700}
@@ -158,3 +163,8 @@ class FourStageContextCompactor:
             tokens_before=tokens_before,
             tokens_after=estimate_tokens(context),
         )
+
+
+# Backward-compatible import for integrations created before message-level
+# context compaction was introduced.
+FourStageContextCompactor = LegalEvidencePacker
