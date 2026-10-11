@@ -110,13 +110,31 @@ class RAGPipeline:
             "agent_rounds": 0,
             "retrieval_rounds": 0,
             "grounding_passed": False,
+            "long_term_memory_retrieved": 0,
+            "long_term_memory_written": 0,
         }
 
-    async def execute(self, question: str, conversation_id: str | None = None) -> ChatResponse:
+    async def execute(
+        self,
+        question: str,
+        conversation_id: str | None = None,
+        *,
+        thread_id: str | None = None,
+        user_id: str | None = None,
+        memory_mode: str = "off",
+        confirmed_memories: list[dict] | None = None,
+    ) -> ChatResponse:
         """Execute the single Agentic RAG graph; no linear workflow route exists."""
         from app.agentic import AgenticRAGRunner
 
-        return await AgenticRAGRunner(self).run(question, conversation_id)
+        return await AgenticRAGRunner(self).run(
+            question,
+            conversation_id,
+            thread_id=thread_id,
+            user_id=user_id,
+            memory_mode=memory_mode,
+            confirmed_memories=confirmed_memories,
+        )
 
     async def _select_skill(self, question: str) -> tuple[LegalSkill, list[BaseMessage]]:
         """Ask the model to call load_skill, then append the result as a ToolMessage."""

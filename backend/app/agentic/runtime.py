@@ -23,7 +23,7 @@ from app.config import settings
 from app.context import FourStageContextCompactor
 from app.core.llm import get_llm
 from app.db.repository import get_parent_child_repository
-from app.memory import memory_service
+from app.memory import checkpoint_manager, long_term_memory, short_term_context
 from app.mcp import ExternalLegalMCPService
 from app.models.schemas import ChatResponse, SourceDocument, StageMetrics
 from app.skills import skill_loader
@@ -95,13 +95,36 @@ class AgenticRAGRunner:
             self._after_grounding,
             {"regenerate": "generate", "finish": END},
         )
-        return graph.compile()
+        return graph.compile(checkpointer=checkpoint_manager.saver)
 
-    async def run(self, question: str, conversation_id: str | None = None) -> ChatResponse:
+    async def run(
+        self,
+        question: str,
+        conversation_id: str | None = None,
+        *,
+        thread_id: str | None = None,
+        user_id: str | None = None,
+        memory_mode: str = "off",
+        confirmed_memories: list[dict[str, Any]] | None = None,
+    ) -> ChatResponse:
         total_start = time.time()
+        active_thread_id = thread_id or conversation_id or uuid4().hex
+        graph_config = await checkpoint_manager.config(active_thread_id)
+        previous_state = await self.graph.aget_state(graph_config)
+        previous_values = dict(previous_state.values or {})
+        short_snapshot = short_term_context.from_values(previous_values)
         initial: AgenticRAGState = {
             "question": question,
-            "conversation_id": conversation_id or uuid4().hex,
+            "conversation_id": active_thread_id,
+            "thread_id": active_thread_id,
+            "user_id": user_id or "",
+            "memory_mode": memory_mode,
+            "confirmed_memories": confirmed_memories or [],
+            "conversation_summary": short_snapshot.summary,
+            "recent_turns": short_snapshot.recent_turns,
+            "case_facts": short_snapshot.case_facts,
+            "memory_turns": short_snapshot.turn_count,
+            "recalled_memory_ids": [],
             "evidence": [],
             "kg_entities": [],
             "rewritten_queries": [],
@@ -112,8 +135,16 @@ class AgenticRAGRunner:
             "grounding_passed": False,
             "trace": [],
             "messages": [],
+            "skill_messages": [],
+            "tool_calls": [],
+            "evidence_sufficient": False,
+            "compacted_context": "",
+            "compacted_documents": [],
+            "compaction": {},
+            "answer": "",
+            "grounding_feedback": "",
         }
-        result: AgenticRAGState = await self.graph.ainvoke(initial)
+        result: AgenticRAGState = await self.graph.ainvoke(initial, config=graph_config)
         self.pipeline.metrics["total_ms"] = round((time.time() - total_start) * 1000, 1)
         self.pipeline.metrics["agent_tool_calls"] = sum(
             int(item.get("tool_count", 0)) for item in result.get("trace", [])
@@ -134,7 +165,46 @@ class AgenticRAGRunner:
         skill = result["skill"]
         answer = result.get("answer", "现有证据不足以形成可靠回答。")
         source_ids = [format_source_display(doc.metadata) for doc in documents]
-        memory_service.append(result["conversation_id"], question, answer, source_ids, skill.name)
+
+        written_memory_ids: list[str] = []
+        if memory_mode == "read_write" and user_id:
+            try:
+                written_memory_ids = await long_term_memory.remember_turn(
+                    user_id=user_id,
+                    thread_id=active_thread_id,
+                    confirmed_items=confirmed_memories or [],
+                    question=question,
+                    answer=answer,
+                    trace=result.get("trace", []),
+                    source_ids=source_ids,
+                )
+            except Exception:
+                # Memory persistence is non-critical and must not discard a legal answer.
+                written_memory_ids = []
+        self.pipeline.metrics["long_term_memory_written"] = len(written_memory_ids)
+
+        confirmed_case_facts = [
+            str(item.get("content", ""))
+            for item in (confirmed_memories or [])
+            if item.get("category") == "case_fact"
+        ]
+        advanced = short_term_context.advance(
+            short_snapshot,
+            question,
+            answer,
+            confirmed_case_facts,
+        )
+        await self.graph.aupdate_state(graph_config, {
+            "conversation_summary": advanced.summary,
+            "recent_turns": advanced.recent_turns,
+            "case_facts": advanced.case_facts,
+            "memory_turns": advanced.turn_count,
+            "messages": [],
+            "tool_calls": [],
+            "evidence": [],
+            "compacted_documents": [],
+            "trace": [],
+        })
 
         config = self.pipeline.config.to_dict()
         config.update({
@@ -151,6 +221,10 @@ class AgenticRAGRunner:
             generation_strategy=self.pipeline.config.generation_strategy.value,
             pipeline_config=config,
             conversation_id=result["conversation_id"],
+            thread_id=active_thread_id,
+            memory_mode=memory_mode,
+            recalled_memory_ids=result.get("recalled_memory_ids", []),
+            written_memory_ids=written_memory_ids,
             resolved_question=(
                 result.get("resolved_question")
                 if result.get("resolved_question") != question else None
@@ -161,15 +235,44 @@ class AgenticRAGRunner:
         )
 
     async def _prepare(self, state: AgenticRAGState) -> dict:
-        memory = memory_service.load(state["conversation_id"])
-        resolved, context = memory_service.resolve_question(state["question"], memory)
-        self.pipeline.metrics["memory_turns"] = len(memory.turns)
+        snapshot = short_term_context.from_values(state)
+        resolved = short_term_context.resolve_question(state["question"], snapshot)
+        short_context = short_term_context.build_context(snapshot)
+        current_confirmed = [
+            f"- [{item.get('category', 'case_fact')}] {str(item.get('content', '')).strip()}"
+            for item in state.get("confirmed_memories", [])
+            if str(item.get("content", "")).strip()
+        ]
+        if current_confirmed:
+            short_context = "\n".join([
+                short_context,
+                "本轮由用户明确确认的信息：",
+                *current_confirmed,
+            ]).strip()
+        recalled = []
+        if state.get("memory_mode") in {"read", "read_write"} and state.get("user_id"):
+            recalled = await long_term_memory.recall(
+                state["user_id"],
+                resolved,
+                settings.MEMORY_RECALL_TOP_K,
+            )
+        long_context = long_term_memory.format_context(recalled)
+        context_parts = [part for part in [short_context, long_context] if part]
+        context = "\n\n".join(context_parts)
+        self.pipeline.metrics["memory_turns"] = snapshot.turn_count
+        self.pipeline.metrics["long_term_memory_retrieved"] = len(recalled)
         return {
             "resolved_question": resolved,
             "memory_context": context,
-            "memory_turns": len(memory.turns),
+            "memory_turns": snapshot.turn_count,
+            "recalled_memory_ids": [item.memory_id for item in recalled],
             "pending_query": resolved,
-            "trace": _trace(state, "prepare", memory_turns=len(memory.turns)),
+            "trace": _trace(
+                state,
+                "prepare",
+                memory_turns=snapshot.turn_count,
+                long_term_memory_count=len(recalled),
+            ),
         }
 
     async def _load_skill(self, state: AgenticRAGState) -> dict:

@@ -2,7 +2,7 @@
 
 LawRAG 是一个面向中国法律咨询场景的检索增强生成（Retrieval-Augmented Generation，RAG）项目。系统将法律法规、裁判案例和犯罪知识整理为可检索知识库，在回答问题前先查找依据，再由大语言模型结合检索结果生成回答。
 
-项目采用前后端分离架构：后端使用 FastAPI、LangChain 与 LangGraph 构建单一 Agentic RAG 状态图，LLM 在有界循环中选择本地法律检索、CrimeKG、来源回查以及外部法律 MCP 工具，并根据证据充分性动态补充检索；MySQL 保存原始文档及父子 Chunk，ChromaDB 仅保存 Child Chunk 向量索引。外部工具池连接国家法律法规数据库、人民法院案例库和 Tavily 官方站点搜索，DashScope 提供生成、向量、工具决策和可选重排模型，前端使用 React 展示答案、来源、Agent Trace 与评测指标。
+项目采用前后端分离架构：后端使用 FastAPI、LangChain 与 LangGraph 构建单一 Agentic RAG 状态图，LLM 在有界循环中选择本地法律检索、CrimeKG、来源回查以及外部法律 MCP 工具，并根据证据充分性动态补充检索；MySQL 保存原始文档、父子 Chunk 与长期记忆正文，ChromaDB 分别保存 Child Chunk 和长期记忆向量索引。LangGraph Checkpointer 以 `thread_id` 隔离短期状态，Semantic、Episodic、Procedural 三类长期记忆按需召回。外部工具池连接国家法律法规数据库、人民法院案例库和 Tavily 官方站点搜索，DashScope 提供生成、向量、工具决策和可选重排模型，前端使用 React 展示答案、来源、Agent Trace 与评测指标。
 
 > 一句话理解：LawRAG 不是让模型仅凭参数记忆回答法律问题，而是先从法律知识库寻找证据，再基于证据组织答案。
 
@@ -46,8 +46,9 @@ LawRAG 围绕法律文本特点实现以下能力：
 - 证据不足时自动生成针对性查询并重新检索，所有循环均设置硬上限；
 - 使用结构化犯罪知识补充罪名定义、构成要件和量刑信息；
 - 在法律检索工具内部支持不重排、轻量重排和云端专用 Reranker；
-- 使用带 TTL 的短期会话 Memory 理解“如果已经退赃呢”等连续追问；
-- 根据问题领域按需加载刑事、劳动、合同、交通或通用法律 Skill；
+- 使用 LangGraph State + Checkpointer 按 `thread_id` 管理最近对话、摘要、已确认案件事实和 Agent 状态；
+- 使用 MySQL + 独立 ChromaDB Collection 管理 Semantic 与 Episodic 长期记忆，并通过 `memory_id` 关联；
+- 将领域 Skills 作为 Procedural Memory，按问题领域加载刑事、劳动、合同、交通或通用法律执行规范；
 - 通过 Budget、Snip、Micro、Summary 四阶段压缩 Tool Result 与最终证据上下文；
 - 返回参考来源和各阶段耗时，便于分析系统行为；
 - 提供知识库管理、问答配置、性能测试和报告导出页面。
@@ -60,7 +61,7 @@ LawRAG 围绕法律文本特点实现以下能力：
 
 ## 2. 系统架构与技术选型
 
-**本章使用的核心技术**：React、FastAPI、Pydantic、LangChain、LangGraph、SQLAlchemy、MySQL、ChromaDB、BM25、DashScope。系统按表现层、接口层、Agentic 编排层、检索工具层和数据层分层，MySQL 是权威事实库，ChromaDB 是可重建的 Child 向量索引。
+**本章使用的核心技术**：React、FastAPI、Pydantic、LangChain、LangGraph、SQLAlchemy、MySQL、ChromaDB、BM25、DashScope。系统按表现层、接口层、Agentic 编排层、检索工具层和数据层分层，MySQL 保存知识原文与记忆权威正文，ChromaDB 保存可重建的 Child 与长期记忆向量索引。
 
 ### 2.1 总体架构
 
@@ -92,13 +93,15 @@ flowchart TB
         GRADER[Evidence Grader]
         REWRITE[Query Rewriter]
         VERIFY[Grounding Checker]
-        MEMORY[短期会话 Memory<br/>memory/service.py]
+        MEMORY[短期 Memory<br/>LangGraph State + Checkpointer]
+        LTM[长期 Memory<br/>Semantic + Episodic]
         SKILL[Skill Catalog + load_skill Tool<br/>skills/loader.py / tool.py]
         COMPACT[四阶段 Context Compact<br/>context/compactor.py]
         PROMPT[Prompt 与生成<br/>prompts.py]
         QUALITY[RAG 评测与报告<br/>quality_service.py / report_service.py]
         PIPE --> STATE
         PIPE --> MEMORY
+        PIPE --> LTM
         PIPE --> SKILL
         PIPE --> ROUTER --> GRADER
         GRADER -->|证据不足| REWRITE --> ROUTER
@@ -137,6 +140,8 @@ flowchart TB
         CASES[(ChromaDB · cases<br/>Child vectors)]
         KGDATA[(CrimeKG 结构化知识)]
         REPORTS[(评测报告 / 问答记录)]
+        MEMORY_SQL[(MySQL memory_entries<br/>记忆正文与元数据)]
+        MEMORY_VEC[(ChromaDB long_term_memory<br/>memory_id + vector)]
         RAW --> PREP --> SPLIT
         SPLIT --> MYSQL_DOC
         SPLIT --> MYSQL_PARENT
@@ -145,6 +150,9 @@ flowchart TB
         EMB --> LAWS
         EMB --> CASES
         PREP --> KGDATA
+        LTM --> MEMORY_VEC
+        LTM --> MEMORY_SQL
+        MEMORY_VEC -.memory_id.-> MEMORY_SQL
     end
 
     CLOUD[阿里云 DashScope]
@@ -184,13 +192,14 @@ flowchart TB
 | 前端 | React 18、Vite、Axios、Recharts | 交互界面、接口调用、性能图表 |
 | Web 后端 | FastAPI、Pydantic | REST API、参数校验、响应模型 |
 | Agentic 编排 | LangGraph、LangChain | 有界状态图、工具决策、证据评估、检索纠错与 Grounding 校验 |
-| 原文事实库 | MySQL 8、SQLAlchemy 2、PyMySQL | 保存 Documents、Parent Chunks、Child Chunks 和来源位置 |
+| 事实库 | MySQL 8、SQLAlchemy 2、PyMySQL | 保存 Documents、Parent Chunks、Child Chunks、来源位置与长期记忆正文 |
 | 上下文工程 | Budget、Snip、Micro、Summary | Token 预算、单文档裁剪、证据去重和抽取式摘要 |
-| 会话记忆 | TTL Memory | 保存最近 6 轮问答、来源 ID 与当前 Skill，支持连续追问 |
-| 领域能力 | YAML frontmatter、`load_skill`、ToolMessage | 技能目录进入 system prompt，完整 SKILL.md 按需进入 tool_result |
+| 短期记忆 | LangGraph State、InMemorySaver、`thread_id`、TTL | 保存最近 3 轮、历史摘要、已确认案件事实和执行状态，支持追问与检查点恢复 |
+| 长期记忆 | MySQL、ChromaDB、`memory_id` | MySQL 保存权威正文和元数据，独立 Collection 负责 Semantic / Episodic 语义召回 |
+| 程序性记忆 | YAML frontmatter、`load_skill`、ToolMessage | 技能目录进入 system prompt，完整执行规范按需作为 tool_result 注入 |
 | 生成模型 | DashScope `qwen-turbo` | 查询改写、答案生成、可选评测 |
 | 向量模型 | DashScope `text-embedding-v3` | 文本向量化和语义查询 |
-| 向量数据库 | ChromaDB | 仅保存 Child Embedding、`child_chunk_id` 和过滤字段 |
+| 向量数据库 | ChromaDB | 分 Collection 保存 Child Embedding 与长期记忆 Embedding，分别用 `child_chunk_id`、`memory_id` 关联 MySQL |
 | 云端重排 | DashScope `qwen3.7-text-rerank` | 对 MySQL 回查的 Child 文本精排，不重复重排 Parent |
 | 稀疏检索 | `rank-bm25`、jieba | 中文分词和关键词匹配 |
 | RAG 评测 | 人工相关文档标注、LLM Judge | Recall@5、MRR@10、P95 Latency、Faithfulness |
@@ -474,16 +483,22 @@ MySQL 写入与向量索引之间通过 `pending → chunked → indexed / faile
 
 ## 4. 一次问答的完整执行流程
 
-**本章使用的核心技术**：LangGraph `StateGraph`、LangChain Tool Calling、FastAPI、短期 Memory、Skill Loading、父子检索、证据充分性判断、四阶段 Context Compact、Grounding Check 和有界自纠错循环。
+**本章使用的核心技术**：LangGraph `StateGraph` 与 Checkpointer、LangChain Tool Calling、FastAPI、短期与长期 Memory、Skill Loading、父子检索、证据充分性判断、四阶段 Context Compact、Grounding Check 和有界自纠错循环。
 
 用户提交问题后，请求进入唯一的 `AgenticRAGRunner`。系统不提供传统 RAG 分支：每次问答都经过 LangGraph 状态图，由 LLM 选择高层工具，策略层强制至少执行一次权威知识检索，并根据证据评估结果决定生成答案或改写查询后再次检索。
 
 ```mermaid
 flowchart TD
     A([用户提交问题]) --> B[POST /api/chat<br/>Pydantic 校验 ChatRequest]
-    B --> B1[按 conversation_id 加载短期 Memory]
-    B1 --> B2[识别追问并补全当前问题]
-    B2 --> B3[system prompt 注入技能目录<br/>仅 name + description]
+    B --> B1[按 thread_id 恢复 LangGraph Checkpoint]
+    B1 --> B2[加载摘要、最近对话与已确认案件事实]
+    B2 --> B2A{memory_mode 是否允许读取}
+    B2A -->|read 或 read_write| B2B[ChromaDB 检索相关长期记忆]
+    B2B --> B2C[按 memory_id 回查 MySQL 权威正文]
+    B2A -->|off| B2D[跳过长期记忆]
+    B2C --> B2E[识别追问并补全当前问题]
+    B2D --> B2E
+    B2E --> B3[system prompt 注入技能目录<br/>仅 name + description]
     B3 --> B4[LLM 调用 load_skill name]
     B4 --> B5[完整 SKILL.md 作为 tool_result<br/>追加到 messages]
     B5 --> C[LLM Tool Router]
@@ -524,9 +539,11 @@ flowchart TD
     M --> N{Grounding 与引用检查}
     N -->|未通过且未超限| M
     N -->|通过或达到上限| O[形成最终答案]
-    O --> O1[写入最近 6 轮 Memory<br/>刷新 24 小时 TTL]
-
-    O1 --> P{是否开启 RAG 评测}
+    O --> O1[更新短期状态<br/>最近 3 轮 + 摘要 + 已确认事实]
+    O1 --> O2{memory_mode 是否为 read_write}
+    O2 -->|是| O3[单批次写入长期记忆<br/>确认信息 + 未确认任务摘要]
+    O2 -->|否| P{是否开启 RAG 评测}
+    O3 --> P
     P -->|是| P1["Recall@5 + MRR@10<br/>P95 Latency + Faithfulness"]
     P -->|否| Q[组装 ChatResponse]
     P1 --> Q
@@ -544,13 +561,17 @@ flowchart TD
 
 `retrieve_legal_evidence` 是一个高层检索工具。LLM 只决定检索 Query、`laws/cases/all` 范围和 Top K，工具内部固定执行 MySQL BM25、ChromaDB Child 向量召回、RRF、MySQL Child 回查、Child Reranker、Parent 聚合与 MySQL Parent 回查。底层步骤不会暴露给 LLM，避免其跳过来源恢复或任意拼装检索链路。
 
+长期记忆使用另一套独立索引：ChromaDB `long_term_memory` Collection 只保存向量、`memory_id`、`user_id` 和分类字段；命中后必须按 `memory_id + user_id` 回查 MySQL `memory_entries`，MySQL 中的有效状态、确认标记和正文才是最终依据。知识库 Child 与长期记忆不会混用 Collection。
+
 流程图中的每个阶段都可以定位到具体实现：
 
 | 阶段 | 采用技术 | 主要源码 | 是否调用云模型 |
 |---|---|---|---|
 | 请求接收 | FastAPI、Pydantic | `api/chat.py`、`models/schemas.py` | 否 |
 | Agent 状态图 | LangGraph、TypedDict、条件边 | `agentic/runtime.py`、`agentic/state.py` | 否 |
-| 短期记忆 | TTL、最近轮次窗口、追问补全 | `memory/service.py` | 否 |
+| 短期记忆 | LangGraph State、Checkpointer、`thread_id`、摘要压缩、追问补全 | `memory/checkpoint.py` | 否 |
+| 长期记忆读取 | ChromaDB 语义召回、`memory_id` 批量回查 MySQL、`user_id` 隔离 | `memory/long_term.py`、`memory/repository.py` | `read/read_write` 模式产生 1 次 Query Embedding |
+| 长期记忆写入 | 明示确认、哈希去重、MySQL + ChromaDB 单批次双写 | `memory/long_term.py`、`db/models.py` | `read_write` 模式产生 1 次批量 Embedding |
 | Skill 路由与加载 | frontmatter 目录、Tool Calling、`load_skill`、ToolMessage | `skills/loader.py`、`skills/tool.py`、`backend/skills/` | `auto` 模式调用 1 次 |
 | 工具决策 | LangChain `bind_tools`、工具白名单、参数约束 | `agentic/tools.py`、`agentic/runtime.py` | 每个工具轮次 1 次 |
 | 证据充分性判断 | JSON 结构化判断、缺失信息提取 | `agentic/runtime.py`、`agentic/prompts.py` | 每轮检索后 1 次 |
@@ -569,9 +590,39 @@ flowchart TD
 | RAG 评测 | 相关文档标注、排名指标、LLM-as-a-Judge | `services/quality_service.py`、`services/perf_service.py` | 检索和延迟指标否，Faithfulness 是 |
 | 响应展示 | Pydantic、Axios、React Markdown | `models/schemas.py`、`ChatPage.jsx` | 否 |
 
-### 4.1 短期 Memory 与 Skill Loading
+### 4.1 短期、长期 Memory 与 Skill Loading
 
-前端在会话开始时生成一个 `conversation_id`，后续问题复用同一标识。后端短期 Memory 保存最近 6 轮问题、答案摘要、来源 ID 和实际 Skill，并在每次访问时刷新 24 小时 TTL。系统发现“如果已经退赃呢”“那未成年人呢”等追问后，将上一轮核心问题与当前问题组合为可独立检索的 `resolved_question`；新会话不会读取其他会话内容。
+一次请求同时携带 `thread_id` 和可选的 `user_id`：`thread_id` 表示当前对话线程，用于隔离 LangGraph Checkpoint；`user_id` 表示同一用户的跨会话身份，只在长期记忆模式开启时使用。旧版 `conversation_id` 继续作为 `thread_id` 的兼容别名。
+
+短期状态由 `AgenticRAGState + InMemorySaver` 管理，保存最近 3 轮对话、较早消息的压缩摘要、用户已确认的本案事实、Agent 节点状态与轮次。每次调用先通过同一 `thread_id` 恢复 Checkpoint，再识别“如果已经退赃呢”“那未成年人呢”等追问并构造可独立检索的 `resolved_question`。超过窗口的消息会进入有界摘要，Checkpoint 超过 24 小时未访问后自动清理。
+
+长期记忆分为三类：
+
+| 类型 | 保存内容 | 确认规则 | 存储与注入方式 |
+|---|---|---|---|
+| Semantic Memory | 用户偏好、已确认案件事实 | 仅接受请求中显式提交的 `confirmed_memories` | MySQL 保存正文与确认状态，ChromaDB 语义召回；作为“用户已确认”上下文注入 |
+| Episodic Memory | 历史任务摘要、调用工具、来源 ID 与处理结论 | Agent 自动生成并固定标记为 `is_confirmed=false` | MySQL + ChromaDB；作为流程参考注入，Prompt 明确禁止当作已确认事实 |
+| Procedural Memory | 各法律领域的分析步骤、证据优先级和工具策略 | 由版本化 `SKILL.md` 管理 | 启动时只注入技能目录，调用 `load_skill` 后才把完整规范写入 `ToolMessage` |
+
+```mermaid
+flowchart LR
+    Q[当前问题] --> ST[按 thread_id 恢复短期状态]
+    ST --> MODE{memory_mode}
+    MODE -->|off| MERGE[组装按需上下文]
+    MODE -->|read 或 read_write| VS[ChromaDB long_term_memory<br/>按 user_id 过滤]
+    VS --> IDS[memory_id 列表]
+    IDS --> SQL[MySQL memory_entries<br/>正文与确认状态回查]
+    SQL --> MERGE
+    SK[Skill 目录] --> MERGE
+    MERGE --> AGENT[Agentic RAG]
+    AGENT --> STW[更新 Checkpoint<br/>最近轮次 + 摘要 + 案件事实]
+    AGENT --> WRITE{read_write}
+    WRITE -->|是| BATCH[确认的 Semantic + 未确认的 Episodic<br/>单次批量向量化写入]
+```
+
+`memory_mode` 控制本次请求的授权边界：`off` 不读不写，`read` 只召回，`read_write` 召回并在回答结束后写入。默认值为 `off`。Semantic Memory 不从模型回答中自动抽取事实；只有用户通过 `confirmed_memories` 明确确认的 `case_fact` 或 `preference` 才能写入。相同用户、相同类型和相同规范化内容通过 SHA-256 哈希去重，重复提交会更新原记录而不是制造副本。
+
+短期上下文、召回的长期记忆与完整 Skill 都采用按需注入：短期只注入摘要、最近窗口和确认事实；长期只注入当前 Query 的 Top K 相关记忆；完整 Skill 只在 `load_skill` 被调用后进入消息。这样避免将全部历史和全部领域规范一次性塞入 Prompt。
 
 ```mermaid
 flowchart LR
@@ -603,7 +654,66 @@ flowchart LR
 
 自动选择 Skill 会增加 1 次轻量 LLM 调用。完整 Skill 进入状态图后，Tool Router 结合领域规则决定是否调用 CrimeKG；CrimeKG 工具本身只执行本地精确查询，不产生嵌套模型调用。
 
-### 4.2 工具决策与检索纠错
+### 4.2 LangGraph 节点图与 State
+
+在线问答由一个 `StateGraph` 统一编排。图中只包含实际注册的九个节点与条件边：
+
+```mermaid
+flowchart TD
+    START([START]) --> PREPARE[prepare]
+    PREPARE --> LOAD_SKILL[load_skill]
+    LOAD_SKILL --> DECIDE_TOOLS[decide_tools]
+
+    DECIDE_TOOLS -->|调用工具| EXECUTE_TOOLS[execute_tools]
+    DECIDE_TOOLS -->|没有工具| GRADE_EVIDENCE[grade_evidence]
+    EXECUTE_TOOLS --> GRADE_EVIDENCE
+
+    GRADE_EVIDENCE -->|证据不足且未超限| REWRITE_QUERY[rewrite_query]
+    REWRITE_QUERY --> DECIDE_TOOLS
+    GRADE_EVIDENCE -->|证据充分或达到上限| COMPACT_CONTEXT[compact_context]
+
+    COMPACT_CONTEXT --> GENERATE[generate]
+    GENERATE --> VERIFY_GROUNDING[verify_grounding]
+    VERIFY_GROUNDING -->|校验失败且未超限| GENERATE
+    VERIFY_GROUNDING -->|校验通过或达到上限| END([END])
+```
+
+#### 4.2.1 AgenticRAGState
+
+所有节点共享同一个 `AgenticRAGState`。节点不直接调用下一个节点，而是读取所需字段、返回局部更新，再由 LangGraph 合并状态并根据边定义继续执行。
+
+| State 分类 | 核心字段 | 作用 |
+|---|---|---|
+| 请求与身份 | `question`、`conversation_id`、`thread_id`、`user_id`、`memory_mode` | 保存原始问题、线程身份、用户身份和长期记忆授权模式 |
+| 短期记忆 | `conversation_summary`、`recent_turns`、`case_facts`、`memory_turns` | 保存历史摘要、最近对话、用户确认事实和累计轮数 |
+| 长期记忆 | `confirmed_memories`、`memory_context`、`recalled_memory_ids` | 保存本轮确认信息、按需注入的记忆上下文和实际召回 ID |
+| Skill | `skill`、`skill_messages` | 保存当前法律领域 Skill 及以 `ToolMessage` 表示的完整执行规范 |
+| 消息与工具 | `messages`、`pending_query`、`tool_calls` | 保存 Agent 消息、当前待检索 Query 和 LLM 生成的工具调用 |
+| 检索证据 | `evidence`、`kg_entities`、`rewritten_queries`、`missing_information` | 汇总法规、案例、CrimeKG、MCP 证据及证据缺口 |
+| 循环控制 | `evidence_sufficient`、`retrieval_rounds`、`tool_rounds`、`generation_rounds` | 控制检索纠错、工具执行和答案修正次数，防止无限循环 |
+| 上下文压缩 | `compacted_context`、`compacted_documents`、`compaction` | 保存压缩后的最终证据、来源文档及 Token 统计 |
+| 生成与校验 | `answer`、`grounding_feedback`、`grounding_passed` | 保存候选答案、校验反馈和最终通过状态 |
+| 可观测性 | `trace` | 按执行顺序记录节点、工具、判断结果和循环信息 |
+
+每次新问题会重置工具调用、临时证据、生成结果和 Trace，只从 Checkpoint 恢复摘要、最近对话、确认事实与轮次，防止上一轮的中间结果泄漏到当前执行。
+
+#### 4.2.2 节点功能
+
+| 节点 | 读取的主要 State | 节点功能 | 写回的主要 State |
+|---|---|---|---|
+| `prepare` | `question`、短期记忆字段、`user_id`、`memory_mode` | 恢复线程上下文，识别连续追问并生成独立 Query；按授权模式从 ChromaDB 召回长期记忆，再按 `memory_id + user_id` 回查 MySQL | `resolved_question`、`pending_query`、`memory_context`、`recalled_memory_ids`、`trace` |
+| `load_skill` | `resolved_question`、请求指定的 Skill | 自动或手动选择法律领域，调用 `load_skill` 读取完整 `SKILL.md`，将程序性规范放入消息 | `skill`、`skill_messages`、`messages`、`trace` |
+| `decide_tools` | `pending_query`、`skill`、`messages`、已有证据 | 让 LLM 从高层工具池选择工具和参数；未选择权威法律检索时由策略层补充 `retrieve_legal_evidence` | `tool_calls`、`messages`、`tool_rounds`、`trace` |
+| `execute_tools` | `tool_calls`、当前 Query | 执行本地父子检索、CrimeKG、来源回查或外部 MCP；大型 Tool Result 经四阶段压缩后形成 `ToolMessage` | `evidence`、`kg_entities`、`messages`、`retrieval_rounds`、`trace` |
+| `grade_evidence` | `resolved_question`、`evidence`、循环次数 | 判断法条、案例和知识证据是否足以回答，提取缺失信息，并根据硬上限决定继续检索还是进入生成 | `evidence_sufficient`、`missing_information`、`pending_query`、`trace` |
+| `rewrite_query` | `resolved_question`、`missing_information`、`evidence` | 围绕缺失的法条、构成要件或案例生成针对性补充 Query | `pending_query`、`rewritten_queries`、`trace` |
+| `compact_context` | `evidence`、`memory_context`、`skill` | 对最终 Parent、案例、KG 和 MCP 证据执行 Budget、Snip、Micro、Summary 四阶段压缩 | `compacted_context`、`compacted_documents`、`compaction`、`trace` |
+| `generate` | `resolved_question`、`compacted_context`、`memory_context`、`skill_messages` | 根据检索证据、按需记忆与领域规范生成带来源引用的法律回答 | `answer`、`generation_rounds`、`trace` |
+| `verify_grounding` | `answer`、`compacted_context`、`generation_rounds` | 检查关键结论是否得到证据支持、引用是否完整；未通过时生成修正反馈 | `grounding_passed`、`grounding_feedback`、`trace` |
+
+`grade_evidence` 后的条件边形成检索纠错循环，`verify_grounding` 后的条件边形成答案修正循环。两个循环都受配置中的最大轮数约束。图执行完成后，Runner 在图外更新短期 Checkpoint；只有 `memory_mode=read_write` 时，才将用户确认信息和未确认任务摘要批量写入长期记忆。长期写入放在 Grounding 校验之后，避免中间答案进入持久化记忆。
+
+### 4.3 工具决策与检索纠错
 
 Agent 只看到稳定的高层工具，底层 BM25、向量检索、重排、数据库回查和第三方 MCP 原始工具不会直接暴露：
 
@@ -621,7 +731,7 @@ Agent 只看到稳定的高层工具，底层 BM25、向量检索、重排、数
 
 LLM 使用 `tool_choice=auto` 选择工具和参数。若首轮没有选择 `retrieve_legal_evidence`，策略层自动补充该调用，从而保证法律答案一定先经过本地知识库检索。本地证据缺失、需要核验效力状态或问题涉及最新政策时，LLM 再选择相应的外部 MCP。所有外部结果以 `Document` 进入同一 Evidence Grader、四阶段压缩和 Grounding 流程。工具轮次最多 3 轮、法律检索最多 2 轮，达到上限后使用现有证据继续生成，不会无限循环。
 
-### 4.3 混合检索
+### 4.4 混合检索
 
 混合检索围绕 Child 展开：MySQL 保存可参与关键词匹配的 Child 权威正文，ChromaDB 保存同一批 Child 的向量及稳定 ID。收到查询后：
 
@@ -633,13 +743,13 @@ LLM 使用 `tool_choice=auto` 选择工具和参数。若首轮没有选择 `ret
 
 因此 ChromaDB 可以随时由 MySQL 数据重建，在线答案不会依赖向量库中的正文副本。用户可以只检索法规、只检索案例，或者同时检索两个 Collection。
 
-### 4.4 CrimeKG 工具
+### 4.5 CrimeKG 工具
 
 Tool Router 判断问题需要罪名结构化知识时调用 `lookup_crime_knowledge`，在 CrimeKG 中精确查找定义、构成要件、量刑和相关法条。命中结果作为高优先级证据并入 Agent 状态。
 
 犯罪知识模块采用轻量结构化查找：将罪名映射到定义、构成要件、量刑和关联法条，以常数时间完成精确查询，省去独立图数据库的部署与维护成本。
 
-### 4.5 重排序
+### 4.6 重排序
 
 初步召回强调“尽量找到”，重排序强调“从细粒度 Child 中选出与 Query 最相关的命中”：
 
@@ -655,13 +765,13 @@ parent_score = max(child_rerank_score) + min(hit_count - 1, 3) × 0.02
 
 系统按 Parent 分数选择 Top 5，并批量回查 MySQL `parent_chunks` 恢复完整法条、案件事实或知识段落。Parent 不再进入 Reranker：相关性判断由更聚焦的 Child 完成，Parent 只承担证据扩展与上下文完整性，避免长文本稀释排序信号和产生第二次云端费用。`cloud` 异常时自动切换到 `simple`，并通过 `rerank_fallback` 记录实际执行路径。
 
-### 4.6 四阶段上下文压缩与答案生成
+### 4.7 四阶段上下文压缩与答案生成
 
 四阶段压缩执行两次：第一次把检索、CrimeKG 和来源回查产生的大型 Tool Result 压缩到默认 1,800 Token 后写入 `ToolMessage`；第二次将 Agent 累积的 Parent 与 KG 证据压缩到默认 4,000 Token，供答案生成使用。整个压缩过程使用确定性算法，不调用模型：
 
 | 阶段 | 处理方式 | 法律场景约束 |
 |---|---|---|
-| Budget | 扣除问题、短期记忆和 Skill 指令占用，计算剩余证据预算 | 为最终答案预留上下文空间 |
+| Budget | 扣除问题、按需召回的短期/长期记忆和 Skill 指令占用，计算剩余证据预算 | 为最终答案预留上下文空间 |
 | Snip | 为法条、案例和 KG 设置单文档上限 | 法条只做原文截取，不改写法律原意 |
 | Micro | 内容归一化去重，按 Skill 的证据优先级和重排分数排序 | 防止同一法条或案例重复占用预算 |
 | Summary | 超出预算时对案例和 KG 做抽取式摘要 | 摘要仅选取原句；法律条文仍保持抽取式裁剪 |
@@ -678,7 +788,7 @@ parent_score = max(child_rerank_score) + min(hit_count - 1, 3) × 0.02
 
 答案生成后，Grounding Checker 判断法律结论是否得到证据支持、关键结论是否具有来源；未通过时最多重新生成一次。最终响应包括 `agent_trace`、工具轮次、检索轮次、Grounding 状态、当前 Skill、上下文压缩统计、来源文档和各节点耗时。
 
-### 4.7 贯穿示例：入室盗窃如何认定和处罚
+### 4.8 贯穿示例：入室盗窃如何认定和处罚
 
 下面以用户问题“进入他人住宅盗窃财物，数额不大，会构成盗窃罪吗？”为例，将离线知识库构建与在线 RAG 问答连接起来：
 
@@ -701,8 +811,9 @@ flowchart LR
     end
 
     subgraph ONLINE[在线 Agentic RAG]
-        Q[用户问题<br/>入室盗窃数额不大会构成犯罪吗] --> MEM[加载短期 Memory]
-        MEM --> CAT[system prompt 提供 Skill 目录]
+        Q[用户问题<br/>入室盗窃数额不大会构成犯罪吗] --> MEM[按 thread_id 恢复短期 Memory]
+        MEM --> LM[按 user_id 召回相关长期 Memory]
+        LM --> CAT[system prompt 提供 Skill 目录]
         CAT --> CALL[LLM 调用 load_skill criminal_law]
         CALL --> SK[完整 SKILL.md 进入 tool_result]
         SK --> T[LLM Tool Router]
@@ -725,8 +836,11 @@ flowchart LR
         CTX --> GEN[Qwen 生成结构化法律回答]
         GEN --> GC{Grounding 与引用校验}
         GC -->|未通过且未超限| GEN
-        GC -->|通过| SAVE[更新短期 Memory]
-        SAVE --> OUT[返回结论、法条、分析<br/>来源和阶段指标]
+        GC -->|通过| SAVE[更新短期 Checkpoint]
+        SAVE --> CONSENT{是否授权长期写入}
+        CONSENT -->|read_write| LMW[批量写入 Semantic 与 Episodic]
+        CONSENT -->|off 或 read| OUT[返回结论、法条、分析<br/>来源和阶段指标]
+        LMW --> OUT
     end
 
     D1 -.法规 Child 向量.-> V
@@ -743,12 +857,12 @@ flowchart LR
 2. **离线整理罪名知识**：CrimeKG 中“盗窃罪”的 `gainian`、`tezheng`、`chufa`、`fatiao` 等字段被展开为可检索文本，同时建立以“盗窃罪”为键的内存索引；
 3. **离线整理案例**：CAIL2018 中罪名为盗窃、关联法条为264的案件被转换为案例文档，保留案件事实、罪名、刑期和来源信息；
 4. **双库存储**：原文、Parent 和 Child 先写入 MySQL；仅 Child 调用 `text-embedding-v3`，法规与 CrimeKG Child 写入 ChromaDB `laws`，案例 Child 写入 `cases`，向量记录 ID 等于 `child_chunk_id`；
-5. **恢复会话并加载 Skill**：系统按 `conversation_id` 读取最近问答；模型选择 `criminal_law` 并调用 `load_skill`，完整刑事规则以 `ToolMessage` 进入 Agent 状态；
+5. **恢复记忆并加载 Skill**：系统按 `thread_id` 恢复最近问答、摘要和确认事实；若本次为 `read` 或 `read_write`，再按 `user_id + 当前问题` 召回相关长期记忆；模型选择 `criminal_law` 并调用 `load_skill`，完整刑事执行规范以 `ToolMessage` 进入 Agent 状态；
 6. **Agent 工具决策**：Tool Router 选择 `retrieve_legal_evidence(query, all, 5)`，并为罪名结构调用 `lookup_crime_knowledge(盗窃罪)`；策略层确保法律检索不会被跳过；
 7. **检索工具执行**：问题 Embedding 查询 ChromaDB 得到 Child ID，BM25 在 MySQL Child 中匹配关键词，RRF 融合后回查 Child 原文、完成 Child 精排并恢复完整 Parent；
 8. **证据评估与纠错检索**：大型工具结果先经过四阶段压缩再写回消息；Evidence Grader 判断法条、构成要件和案例是否足够，不足时生成针对性 Query 并在有界循环中补充检索；
 9. **基于证据生成与校验**：最终证据再次压缩，生成模型组织结构化答案；Grounding Checker 检查结论和引用，未通过时最多重新生成一次；
-10. **更新记忆与评测**：答案、问题和来源 ID 写回短期 Memory；接口返回 Agent Trace、工具与检索轮次、Grounding 状态、来源及阶段耗时，并计算 Recall@5、MRR@10、P95 Latency 和 Faithfulness。
+10. **更新记忆与评测**：问题、答案、摘要和用户确认事实写回短期 Checkpoint；`read_write` 模式将显式确认信息作为 Semantic Memory、将任务摘要作为未确认的 Episodic Memory，以一个 Embedding 批次写入 MySQL 与 ChromaDB；接口返回 Agent Trace、记忆 ID、来源及阶段耗时，并计算 Recall@5、MRR@10、P95 Latency 和 Faithfulness。
 
 该问题最终使用的证据上下文示意如下：
 
@@ -781,7 +895,7 @@ backend/
 │   ├── context/             # Budget、Snip、Micro、Summary 四阶段压缩
 │   ├── core/                # LLM、Embedding、ChromaDB、检索器
 │   ├── db/                  # SQLAlchemy 表模型与 Parent/Child Repository
-│   ├── memory/              # 带 TTL 的短期会话记忆
+│   ├── memory/              # Checkpointer 短期状态、长期记忆服务与 MySQL Repository
 │   ├── models/              # Pydantic 请求与响应模型
 │   ├── services/            # 导入、检索执行与生成能力
 │   ├── skills/              # frontmatter 扫描器、按需加载器与 load_skill 工具
@@ -806,7 +920,7 @@ backend/
 | `GET` | `/` | 项目基本信息 |
 | `GET` | `/health` | 服务和模型配置状态 |
 | `POST` | `/api/chat` | 执行可配置 RAG 问答 |
-| `DELETE` | `/api/chat/memory/{conversation_id}` | 清除指定会话的短期记忆 |
+| `DELETE` | `/api/chat/memory/{thread_id}` | 清除指定线程的短期 Checkpoint（路径兼容旧 conversation_id） |
 | `POST` | `/api/chat/save-record` | 保存问答记录 |
 | `GET` | `/api/chat/records` | 查询问答记录 |
 | `POST` | `/api/knowledge/upload` | 上传法规或案例文件 |
@@ -821,7 +935,7 @@ backend/
 | `POST` | `/api/performance/report` | 生成并保存测试报告 |
 | `GET` | `/api/performance/reports` | 查询历史报告 |
 
-基础问答请求示例：
+带长期记忆授权的问答请求示例：
 
 ```json
 {
@@ -829,16 +943,30 @@ backend/
   "collection": "all",
   "rerank_strategy": "simple",
   "generation_strategy": "structured_legal",
-  "conversation_id": "7ed4fef8aab44f20831b78495cebd8f2",
+  "thread_id": "thread-labor-20261011",
+  "user_id": "user-10001",
+  "memory_mode": "read_write",
+  "confirmed_memories": [
+    {
+      "category": "case_fact",
+      "content": "用户确认公司已经连续拖欠工资三个月"
+    },
+    {
+      "category": "preference",
+      "content": "用户希望回答先给结论，再列法律依据"
+    }
+  ],
   "skill_name": "auto",
   "top_k": 5,
   "evaluate_quality": false
 }
 ```
 
+响应中的 `recalled_memory_ids` 表示本轮实际召回的长期记忆，`written_memory_ids` 表示本轮完成去重并写入/更新的记忆。只需要多轮对话而不需要跨会话记忆时，复用 `thread_id` 并保持 `memory_mode=off`；只读取既有长期记忆时使用 `read`；只有同时提供稳定 `user_id` 和明确写入授权时才使用 `read_write`。
+
 ### 5.3 前端页面
 
-- **智能问答**：复用同一 `conversation_id` 完成多轮追问，可自动或手动选择领域 Skill，并查看回答、来源及阶段耗时；
+- **智能问答**：复用同一 `thread_id` 完成多轮追问，按授权模式召回或写入长期记忆，可自动或手动选择领域 Skill，并查看回答、来源及阶段耗时；
 - **知识库管理**：查看文件与 Chunk 数量，上传 TXT、Markdown 或 JSON 文件，删除文件并重建索引；
 - **性能监控**：查看 CPU/内存，执行基准测试，展示延迟分解和质量指标，导出历史报告。
 
@@ -884,7 +1012,13 @@ RERANKER_CANDIDATE_K=20
 RERANKER_DOCUMENT_MAX_CHARS=1200
 CONTEXT_MAX_TOKENS=4000
 MEMORY_TTL_SECONDS=86400
-MEMORY_MAX_TURNS=6
+SHORT_TERM_RECENT_TURNS=3
+SHORT_TERM_SUMMARY_MAX_CHARS=2400
+SHORT_TERM_MAX_CASE_FACTS=20
+LONG_TERM_MEMORY_ENABLED=true
+MEMORY_COLLECTION=long_term_memory
+MEMORY_RECALL_TOP_K=6
+MEMORY_MAX_WRITES_PER_TURN=8
 AGENT_MAX_TOOL_ROUNDS=3
 AGENT_MAX_RETRIEVAL_ROUNDS=2
 AGENT_MAX_GENERATION_ROUNDS=2
@@ -941,7 +1075,7 @@ python -m scripts.prepare_datasets
 python -m scripts.import_data
 ```
 
-`init_mysql` 创建 Documents、Parent Chunks 和 Child Chunks 三张表，不调用模型。`prepare_datasets` 完成本地格式转换；`import_data` 先把原文及父子块写入 MySQL，再批量调用 `text-embedding-v3` 生成 Child 向量并写入 ChromaDB。旧版 ChromaDB 记录不含稳定 Child ID，升级后需要重新执行一次 `import_data`。
+`init_mysql` 创建 Documents、Parent Chunks、Child Chunks 和 `memory_entries` 表，不调用模型。`prepare_datasets` 完成本地格式转换；`import_data` 先把原文及父子块写入 MySQL，再批量调用 `text-embedding-v3` 生成 Child 向量并写入 ChromaDB。长期记忆 Collection 在首次授权读写时按需创建，与知识库索引相互独立。旧版 ChromaDB 记录不含稳定 Child ID，升级后需要重新执行一次 `import_data`。
 
 ### 6.5 启动后端和前端
 
@@ -967,7 +1101,7 @@ npm run dev
 - 后端文档：`http://127.0.0.1:8000/docs`
 - 健康检查：`http://127.0.0.1:8000/health`
 
-在线 Agentic RAG 的模型调用发生在 Skill 选择、工具决策、证据充分性判断、必要的查询改写、答案生成和 Grounding 校验阶段；每轮法律检索还会调用一次 Embedding，选择 `cloud` 时增加一次云端重排。工具与生成循环均有硬上限。Faithfulness 评测和索引构建也会独立调用模型；Recall@5、MRR@10 与 P95 Latency 的指标计算本身不额外调用模型。
+在线 Agentic RAG 的模型调用发生在 Skill 选择、工具决策、证据充分性判断、必要的查询改写、答案生成和 Grounding 校验阶段；每轮法律检索还会调用一次 Embedding，选择 `cloud` 时增加一次云端重排。长期记忆在 `read/read_write` 模式增加一次 Query Embedding，`read_write` 再增加一次合并后的批量写入 Embedding；`off` 模式不产生记忆向量调用。工具与生成循环均有硬上限。Faithfulness 评测和索引构建也会独立调用模型；Recall@5、MRR@10 与 P95 Latency 的指标计算本身不额外调用模型。
 
 ---
 
@@ -987,7 +1121,8 @@ npm run dev
 | `test_kg.py` | 犯罪知识加载和罪名查找 |
 | `test_cloud_reranker.py` | 云端排序请求格式、响应映射、配置检查和无网络降级 |
 | `test_rag_evaluation.py` | Recall@5、MRR@10、指标聚合和 P95 计算 |
-| `test_context_memory_skills.py` | 四阶段压缩、TTL Memory、frontmatter 扫描、按需正文加载和 `load_skill` Tool |
+| `test_context_memory_skills.py` | 四阶段压缩、兼容会话 Memory、frontmatter 扫描、按需正文加载和 `load_skill` Tool |
+| `test_long_term_memory.py` | Checkpointer 线程隔离、历史摘要压缩、Semantic/Episodic 确认边界、去重、双存储关联与单批次写入 |
 | `test_parent_child_storage.py` | 稳定父子 ID、MySQL 回查、Child 权威正文、Child 精排与 Parent 聚合 |
 | `test_agentic_rag.py` | LangGraph 节点顺序、LLM 工具决策、强制检索策略、证据评估和 Grounding 校验 |
 | `test_external_mcp.py` | MCP 工具注册、底层参数映射、查询脱敏、结果上限和官方域名白名单 |
@@ -1028,12 +1163,14 @@ python -m scripts.run_quality_eval
 - **有界自主决策**：LLM 选择高层工具和补充查询，工具轮次、检索轮次与生成轮次均有硬上限；
 - **强制知识检索**：策略层保证每个法律回答至少调用一次 `retrieve_legal_evidence`；
 - **证据闭环**：Evidence Grader 控制补充检索，Grounding Checker 控制答案修正；
-- **事实库与索引分离**：MySQL 是原文、Parent 和 Child 的唯一事实来源，ChromaDB 是可重建的 Child 向量索引；
+- **事实库与索引分离**：MySQL 是知识原文和记忆正文的事实来源，ChromaDB 中 Child 与 Memory Collection 均为可重建向量索引；
 - **父子索引**：短 Child 负责精确召回与重排，完整 Parent 负责生成证据，兼顾检索精度与语义完整性；
 - **稳定 ID 关联**：`doc_id → parent_chunk_id → child_chunk_id` 使用确定性 ID 串联导入、检索、删除、重建和来源回查；
 - **上下文有预算**：四阶段压缩限制输入规模，保留法条原文、来源标签和高相关证据；
-- **多轮可隔离**：会话以 `conversation_id` 隔离，仅保存最近 6 轮并使用 TTL 自动过期；
-- **能力按需加载**：启动时只有技能目录进入 system prompt，完整 `SKILL.md` 仅在 `load_skill` 调用后以 tool_result 注入；
+- **短期状态可恢复**：LangGraph Checkpointer 以 `thread_id` 隔离线程，保存最近 3 轮、历史摘要、确认事实和 Agent 状态，并使用 TTL 自动过期；
+- **长期记忆双存储**：MySQL 是记忆正文和确认状态的事实库，ChromaDB 只负责按 `memory_id` 召回 Semantic / Episodic 记忆；
+- **写入需要授权**：默认 `memory_mode=off`；Semantic Memory 只接收用户显式确认内容，Agent 任务摘要固定标记为未确认；
+- **能力按需加载**：Skills 作为 Procedural Memory，启动时只有技能目录进入 system prompt，完整 `SKILL.md` 仅在 `load_skill` 调用后以 tool_result 注入；
 - **云端调用隔离**：模型客户端按需初始化，服务启动与单元测试保持零外部调用；
 - **重排自动降级**：云端排序异常时切换到轻量算法，并将降级状态写入响应指标；
 - **请求可观测**：记录查询变换、检索、知识增强、重排、生成和总耗时；

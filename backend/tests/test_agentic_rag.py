@@ -137,3 +137,66 @@ def test_agent_policy_injects_mandatory_retrieval_when_model_skips_it(monkeypatc
 
     assert update["tool_calls"][0]["name"] == "retrieve_legal_evidence"
     assert isinstance(update["messages"][-1], AIMessage)
+
+
+def test_agentic_graph_restores_follow_up_by_thread_id(monkeypatch):
+    from app.agentic import runtime as runtime_module
+
+    monkeypatch.setattr(runtime_module, "get_llm", lambda **kwargs: FakeAgentLLM())
+
+    async def scenario():
+        first_request_runner = runtime_module.AgenticRAGRunner(FakePipeline())
+        await first_request_runner.run("合同成立后是否受法律保护？", thread_id="checkpoint-follow-up")
+        second_request_runner = runtime_module.AgenticRAGRunner(FakePipeline())
+        return await second_request_runner.run(
+            "那如果一方已经付款呢？",
+            thread_id="checkpoint-follow-up",
+        )
+
+    second = asyncio.run(scenario())
+    assert second.thread_id == "checkpoint-follow-up"
+    assert "上一轮问题" in second.resolved_question
+    assert second.metrics.memory_turns == 1
+
+
+def test_agentic_graph_reads_and_writes_long_term_memory_only_when_authorized(monkeypatch):
+    from app.agentic import runtime as runtime_module
+    from app.memory.long_term import RecalledMemory
+
+    calls = {"recall": 0, "write": 0}
+
+    async def fake_recall(user_id, query, top_k):
+        calls["recall"] += 1
+        assert user_id == "user-memory"
+        return [RecalledMemory(
+            memory_id="memory-existing",
+            memory_type="semantic",
+            category="preference",
+            content="用户希望先给结论",
+            is_confirmed=True,
+            source_kind="user_confirmed",
+        )]
+
+    async def fake_remember_turn(**kwargs):
+        calls["write"] += 1
+        assert kwargs["confirmed_items"][0]["category"] == "case_fact"
+        return ["memory-new", "episode-new"]
+
+    monkeypatch.setattr(runtime_module, "get_llm", lambda **kwargs: FakeAgentLLM())
+    monkeypatch.setattr(runtime_module.long_term_memory, "recall", fake_recall)
+    monkeypatch.setattr(runtime_module.long_term_memory, "remember_turn", fake_remember_turn)
+    runner = runtime_module.AgenticRAGRunner(FakePipeline())
+
+    result = asyncio.run(runner.run(
+        "合同是否有效？",
+        thread_id="authorized-memory-thread",
+        user_id="user-memory",
+        memory_mode="read_write",
+        confirmed_memories=[{"category": "case_fact", "content": "双方已经签字"}],
+    ))
+
+    assert calls == {"recall": 1, "write": 1}
+    assert result.recalled_memory_ids == ["memory-existing"]
+    assert result.written_memory_ids == ["memory-new", "episode-new"]
+    assert result.metrics.long_term_memory_retrieved == 1
+    assert result.metrics.long_term_memory_written == 2

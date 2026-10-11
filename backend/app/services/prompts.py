@@ -17,7 +17,7 @@ LEGAL_QA_PROMPT = ChatPromptTemplate.from_messages([
 技能目录：
 {skill_catalog}
 
-短期会话记忆：
+按需加载的记忆上下文（含短期会话、已确认语义记忆和仅供流程参考的情景记忆）：
 {memory_context}
 
 参考资料：
@@ -53,7 +53,7 @@ LEGAL_STRUCTURED_PROMPT = ChatPromptTemplate.from_messages([
 技能目录：
 {skill_catalog}
 
-短期会话记忆：
+按需加载的记忆上下文（含短期会话、已确认语义记忆和仅供流程参考的情景记忆）：
 {memory_context}
 
 参考资料：

@@ -17,6 +17,10 @@ export async function sendChat({
   generationStrategy = 'standard',
   conversationId,
   skillName = 'auto',
+  threadId,
+  userId,
+  memoryMode = 'off',
+  confirmedMemories = [],
 }) {
   const res = await api.post('/chat', {
     question,
@@ -27,6 +31,10 @@ export async function sendChat({
     rerank_strategy: rerankStrategy,
     generation_strategy: generationStrategy,
     conversation_id: conversationId,
+    thread_id: threadId,
+    user_id: userId,
+    memory_mode: memoryMode,
+    confirmed_memories: confirmedMemories,
     skill_name: skillName,
   })
   return res.data.data

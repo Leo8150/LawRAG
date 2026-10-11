@@ -15,6 +15,10 @@ export default function ChatPage() {
   const [rerankStrategy, setRerankStrategy] = useState('simple')
   const [generationStrategy, setGenerationStrategy] = useState('standard')
   const [skillName, setSkillName] = useState('auto')
+  const [memoryMode, setMemoryMode] = useState('off')
+  const [userId, setUserId] = useState('')
+  const [memoryCategory, setMemoryCategory] = useState('case_fact')
+  const [confirmedMemory, setConfirmedMemory] = useState('')
   const conversationIdRef = useRef(
     globalThis.crypto?.randomUUID?.() || `lawrag-${Date.now()}`
   )
@@ -73,6 +77,10 @@ export default function ChatPage() {
   const handleSend = async () => {
     const q = input.trim()
     if (!q || loading) return
+    if (memoryMode !== 'off' && !userId.trim()) {
+      alert('启用长期记忆前，请填写稳定的用户 ID。')
+      return
+    }
 
     setMessages(prev => [...prev, { role: 'user', content: q }])
     setInput('')
@@ -92,6 +100,12 @@ export default function ChatPage() {
         rerankStrategy,
         generationStrategy,
         conversationId: conversationIdRef.current,
+        threadId: conversationIdRef.current,
+        userId: userId.trim() || undefined,
+        memoryMode,
+        confirmedMemories: memoryMode === 'read_write' && confirmedMemory.trim()
+          ? [{ category: memoryCategory, content: confirmedMemory.trim() }]
+          : [],
         skillName,
       })
 
@@ -114,7 +128,10 @@ export default function ChatPage() {
         activeSkill: result.active_skill,
         contextCompaction: result.context_compaction,
         agentTrace: result.agent_trace,
+        recalledMemoryIds: result.recalled_memory_ids,
+        writtenMemoryIds: result.written_memory_ids,
       }])
+      if (memoryMode === 'read_write') setConfirmedMemory('')
     } catch (err) {
       stopLiveMonitor()
       setMessages(prev => [...prev, {
@@ -203,6 +220,38 @@ export default function ChatPage() {
             </select>
           </label>
         </div>
+        <div className="option-group">
+          <span className="option-group-label">长期记忆</span>
+          <select className="select-small" value={memoryMode} onChange={e => setMemoryMode(e.target.value)}>
+            <option value="off">关闭</option>
+            <option value="read">只读</option>
+            <option value="read_write">读写（明确授权）</option>
+          </select>
+          {memoryMode !== 'off' && (
+            <input
+              className="input"
+              style={{ width: 150, padding: '4px 8px' }}
+              placeholder="稳定用户 ID"
+              value={userId}
+              onChange={e => setUserId(e.target.value)}
+            />
+          )}
+          {memoryMode === 'read_write' && (
+            <>
+              <select className="select-small" value={memoryCategory} onChange={e => setMemoryCategory(e.target.value)}>
+                <option value="case_fact">确认案件事实</option>
+                <option value="preference">确认回答偏好</option>
+              </select>
+              <input
+                className="input"
+                style={{ width: 220, padding: '4px 8px' }}
+                placeholder="可选：本轮明确确认的信息"
+                value={confirmedMemory}
+                onChange={e => setConfirmedMemory(e.target.value)}
+              />
+            </>
+          )}
+        </div>
         <div style={{ borderLeft: '1px solid var(--border)', height: 20, margin: '0 4px' }} />
         <label className="option-label" style={{ color: enableMonitor ? 'var(--primary)' : undefined }}>
           <input type="checkbox" checked={enableMonitor} onChange={e => setEnableMonitor(e.target.checked)} />
@@ -288,6 +337,8 @@ export default function ChatPage() {
                   {msg.metrics.rerank_fallback && <span className="metric-tag">重排已降级</span>}
                   <span className="metric-tag">上下文 {msg.metrics.context_tokens_before}→{msg.metrics.context_tokens_after} tokens</span>
                   <span className="metric-tag">Memory {msg.metrics.memory_turns} 轮</span>
+                  {msg.metrics.long_term_memory_retrieved > 0 && <span className="metric-tag">长期召回 {msg.metrics.long_term_memory_retrieved}</span>}
+                  {msg.metrics.long_term_memory_written > 0 && <span className="metric-tag">长期写入 {msg.metrics.long_term_memory_written}</span>}
                   <span className="metric-tag">Child {msg.metrics.retrieved_child_count}→{msg.metrics.reranked_child_count}</span>
                   <span className="metric-tag">Parent {msg.metrics.parent_candidate_count}</span>
                   <span className="metric-tag">Agent {msg.metrics.agent_rounds} 轮 / {msg.metrics.agent_tool_calls} 工具</span>

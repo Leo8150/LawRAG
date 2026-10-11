@@ -82,24 +82,42 @@ class LongTermMemoryService:
         items: list[dict[str, Any]],
         thread_id: str,
     ) -> list[str]:
-        written: list[str] = []
-        for item in items[: settings.MEMORY_MAX_WRITES_PER_TURN]:
-            content = _normalize(str(item.get("content", "")))
-            category = str(item.get("category", "case_fact"))
-            if not content or category not in {"case_fact", "preference"}:
-                continue
-            entry = self._entry(
-                user_id=user_id,
-                memory_type="semantic",
-                category=category,
-                content=content,
-                source_kind="user_confirmed",
-                confirmed=True,
-                metadata={"thread_id": thread_id},
-            )
-            saved = await self._store(entry)
-            written.append(saved.memory_id)
-        return written
+        if not settings.LONG_TERM_MEMORY_ENABLED or not user_id.strip():
+            return []
+        entries = self._confirmed_entries(user_id, items, thread_id)
+        return [entry.memory_id for entry in await self._store_many(entries)]
+
+    async def remember_turn(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+        confirmed_items: list[dict[str, Any]],
+        question: str,
+        answer: str,
+        trace: list[dict[str, Any]],
+        source_ids: list[str],
+    ) -> list[str]:
+        """Persist all memories from one turn with one embedding batch.
+
+        Semantic entries only come from the explicit ``confirmed_items`` field.
+        The generated task episode is intentionally marked unconfirmed, so it
+        can help route future work without becoming an authoritative case fact.
+        """
+        if not settings.LONG_TERM_MEMORY_ENABLED or not user_id.strip():
+            return []
+        entries = self._confirmed_entries(user_id, confirmed_items, thread_id)
+        episode = self._episode_entry(
+            user_id=user_id,
+            thread_id=thread_id,
+            question=question,
+            answer=answer,
+            trace=trace,
+            source_ids=source_ids,
+        )
+        if episode is not None:
+            entries.append(episode)
+        return [entry.memory_id for entry in await self._store_many(entries)]
 
     async def remember_episode(
         self,
@@ -110,6 +128,54 @@ class LongTermMemoryService:
         trace: list[dict[str, Any]],
         source_ids: list[str],
     ) -> str | None:
+        if not settings.LONG_TERM_MEMORY_ENABLED or not user_id.strip():
+            return None
+        entry = self._episode_entry(
+            user_id=user_id,
+            thread_id=thread_id,
+            question=question,
+            answer=answer,
+            trace=trace,
+            source_ids=source_ids,
+        )
+        if entry is None:
+            return None
+        saved = await self._store_many([entry])
+        return saved[0].memory_id if saved else None
+
+    def _confirmed_entries(
+        self,
+        user_id: str,
+        items: list[dict[str, Any]],
+        thread_id: str,
+    ) -> list[MemoryEntry]:
+        entries: list[MemoryEntry] = []
+        for item in items[: settings.MEMORY_MAX_WRITES_PER_TURN]:
+            content = _normalize(str(item.get("content", "")))
+            category = str(item.get("category", "case_fact"))
+            if not content or category not in {"case_fact", "preference"}:
+                continue
+            entries.append(self._entry(
+                user_id=user_id,
+                memory_type="semantic",
+                category=category,
+                content=content,
+                source_kind="user_confirmed",
+                confirmed=True,
+                metadata={"thread_id": thread_id},
+            ))
+        return entries
+
+    def _episode_entry(
+        self,
+        *,
+        user_id: str,
+        thread_id: str,
+        question: str,
+        answer: str,
+        trace: list[dict[str, Any]],
+        source_ids: list[str],
+    ) -> MemoryEntry | None:
         tools = [
             tool
             for event in trace
@@ -122,7 +188,7 @@ class LongTermMemoryService:
         )
         if not content:
             return None
-        entry = self._entry(
+        return self._entry(
             user_id=user_id,
             memory_type="episodic",
             category="task_summary",
@@ -135,29 +201,36 @@ class LongTermMemoryService:
                 "source_ids": source_ids[:10],
             },
         )
-        return (await self._store(entry)).memory_id
 
-    async def _store(self, entry: MemoryEntry) -> MemoryEntry:
-        saved, _ = await asyncio.to_thread(self.repo.upsert, entry)
-        metadata = {
-            "memory_id": saved.memory_id,
-            "user_id": saved.user_id,
-            "memory_type": saved.memory_type,
-            "category": saved.category,
-            "is_confirmed": saved.is_confirmed,
-        }
+    async def _store_many(self, entries: list[MemoryEntry]) -> list[MemoryEntry]:
+        if not entries:
+            return []
+        saved_entries = [
+            (await asyncio.to_thread(self.repo.upsert, entry))[0]
+            for entry in entries
+        ]
+        ids = [entry.memory_id for entry in saved_entries]
+        metadatas = [{
+            "memory_id": entry.memory_id,
+            "user_id": entry.user_id,
+            "memory_type": entry.memory_type,
+            "category": entry.category,
+            "is_confirmed": entry.is_confirmed,
+        } for entry in saved_entries]
         try:
-            await asyncio.to_thread(self.vectorstore.delete, [saved.memory_id])
+            await asyncio.to_thread(self.vectorstore.delete, ids)
             await asyncio.to_thread(
                 self.vectorstore.add_texts,
-                [saved.content],
-                [metadata],
-                [saved.memory_id],
+                [entry.content for entry in saved_entries],
+                metadatas,
+                ids,
             )
-            await asyncio.to_thread(self.repo.mark_indexed, saved.memory_id, "indexed")
+            for memory_id in ids:
+                await asyncio.to_thread(self.repo.mark_indexed, memory_id, "indexed")
         except Exception:
-            await asyncio.to_thread(self.repo.mark_indexed, saved.memory_id, "pending")
-        return saved
+            for memory_id in ids:
+                await asyncio.to_thread(self.repo.mark_indexed, memory_id, "pending")
+        return saved_entries
 
     @staticmethod
     def _entry(

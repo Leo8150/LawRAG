@@ -36,6 +36,10 @@ async def chat(req: ChatRequest):
             use_kg=req.use_kg,
             conversation_id=req.conversation_id,
             skill_name=req.skill_name,
+            thread_id=req.thread_id,
+            user_id=req.user_id,
+            memory_mode=req.memory_mode,
+            confirmed_memories=[item.model_dump() for item in req.confirmed_memories],
         )
 
         # 系统快照（问答后）
@@ -65,9 +69,11 @@ async def chat(req: ChatRequest):
 @router.delete("/memory/{conversation_id}", response_model=APIResponse)
 async def clear_conversation_memory(conversation_id: str):
     """清除指定会话的短期记忆。"""
-    from app.memory import memory_service
+    from app.memory import checkpoint_manager, memory_service
 
-    cleared = memory_service.clear(conversation_id)
+    legacy_cleared = memory_service.clear(conversation_id)
+    checkpoint_cleared = await checkpoint_manager.clear(conversation_id)
+    cleared = legacy_cleared or checkpoint_cleared
     return APIResponse(data={"conversation_id": conversation_id, "cleared": cleared})
 
 
