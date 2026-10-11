@@ -89,6 +89,7 @@ class AgenticRAGRunner:
         graph.add_node("compact_context", self._compact_context)
         graph.add_node("generate", self._generate)
         graph.add_node("verify_grounding", self._verify_grounding)
+        graph.add_node("update_memory", self._update_memory)
 
         graph.add_edge(START, "prepare")
         graph.add_edge("prepare", "load_skill")
@@ -110,8 +111,9 @@ class AgenticRAGRunner:
         graph.add_conditional_edges(
             "verify_grounding",
             self._after_grounding,
-            {"regenerate": "generate", "finish": END},
+            {"regenerate": "generate", "finish": "update_memory"},
         )
+        graph.add_edge("update_memory", END)
         return graph.compile(checkpointer=checkpoint_manager.saver)
 
     async def run(
@@ -140,6 +142,8 @@ class AgenticRAGRunner:
             "case_facts": short_snapshot.case_facts,
             "memory_turns": short_snapshot.turn_count,
             "recalled_memory_ids": [],
+            "written_memory_ids": [],
+            "memory_write_error": "",
             "evidence": [],
             "kg_entities": [],
             "rewritten_queries": [],
@@ -180,47 +184,8 @@ class AgenticRAGRunner:
         ]
         skill = result["skill"]
         answer = result.get("answer", "现有证据不足以形成可靠回答。")
-        source_ids = [format_source_display(doc.metadata) for doc in documents]
-
-        extracted_memories: list[dict[str, str]] = []
-        written_memory_ids: list[str] = []
-        if memory_mode == "read_write" and user_id:
-            try:
-                extracted_memories = await self._extract_user_memories(question)
-            except Exception:
-                # Extraction is optional enrichment and must not discard a legal answer.
-                extracted_memories = []
-            try:
-                written_memory_ids = await long_term_memory.remember_turn(
-                    user_id=user_id,
-                    thread_id=active_thread_id,
-                    user_items=extracted_memories,
-                    question=question,
-                    answer=answer,
-                    trace=result.get("trace", []),
-                    source_ids=source_ids,
-                )
-            except Exception:
-                # Memory persistence is non-critical and must not discard a legal answer.
-                written_memory_ids = []
-        self.pipeline.metrics["long_term_memory_written"] = len(written_memory_ids)
-
-        extracted_case_facts = [
-            str(item.get("content", ""))
-            for item in extracted_memories
-            if item.get("category") == "case_fact"
-        ]
-        advanced = short_term_context.advance(
-            short_snapshot,
-            question,
-            answer,
-            extracted_case_facts,
-        )
+        written_memory_ids = result.get("written_memory_ids", [])
         await self.graph.aupdate_state(graph_config, {
-            "conversation_summary": advanced.summary,
-            "recent_turns": advanced.recent_turns,
-            "case_facts": advanced.case_facts,
-            "memory_turns": advanced.turn_count,
             "messages": [],
             "tool_calls": [],
             "evidence": [],
@@ -650,6 +615,69 @@ class AgenticRAGRunner:
         if state.get("generation_rounds", 0) >= settings.AGENT_MAX_GENERATION_ROUNDS:
             return "finish"
         return "regenerate"
+
+    async def _update_memory(self, state: AgenticRAGState) -> dict:
+        """Extract and persist memory after the final answer without blocking it."""
+        snapshot = short_term_context.from_values(state)
+        extracted_memories: list[dict[str, str]] = []
+        written_memory_ids: list[str] = []
+        errors: list[str] = []
+
+        if state.get("memory_mode") == "read_write" and state.get("user_id"):
+            try:
+                extracted_memories = await self._extract_user_memories(state["question"])
+            except Exception as exc:
+                # Memory enrichment is non-critical: the verified legal answer
+                # must still be returned when extraction is unavailable.
+                errors.append(f"extract:{type(exc).__name__}")
+                extracted_memories = []
+
+            source_ids = [
+                format_source_display(document.metadata)
+                for document in state.get("compacted_documents", [])
+            ]
+            try:
+                written_memory_ids = await long_term_memory.remember_turn(
+                    user_id=state["user_id"],
+                    thread_id=state["thread_id"],
+                    user_items=extracted_memories,
+                    question=state["question"],
+                    answer=state.get("answer", ""),
+                    trace=state.get("trace", []),
+                    source_ids=source_ids,
+                )
+            except Exception as exc:
+                errors.append(f"persist:{type(exc).__name__}")
+                written_memory_ids = []
+
+        self.pipeline.metrics["long_term_memory_written"] = len(written_memory_ids)
+        extracted_case_facts = [
+            str(item.get("content", ""))
+            for item in extracted_memories
+            if item.get("category") == "case_fact"
+        ]
+        advanced = short_term_context.advance(
+            snapshot,
+            state["question"],
+            state.get("answer", ""),
+            extracted_case_facts,
+        )
+        error = ";".join(errors)
+        return {
+            "conversation_summary": advanced.summary,
+            "recent_turns": advanced.recent_turns,
+            "case_facts": advanced.case_facts,
+            "memory_turns": advanced.turn_count,
+            "written_memory_ids": written_memory_ids,
+            "memory_write_error": error,
+            "trace": _trace(
+                state,
+                "update_memory",
+                extracted_count=len(extracted_memories),
+                written_count=len(written_memory_ids),
+                write_failed=bool(error),
+            ),
+        }
 
     async def _summarize_message_history(
         self,

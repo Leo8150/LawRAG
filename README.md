@@ -590,7 +590,8 @@ flowchart TD
     M --> N{Grounding 与引用检查}
     N -->|未通过且未超限| M
     N -->|通过或达到上限| O[形成最终答案]
-    O --> O2{memory_mode 是否为 read_write}
+    O --> UM[update_memory]
+    UM --> O2{memory_mode 是否为 read_write}
     O2 -->|是| OX[从用户原始消息自动提取<br/>事实与偏好 + 原文证据校验]
     OX --> O1[更新短期状态<br/>最近 3 轮 + 摘要 + 用户陈述事实]
     O2 -->|否| O1
@@ -774,7 +775,7 @@ flowchart LR
 
 ### 4.2 LangGraph 节点图与 State
 
-在线问答由一个 `StateGraph` 统一编排。图中只包含实际注册的九个节点与条件边：
+在线问答由一个 `StateGraph` 统一编排。图中只包含实际注册的十个节点与条件边：
 
 ```mermaid
 flowchart TD
@@ -793,7 +794,8 @@ flowchart TD
     COMPACT_CONTEXT --> GENERATE[generate]
     GENERATE --> VERIFY_GROUNDING[verify_grounding]
     VERIFY_GROUNDING -->|校验失败且未超限| GENERATE
-    VERIFY_GROUNDING -->|校验通过或达到上限| END([END])
+    VERIFY_GROUNDING -->|校验通过或达到上限| UPDATE_MEMORY[update_memory]
+    UPDATE_MEMORY --> END([END])
 ```
 
 #### 4.2.1 AgenticRAGState
@@ -804,7 +806,7 @@ flowchart TD
 |---|---|---|
 | 请求与身份 | `question`、`conversation_id`、`thread_id`、`user_id`、`memory_mode` | 保存原始问题、线程身份、用户身份和长期记忆授权模式 |
 | 短期记忆 | `conversation_summary`、`recent_turns`、`case_facts`、`memory_turns` | 保存历史摘要、最近对话、用户明确陈述的事实和累计轮数 |
-| 长期记忆 | `memory_context`、`recalled_memory_ids` | 保存按需注入的记忆上下文和本轮实际召回的 Memory ID；自动提取与持久化在回答结束后执行，不把临时提取结果滞留在 Graph State 中 |
+| 长期记忆 | `memory_context`、`recalled_memory_ids`、`written_memory_ids`、`memory_write_error` | 保存按需注入的记忆上下文、召回与写入 ID，以及非阻断写入错误；临时提取结果只在节点内部使用，不滞留在 State 中 |
 | Skill | `skill`、`skill_messages` | 保存当前法律领域 Skill 及以 `ToolMessage` 表示的完整执行规范 |
 | 消息与工具 | `messages`、`pending_query`、`tool_calls` | 保存 Agent 消息、当前待检索 Query 和 LLM 生成的工具调用 |
 | 检索证据 | `evidence`、`kg_entities`、`rewritten_queries`、`missing_information` | 汇总法规、案例、CrimeKG、MCP 证据及证据缺口 |
@@ -828,8 +830,9 @@ flowchart TD
 | `compact_context` | `evidence`、`memory_context`、`skill` | 使用 `LegalEvidencePacker` 计算 Token 预算，对 Parent、案例、KG 与 MCP 证据裁剪、去重、排序并保留来源 | `compacted_context`、`compacted_documents`、`compaction`、`trace` |
 | `generate` | `resolved_question`、`compacted_context`、`memory_context`、`skill_messages` | 根据检索证据、按需记忆与领域规范生成带来源引用的法律回答 | `answer`、`generation_rounds`、`trace` |
 | `verify_grounding` | `answer`、`compacted_context`、`generation_rounds` | 检查关键结论是否得到证据支持、引用是否完整；未通过时生成修正反馈 | `grounding_passed`、`grounding_feedback`、`trace` |
+| `update_memory` | `question`、`answer`、`trace`、`compacted_documents`、短期记忆字段、`memory_mode`、`user_id` | 在最终答案后更新短期记忆；`read_write` 模式自动提取并校验用户陈述，构造 Semantic / Episodic Memory 后批量写入 MySQL 与 ChromaDB；异常只记录、不阻断答案 | `conversation_summary`、`recent_turns`、`case_facts`、`memory_turns`、`written_memory_ids`、`memory_write_error`、`trace` |
 
-`grade_evidence` 后的条件边形成检索纠错循环，`verify_grounding` 后的条件边形成答案修正循环。两个循环都受配置中的最大轮数约束。图执行完成后，Runner 在图外更新短期 Checkpoint；只有 `memory_mode=read_write` 时，才自动提取带原文依据的用户陈述，并与 Agent 任务摘要批量写入长期记忆。长期写入放在 Grounding 校验之后，避免中间答案进入持久化记忆。
+`grade_evidence` 后的条件边形成检索纠错循环，`verify_grounding` 后的条件边形成答案修正循环。两个循环都受配置中的最大轮数约束。校验通过或达到生成上限后统一进入 `update_memory`：节点始终更新短期状态，只有 `memory_mode=read_write` 时才自动提取带原文依据的用户陈述，并与 Agent 任务摘要批量写入长期记忆。该节点位于 Grounding 校验之后，避免中间答案进入持久化记忆。
 
 ### 4.3 工具决策与检索纠错
 
@@ -980,11 +983,8 @@ flowchart LR
         CTX --> GEN[Qwen 生成结构化法律回答]
         GEN --> GC{Grounding 与引用校验}
         GC -->|未通过且未超限| GEN
-        GC -->|通过| SAVE[更新短期 Checkpoint]
-        SAVE --> CONSENT{是否授权长期写入}
-        CONSENT -->|read_write| LMW[批量写入 Semantic 与 Episodic]
-        CONSENT -->|off 或 read| OUT[返回结论、法条、分析<br/>来源和阶段指标]
-        LMW --> OUT
+        GC -->|通过或达到上限| UM[update_memory<br/>更新短期 Checkpoint<br/>按授权提取并持久化长期记忆]
+        UM --> OUT[返回结论、法条、分析<br/>来源和阶段指标]
     end
 
     D1 -.法规 Child 向量.-> V

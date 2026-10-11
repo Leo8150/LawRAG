@@ -23,6 +23,8 @@ class AgenticRAGState(TypedDict, total=False):
     recent_turns: list[dict[str, str]]
     case_facts: list[str]
     recalled_memory_ids: list[str]
+    written_memory_ids: list[str]
+    memory_write_error: str
     skill: LegalSkill
     skill_messages: list[BaseMessage]
     messages: list[BaseMessage]

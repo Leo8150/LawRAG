@@ -115,6 +115,7 @@ def test_agentic_graph_runs_tool_grade_generate_and_grounding(monkeypatch):
         "compact_context",
         "generate",
         "verify_grounding",
+        "update_memory",
     ]
     assert result.metrics.grounding_passed is True
     assert result.metrics.retrieval_rounds == 1
