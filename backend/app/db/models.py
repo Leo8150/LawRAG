@@ -111,6 +111,8 @@ class MemoryEntry(Base):
     user_id: Mapped[str] = mapped_column(String(128), index=True)
     memory_type: Mapped[str] = mapped_column(String(32), index=True)
     category: Mapped[str] = mapped_column(String(32), default="")
+    importance: Mapped[float] = mapped_column(Float, default=0.5)
+    half_life_days: Mapped[int] = mapped_column(Integer, default=90)
     content: Mapped[str] = mapped_column(LONG_TEXT)
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
     source_kind: Mapped[str] = mapped_column(String(32), default="user_statement")
@@ -125,3 +127,4 @@ class MemoryEntry(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
     last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    forgotten_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

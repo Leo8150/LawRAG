@@ -32,8 +32,9 @@ LawRAG 是一个面向中国法律咨询场景的检索增强生成（Retrieval-
      - [4.1.1 记忆分层与身份隔离](#411-记忆分层与身份隔离)
      - [4.1.2 会话开始：恢复与召回](#412-会话开始恢复与召回)
      - [4.1.3 会话结束：提取、校验与写入](#413-会话结束提取校验与写入)
-     - [4.1.4 记忆整合与授权模式](#414-记忆整合与授权模式)
-     - [4.1.5 Skill Loading](#415-skill-loading)
+     - [4.1.4 检索评分与指数遗忘](#414-检索评分与指数遗忘)
+     - [4.1.5 记忆整合与授权模式](#415-记忆整合与授权模式)
+     - [4.1.6 Skill Loading](#416-skill-loading)
    - [4.2 LangGraph 节点图与 State](#42-langgraph-节点图与-state)
      - [4.2.1 AgenticRAGState](#421-agenticragstate)
      - [4.2.2 节点功能](#422-节点功能)
@@ -239,7 +240,7 @@ flowchart TB
 | Agent 上下文 | Tool Result Budget、Snip Compact、Micro Compact、Compact History | 大结果转存、消息归档、旧结果替换和超限历史摘要 |
 | 法律证据上下文 | `LegalEvidencePacker` | Token 预算、单文档裁剪、证据去重、排序和抽取式打包 |
 | 短期记忆 | LangGraph State、InMemorySaver、`thread_id`、TTL | 保存最近 3 轮、历史摘要、已确认案件事实和执行状态，支持追问与检查点恢复 |
-| 长期记忆 | MySQL、ChromaDB、`memory_id` | MySQL 保存权威正文和元数据，独立 Collection 负责 Semantic / Episodic 语义召回 |
+| 长期记忆 | MySQL、ChromaDB、`memory_id`、指数衰减 | MySQL 保存权威正文、重要性与半衰期，独立 Collection 粗召回后按记忆强度重排 Semantic / Episodic 候选 |
 | 程序性记忆 | YAML frontmatter、`load_skill`、ToolMessage | 技能目录进入 system prompt，完整执行规范按需作为 tool_result 注入 |
 | 生成模型 | DashScope `qwen-turbo` | 查询改写、答案生成、可选评测 |
 | 向量模型 | DashScope `text-embedding-v3` | 文本向量化和语义查询 |
@@ -625,7 +626,7 @@ flowchart TD
 | 请求接收 | FastAPI、Pydantic | `api/chat.py`、`models/schemas.py` | 否 |
 | Agent 状态图 | LangGraph、TypedDict、条件边 | `agentic/runtime.py`、`agentic/state.py` | 否 |
 | 短期记忆 | LangGraph State、Checkpointer、`thread_id`、摘要压缩、追问补全 | `memory/checkpoint.py` | 否 |
-| 长期记忆读取 | ChromaDB 语义召回、`memory_id` 批量回查 MySQL、`user_id` 隔离 | `memory/long_term.py`、`memory/repository.py` | `read/read_write` 模式产生 1 次 Query Embedding |
+| 长期记忆读取 | ChromaDB Top 20 粗召回、`memory_id` 批量回查 MySQL、指数衰减重排、分类限额、`user_id` 隔离 | `memory/long_term.py`、`memory/repository.py` | `read/read_write` 模式产生 1 次 Query Embedding |
 | 长期记忆写入 | 用户陈述自动提取、原文证据校验、哈希去重、MySQL + ChromaDB 单批次双写 | `agentic/runtime.py`、`memory/long_term.py`、`db/models.py` | `read_write` 模式产生 1 次提取调用和 1 次批量 Embedding |
 | Skill 路由与加载 | frontmatter 目录、Tool Calling、`load_skill`、ToolMessage | `skills/loader.py`、`skills/tool.py`、`backend/skills/` | `auto` 模式调用 1 次 |
 | 工具决策 | LangChain `bind_tools`、工具白名单、参数约束 | `agentic/tools.py`、`agentic/runtime.py` | 每个工具轮次 1 次 |
@@ -656,10 +657,12 @@ flowchart TD
     CP --> RESOLVE[结合摘要与最近对话<br/>补全多轮追问]
     RESOLVE --> MODE{memory_mode}
     MODE -->|off| MERGE[组装 memory_context]
-    MODE -->|read / read_write| VECTOR[ChromaDB long_term_memory<br/>Query 向量召回 + user_id 过滤]
-    VECTOR --> IDS[Top K memory_id]
+    MODE -->|read / read_write| VECTOR[ChromaDB long_term_memory<br/>召回 Top 20 候选]
+    VECTOR --> IDS[memory_id + similarity]
     IDS --> MYSQL[MySQL memory_entries<br/>回查有效正文与来源类型]
-    MYSQL --> MERGE
+    MYSQL --> SCORE[相似度 0.8 + 记忆强度 0.2<br/>分类限额选择 Top 6]
+    SCORE --> ACCESS[仅更新入选记忆的<br/>access_count / last_accessed_at]
+    ACCESS --> MERGE
     MERGE --> RAG[Agentic RAG 检索与生成]
     RAG --> CHECK[答案忠实度校验]
     CHECK --> WRITE{memory_mode = read_write}
@@ -673,6 +676,8 @@ flowchart TD
     UPSERT --> INDEX[ChromaDB 单批次向量化]
     INDEX --> SHORT
     SHORT --> END([结束])
+    MAINTAIN[maintain_memory] --> DECAY[计算指数衰减强度]
+    DECAY -->|Strength 小于 0.1| FORGET[MySQL 软遗忘<br/>删除 ChromaDB 向量]
 ```
 
 #### 4.1.1 记忆分层与身份隔离
@@ -697,13 +702,16 @@ flowchart TD
 ```text
 resolved_question
     → Query Embedding
-    → ChromaDB 按 user_id 相似度检索
-    → Top K memory_id
+    → ChromaDB 按 user_id 召回 Top 20 候选
+    → memory_id + similarity
     → MySQL 按 user_id + memory_id 批量回查
-    → 记录 access_count / last_accessed_at
+    → 过滤 is_active=false 的记录
+    → 相似度与指数衰减强度重排
+    → 按类别限额选择 Top 6
+    → 仅为入选记忆记录 access_count / last_accessed_at
 ```
 
-默认最多召回 `MEMORY_RECALL_TOP_K=6` 条。ChromaDB 是可重建索引，MySQL 中的正文、有效状态和来源类型才是最终依据；向量命中后不能绕过 MySQL 直接注入 Prompt。
+默认由 `MEMORY_CANDIDATE_TOP_K=20` 控制粗召回数量，由 `MEMORY_RECALL_TOP_K=6` 控制最终注入数量。最终结果最多包含 3 条案件事实、1 条用户偏好和 2 条历史任务摘要。ChromaDB 是可重建索引，MySQL 中的正文、有效状态、重要性、半衰期和来源类型才是最终依据；向量命中后不能绕过 MySQL 直接注入 Prompt。
 
 #### 4.1.3 会话结束：提取、校验与写入
 
@@ -716,7 +724,27 @@ resolved_question
 
 MySQL 使用 `user_id + memory_type + SHA-256(normalized_content)` 去重。重复内容会更新原记录的元数据、活跃状态和时间，再以同一个 `memory_id` 更新 ChromaDB；若向量写入失败，MySQL 正文仍然保留，并将索引状态标记为 `pending`。Semantic 与 Episodic 条目合并为一个 Embedding 批次，减少外部调用次数。
 
-#### 4.1.4 记忆整合与授权模式
+写入时按类别直接设置重要性与半衰期，不增加模型调用：案件事实为 `0.9 / 365 天`，用户偏好为 `0.7 / 180 天`，历史任务摘要为 `0.5 / 30 天`。
+
+#### 4.1.4 检索评分与指数遗忘
+
+长期记忆使用同一个 `Strength` 同时完成检索调权和遗忘判断。距离上次有效使用的天数记为 `Δt`，半衰期记为 `H`：
+
+```text
+Strength = Importance × exp(-ln(2) × Δt / H)
+FinalScore = 0.8 × Similarity + 0.2 × Strength
+```
+
+`Similarity` 来自 ChromaDB，`Importance` 与 `H` 来自 MySQL；`Δt` 优先使用 `last_accessed_at`，尚未被使用的记忆使用 `updated_at`。只有最终进入 `memory_context` 的记忆才更新访问时间，因此粗召回但未注入的候选不会被错误强化。
+
+维护命令按批次扫描活跃记忆。当 `Strength < 0.1` 时，系统将 MySQL 中的 `is_active` 设为 `false`、写入 `forgotten_at`，并删除 ChromaDB 中对应的 `memory_id`；软遗忘记录保留 90 天后再从 MySQL 物理清理。MySQL 过滤保证尚未清理的旧向量也不能进入 Prompt。
+
+```powershell
+cd "D:\LLM study\LawRAG\LawRAG\backend"
+python -m scripts.maintain_memory
+```
+
+#### 4.1.5 记忆整合与授权模式
 
 短期记忆先被格式化为“历史摘要 + 用户陈述事实 + 最近对话”，长期记忆再按来源划分为 Semantic 与 Episodic 两部分，最终合并为 `state["memory_context"]`：
 
@@ -747,7 +775,7 @@ MySQL 使用 `user_id + memory_type + SHA-256(normalized_content)` 去重。重�
 
 短期 Checkpoint 独立于该开关，始终用于同一 `thread_id` 下的多轮对话。`read_write` 会额外产生 1 次记忆提取模型调用和 1 次长期记忆批量 Embedding。
 
-#### 4.1.5 Skill Loading
+#### 4.1.6 Skill Loading
 
 Skill 作为 Procedural Memory 按需加载：启动时 `SkillLoader.scan()` 只读取各 `SKILL.md` frontmatter 中的 `name` 和 `description`，完整正文保持未加载；运行时模型先查看技能目录，调用 `load_skill(name)` 后才读取一个完整 Skill，并以 `ToolMessage` 追加到消息序列。
 
@@ -1159,8 +1187,20 @@ SHORT_TERM_SUMMARY_MAX_CHARS=2400
 SHORT_TERM_MAX_CASE_FACTS=20
 LONG_TERM_MEMORY_ENABLED=true
 MEMORY_COLLECTION=long_term_memory
+MEMORY_CANDIDATE_TOP_K=20
 MEMORY_RECALL_TOP_K=6
 MEMORY_MAX_WRITES_PER_TURN=8
+MEMORY_SIMILARITY_WEIGHT=0.8
+MEMORY_STRENGTH_WEIGHT=0.2
+MEMORY_FORGET_THRESHOLD=0.1
+MEMORY_FORGET_BATCH_SIZE=500
+MEMORY_FORGET_RETENTION_DAYS=90
+MEMORY_CASE_FACT_IMPORTANCE=0.9
+MEMORY_CASE_FACT_HALF_LIFE_DAYS=365
+MEMORY_PREFERENCE_IMPORTANCE=0.7
+MEMORY_PREFERENCE_HALF_LIFE_DAYS=180
+MEMORY_EPISODIC_IMPORTANCE=0.5
+MEMORY_EPISODIC_HALF_LIFE_DAYS=30
 AGENT_MAX_TOOL_ROUNDS=3
 AGENT_MAX_RETRIEVAL_ROUNDS=2
 AGENT_MAX_GENERATION_ROUNDS=2
@@ -1216,7 +1256,7 @@ python -m scripts.prepare_datasets
 python -m scripts.import_data
 ```
 
-`init_mysql` 创建 Documents、Parent Chunks、Child Chunks 和 `memory_entries` 表，不调用模型。`prepare_datasets` 完成本地格式转换；`import_data` 先把原文及父子块写入 MySQL，再批量调用 `text-embedding-v3` 生成 Child 向量并写入 ChromaDB。长期记忆 Collection 在首次授权读写时按需创建，与知识库索引相互独立。旧版 ChromaDB 记录不含稳定 Child ID，升级后需要重新执行一次 `import_data`。
+`init_mysql` 创建 Documents、Parent Chunks、Child Chunks 和 `memory_entries` 表，并为已有记忆表补充 `importance`、`half_life_days`、`forgotten_at` 生命周期字段，全程不调用模型。`prepare_datasets` 完成本地格式转换；`import_data` 先把原文及父子块写入 MySQL，再批量调用 `text-embedding-v3` 生成 Child 向量并写入 ChromaDB。长期记忆 Collection 在首次授权读写时按需创建，与知识库索引相互独立。旧版 ChromaDB 记录不含稳定 Child ID，升级后需要重新执行一次 `import_data`。
 
 ### 6.5 启动后端和前端
 
@@ -1311,6 +1351,7 @@ python -m scripts.run_quality_eval
 - **证据有预算**：`LegalEvidencePacker` 单独限制生成证据规模，保留法条原文、来源标签和高相关 Parent；
 - **短期状态可恢复**：LangGraph Checkpointer 以 `thread_id` 隔离线程，保存最近 3 轮、历史摘要、用户陈述事实和 Agent 状态，并使用 TTL 自动过期；
 - **长期记忆双存储**：MySQL 是记忆正文、原文片段和来源类型的事实库，ChromaDB 只负责按 `memory_id` 召回 Semantic / Episodic 记忆；
+- **记忆生命周期闭环**：候选记忆按“`0.8 × 相似度 + 0.2 × 指数衰减强度`”重排，最终入选项刷新访问时间，强度低于阈值的条目执行 MySQL 软遗忘与 ChromaDB 向量删除；
 - **写入需要授权**：默认 `memory_mode=off`；`read_write` 模式自动提取用户明确陈述的事实与偏好，并通过原文 evidence 校验阻止模型推断、检索结果和法律结论进入事实记忆；
 - **能力按需加载**：Skills 作为 Procedural Memory，启动时只有技能目录进入 system prompt，完整 `SKILL.md` 仅在 `load_skill` 调用后以 tool_result 注入；
 - **云端调用隔离**：模型客户端按需初始化，服务启动与单元测试保持零外部调用；

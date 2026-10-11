@@ -1,8 +1,10 @@
 """Offline tests for checkpointed short-term and dual-store long-term memory."""
 
 import asyncio
+from datetime import datetime, timedelta
 from typing import TypedDict
 
+import pytest
 from langchain_core.documents import Document
 from langgraph.graph import END, START, StateGraph
 
@@ -22,10 +24,10 @@ class FakeMemoryVectorStore:
             self.documents[memory_id] = Document(page_content=text, metadata=metadata)
         return ids
 
-    def similarity_search(self, query, k, filter):
+    def similarity_search_with_relevance_scores(self, query, k, filter):
         return [
-            document
-            for document in self.documents.values()
+            (document, 0.9 - index * 0.05)
+            for index, document in enumerate(self.documents.values())
             if document.metadata.get("user_id") == filter.get("user_id")
         ][:k]
 
@@ -125,6 +127,110 @@ def test_remember_turn_batches_semantic_and_episode_embeddings(tmp_path):
     assert len(memory_ids) == 3
     assert vectorstore.add_batches == 1
     assert len(repository.list_user("user-a")) == 3
+
+
+def test_memory_strength_uses_exponential_half_life():
+    from app.db.models import MemoryEntry
+    from app.memory.long_term import LongTermMemoryService
+
+    now = datetime.utcnow()
+    entry = MemoryEntry(
+        memory_id="memory-half-life",
+        user_id="user-a",
+        memory_type="semantic",
+        category="case_fact",
+        importance=0.8,
+        half_life_days=10,
+        content="test",
+        content_hash="hash",
+        updated_at=now - timedelta(days=10),
+    )
+
+    strength = LongTermMemoryService.memory_strength(entry, now)
+    assert strength == pytest.approx(0.4, abs=0.001)
+    assert LongTermMemoryService.memory_score(0.75, strength) == pytest.approx(0.68)
+
+
+def test_existing_memory_table_is_migrated_and_backfilled(tmp_path):
+    from sqlalchemy import create_engine, inspect, text
+
+    from app.memory.repository import LongTermMemoryRepository
+
+    database_url = f"sqlite:///{tmp_path / 'legacy-memory.db'}"
+    engine = create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(text(
+            "CREATE TABLE memory_entries ("
+            "memory_id VARCHAR(36) PRIMARY KEY, category VARCHAR(32) NOT NULL)"
+        ))
+        connection.execute(text(
+            "INSERT INTO memory_entries (memory_id, category) "
+            "VALUES ('legacy-fact', 'case_fact')"
+        ))
+
+    repository = LongTermMemoryRepository(database_url)
+    columns = {column["name"] for column in inspect(repository.engine).get_columns("memory_entries")}
+    with repository.engine.connect() as connection:
+        row = connection.execute(text(
+            "SELECT importance, half_life_days, forgotten_at "
+            "FROM memory_entries WHERE memory_id = 'legacy-fact'"
+        )).one()
+
+    assert {"importance", "half_life_days", "forgotten_at"} <= columns
+    assert row.importance == pytest.approx(0.9)
+    assert row.half_life_days == 365
+    assert row.forgotten_at is None
+
+
+def test_recall_applies_category_limits_and_records_selected_access(tmp_path):
+    from app.memory.long_term import LongTermMemoryService
+    from app.memory.repository import LongTermMemoryRepository
+
+    repository = LongTermMemoryRepository(f"sqlite:///{tmp_path / 'rank-memory.db'}")
+    vectorstore = FakeMemoryVectorStore()
+    service = LongTermMemoryService(repository, vectorstore)
+    asyncio.run(service.remember_user_statements(
+        "user-a",
+        [
+            {"category": "preference", "content": "preference one", "source_excerpt": "one"},
+            {"category": "preference", "content": "preference two", "source_excerpt": "two"},
+        ],
+        "thread-a",
+    ))
+
+    recalled = asyncio.run(service.recall("user-a", "preference", top_k=6))
+    rows = repository.list_user("user-a")
+
+    assert len(recalled) == 1
+    assert sum(row.access_count for row in rows) == 1
+    assert recalled[0].score > 0
+
+
+def test_memory_maintenance_soft_forgets_weak_entries(tmp_path):
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session
+
+    from app.db.models import MemoryEntry
+    from app.memory.long_term import LongTermMemoryService
+    from app.memory.repository import LongTermMemoryRepository
+
+    repository = LongTermMemoryRepository(f"sqlite:///{tmp_path / 'forget-memory.db'}")
+    vectorstore = FakeMemoryVectorStore()
+    service = LongTermMemoryService(repository, vectorstore)
+    memory_id = asyncio.run(service.remember_user_statements(
+        "user-a",
+        [{"category": "case_fact", "content": "old fact", "source_excerpt": "old fact"}],
+        "thread-a",
+    ))[0]
+    with Session(repository.engine) as session, session.begin():
+        row = session.scalar(select(MemoryEntry).where(MemoryEntry.memory_id == memory_id))
+        row.importance = 0.05
+
+    result = asyncio.run(service.maintain())
+
+    assert result["forgotten"] == 1
+    assert memory_id not in vectorstore.documents
+    assert repository.fetch("user-a", [memory_id]) == []
 
 
 def test_langgraph_checkpointer_isolates_thread_ids():

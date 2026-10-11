@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -23,6 +25,9 @@ class RecalledMemory:
     content: str
     is_user_stated: bool
     source_kind: str
+    similarity: float = 0.0
+    strength: float = 0.0
+    score: float = 0.0
 
 
 class LongTermMemoryService:
@@ -51,27 +56,49 @@ class LongTermMemoryService:
             return []
         limit = top_k or settings.MEMORY_RECALL_TOP_K
         try:
-            documents = await asyncio.to_thread(
-                self.vectorstore.similarity_search,
+            candidates = await asyncio.to_thread(
+                self.vectorstore.similarity_search_with_relevance_scores,
                 query,
-                limit,
-                {"user_id": user_id},
+                max(limit, settings.MEMORY_CANDIDATE_TOP_K),
+                filter={"user_id": user_id},
             )
             memory_ids = [
                 str(doc.metadata.get("memory_id", ""))
-                for doc in documents
+                for doc, _ in candidates
                 if doc.metadata.get("memory_id")
             ]
+            similarities = {
+                str(doc.metadata.get("memory_id")): _clamp(float(score))
+                for doc, score in candidates
+                if doc.metadata.get("memory_id")
+            }
             rows = await asyncio.to_thread(self.repo.fetch, user_id, memory_ids)
-            await asyncio.to_thread(self.repo.record_access, [row.memory_id for row in rows])
-            return [RecalledMemory(
-                memory_id=row.memory_id,
-                memory_type=row.memory_type,
-                category=row.category,
-                content=row.content,
-                is_user_stated=row.source_kind in {"user_statement", "user_preference", "user_confirmed"},
-                source_kind=row.source_kind,
-            ) for row in rows]
+            now = datetime.utcnow()
+            ranked: list[RecalledMemory] = []
+            for row in rows:
+                similarity = similarities.get(row.memory_id, 0.0)
+                strength = self.memory_strength(row, now)
+                ranked.append(RecalledMemory(
+                    memory_id=row.memory_id,
+                    memory_type=row.memory_type,
+                    category=row.category,
+                    content=row.content,
+                    is_user_stated=row.source_kind in {
+                        "user_statement", "user_preference", "user_confirmed"
+                    },
+                    source_kind=row.source_kind,
+                    similarity=similarity,
+                    strength=strength,
+                    score=self.memory_score(similarity, strength),
+                ))
+            ranked.sort(key=lambda item: item.score, reverse=True)
+            selected = self._apply_category_limits(ranked, limit)
+            await asyncio.to_thread(
+                self.repo.record_access,
+                user_id,
+                [item.memory_id for item in selected],
+            )
+            return selected
         except Exception:
             # Long-term memory is enrichment; retrieval failure must not block legal QA.
             return []
@@ -169,6 +196,58 @@ class LongTermMemoryService:
             ))
         return entries
 
+    @staticmethod
+    def memory_strength(entry: MemoryEntry, now: datetime | None = None) -> float:
+        """Return importance after exponential half-life decay."""
+        current = now or datetime.utcnow()
+        reference = entry.last_accessed_at or entry.updated_at or entry.created_at
+        idle_days = max(0.0, (current - reference).total_seconds() / 86400)
+        half_life = max(1, int(entry.half_life_days or 1))
+        decay = math.exp(-math.log(2) * idle_days / half_life)
+        return _clamp(float(entry.importance) * decay)
+
+    @staticmethod
+    def memory_score(similarity: float, strength: float) -> float:
+        return (
+            settings.MEMORY_SIMILARITY_WEIGHT * _clamp(similarity)
+            + settings.MEMORY_STRENGTH_WEIGHT * _clamp(strength)
+        )
+
+    @staticmethod
+    def _apply_category_limits(
+        memories: list[RecalledMemory],
+        limit: int,
+    ) -> list[RecalledMemory]:
+        category_limits = {"case_fact": 3, "preference": 1, "task_summary": 2}
+        counts: dict[str, int] = {}
+        selected: list[RecalledMemory] = []
+        for memory in memories:
+            category_limit = category_limits.get(memory.category, limit)
+            if counts.get(memory.category, 0) >= category_limit:
+                continue
+            selected.append(memory)
+            counts[memory.category] = counts.get(memory.category, 0) + 1
+            if len(selected) >= limit:
+                break
+        return selected
+
+    async def maintain(self, batch_size: int | None = None) -> dict[str, int]:
+        """Soft-forget weak memories, remove vectors, and purge old tombstones."""
+        limit = batch_size or settings.MEMORY_FORGET_BATCH_SIZE
+        rows = await asyncio.to_thread(self.repo.list_active_for_maintenance, limit)
+        now = datetime.utcnow()
+        forgotten_ids = [
+            row.memory_id
+            for row in rows
+            if self.memory_strength(row, now) < settings.MEMORY_FORGET_THRESHOLD
+        ]
+        forgotten = await asyncio.to_thread(self.repo.soft_forget, forgotten_ids, now)
+        if forgotten_ids:
+            await asyncio.to_thread(self.vectorstore.delete, forgotten_ids)
+        purge_before = now - timedelta(days=settings.MEMORY_FORGET_RETENTION_DAYS)
+        purged = await asyncio.to_thread(self.repo.purge_forgotten, purge_before, limit)
+        return {"scanned": len(rows), "forgotten": forgotten, "purged": purged}
+
     def _episode_entry(
         self,
         *,
@@ -246,11 +325,14 @@ class LongTermMemoryService:
         user_stated: bool,
         metadata: dict[str, Any],
     ) -> MemoryEntry:
+        importance, half_life_days = _memory_policy(category)
         return MemoryEntry(
             memory_id=str(uuid4()),
             user_id=user_id.strip(),
             memory_type=memory_type,
             category=category,
+            importance=importance,
+            half_life_days=half_life_days,
             content=content,
             content_hash=hashlib.sha256(content.casefold().encode("utf-8")).hexdigest(),
             source_kind=source_kind,
@@ -280,6 +362,24 @@ class LongTermMemoryService:
 
 def _normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _clamp(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _memory_policy(category: str) -> tuple[float, int]:
+    if category == "case_fact":
+        return (
+            settings.MEMORY_CASE_FACT_IMPORTANCE,
+            settings.MEMORY_CASE_FACT_HALF_LIFE_DAYS,
+        )
+    if category == "preference":
+        return (
+            settings.MEMORY_PREFERENCE_IMPORTANCE,
+            settings.MEMORY_PREFERENCE_HALF_LIFE_DAYS,
+        )
+    return settings.MEMORY_EPISODIC_IMPORTANCE, settings.MEMORY_EPISODIC_HALF_LIFE_DAYS
 
 
 long_term_memory = LongTermMemoryService()
