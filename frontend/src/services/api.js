@@ -20,7 +20,6 @@ export async function sendChat({
   threadId,
   userId,
   memoryMode = 'off',
-  confirmedMemories = [],
 }) {
   const res = await api.post('/chat', {
     question,
@@ -34,7 +33,6 @@ export async function sendChat({
     thread_id: threadId,
     user_id: userId,
     memory_mode: memoryMode,
-    confirmed_memories: confirmedMemories,
     skill_name: skillName,
   })
   return res.data.data

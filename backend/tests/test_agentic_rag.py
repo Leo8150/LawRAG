@@ -87,6 +87,14 @@ class FakeAgentLLM:
             return AIMessage(content='{"sufficient": true, "missing_information": [], "follow_up_query": ""}')
         if "引用审查器" in system:
             return AIMessage(content='{"grounded": true, "citation_complete": true, "feedback": ""}')
+        if "用户记忆提取器" in system:
+            user_message = str(messages[-1].content)
+            if "双方已经签字" in user_message:
+                return AIMessage(content=(
+                    '{"memories": [{"category": "case_fact", '
+                    '"content": "双方已经签字", "evidence": "双方已经签字"}]}'
+                ))
+            return AIMessage(content='{"memories": []}')
         raise AssertionError(f"未预期的 Agent 调用: {system}")
 
 
@@ -173,13 +181,14 @@ def test_agentic_graph_reads_and_writes_long_term_memory_only_when_authorized(mo
             memory_type="semantic",
             category="preference",
             content="用户希望先给结论",
-            is_confirmed=True,
-            source_kind="user_confirmed",
+            is_user_stated=True,
+            source_kind="user_preference",
         )]
 
     async def fake_remember_turn(**kwargs):
         calls["write"] += 1
-        assert kwargs["confirmed_items"][0]["category"] == "case_fact"
+        assert kwargs["user_items"][0]["category"] == "case_fact"
+        assert kwargs["user_items"][0]["source_excerpt"] == "双方已经签字"
         return ["memory-new", "episode-new"]
 
     monkeypatch.setattr(runtime_module, "get_llm", lambda **kwargs: FakeAgentLLM())
@@ -188,11 +197,10 @@ def test_agentic_graph_reads_and_writes_long_term_memory_only_when_authorized(mo
     runner = runtime_module.AgenticRAGRunner(FakePipeline())
 
     result = asyncio.run(runner.run(
-        "合同是否有效？",
+        "双方已经签字，合同是否有效？",
         thread_id="authorized-memory-thread",
         user_id="user-memory",
         memory_mode="read_write",
-        confirmed_memories=[{"category": "case_fact", "content": "双方已经签字"}],
     ))
 
     assert calls == {"recall": 1, "write": 1}
@@ -200,6 +208,55 @@ def test_agentic_graph_reads_and_writes_long_term_memory_only_when_authorized(mo
     assert result.written_memory_ids == ["memory-new", "episode-new"]
     assert result.metrics.long_term_memory_retrieved == 1
     assert result.metrics.long_term_memory_written == 2
+
+
+def test_memory_extractor_rejects_items_without_user_source_span(monkeypatch):
+    from app.agentic import runtime as runtime_module
+
+    class HallucinatingMemoryLLM:
+        async def ainvoke(self, messages):
+            return AIMessage(content=(
+                '{"memories": ['
+                '{"category": "case_fact", "content": "用户已经付款", "evidence": "用户已经付款"},'
+                '{"category": "preference", "content": "先给结论", "evidence": "请先给结论"}'
+                ']}'
+            ))
+
+    monkeypatch.setattr(runtime_module, "get_llm", lambda **kwargs: HallucinatingMemoryLLM())
+    runner = runtime_module.AgenticRAGRunner(FakePipeline())
+    extracted = asyncio.run(runner._extract_user_memories("请先给结论，然后说明合同效力。"))
+
+    assert extracted == [{
+        "category": "preference",
+        "content": "请先给结论",
+        "source_excerpt": "请先给结论",
+    }]
+
+
+def test_memory_extractor_rejects_hypotheses_and_legal_conclusions(monkeypatch):
+    from app.agentic import runtime as runtime_module
+
+    class UnsafeMemoryLLM:
+        async def ainvoke(self, messages):
+            return AIMessage(content=(
+                '{"memories": ['
+                '{"category": "case_fact", "content": "如果已经付款", "evidence": "如果已经付款"},'
+                '{"category": "case_fact", "content": "该行为构成盗窃罪", "evidence": "该行为构成盗窃罪"},'
+                '{"category": "case_fact", "content": "涉案金额为5000元", "evidence": "涉案金额为5000元"}'
+                ']}'
+            ))
+
+    monkeypatch.setattr(runtime_module, "get_llm", lambda **kwargs: UnsafeMemoryLLM())
+    runner = runtime_module.AgenticRAGRunner(FakePipeline())
+    extracted = asyncio.run(runner._extract_user_memories(
+        "如果已经付款，该行为构成盗窃罪；涉案金额为5000元。"
+    ))
+
+    assert extracted == [{
+        "category": "case_fact",
+        "content": "涉案金额为5000元",
+        "source_excerpt": "涉案金额为5000元",
+    }]
 
 
 def test_agent_requested_compaction_runs_after_complete_tool_batch(monkeypatch, tmp_path):

@@ -112,6 +112,8 @@ class RAGPipeline:
             "grounding_passed": False,
             "long_term_memory_retrieved": 0,
             "long_term_memory_written": 0,
+            "memory_extraction_ms": 0,
+            "memory_extracted_count": 0,
         }
 
     async def execute(
@@ -122,7 +124,6 @@ class RAGPipeline:
         thread_id: str | None = None,
         user_id: str | None = None,
         memory_mode: str = "off",
-        confirmed_memories: list[dict] | None = None,
     ) -> ChatResponse:
         """Execute the single Agentic RAG graph; no linear workflow route exists."""
         from app.agentic import AgenticRAGRunner
@@ -133,7 +134,6 @@ class RAGPipeline:
             thread_id=thread_id,
             user_id=user_id,
             memory_mode=memory_mode,
-            confirmed_memories=confirmed_memories,
         )
 
     async def _select_skill(self, question: str) -> tuple[LegalSkill, list[BaseMessage]]:

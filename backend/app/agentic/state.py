@@ -16,7 +16,6 @@ class AgenticRAGState(TypedDict, total=False):
     thread_id: str
     user_id: str
     memory_mode: str
-    confirmed_memories: list[dict[str, Any]]
     resolved_question: str
     memory_context: str
     memory_turns: int

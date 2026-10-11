@@ -21,7 +21,7 @@ class RecalledMemory:
     memory_type: str
     category: str
     content: str
-    is_confirmed: bool
+    is_user_stated: bool
     source_kind: str
 
 
@@ -69,14 +69,14 @@ class LongTermMemoryService:
                 memory_type=row.memory_type,
                 category=row.category,
                 content=row.content,
-                is_confirmed=row.is_confirmed,
+                is_user_stated=row.source_kind in {"user_statement", "user_preference", "user_confirmed"},
                 source_kind=row.source_kind,
             ) for row in rows]
         except Exception:
             # Long-term memory is enrichment; retrieval failure must not block legal QA.
             return []
 
-    async def remember_confirmed(
+    async def remember_user_statements(
         self,
         user_id: str,
         items: list[dict[str, Any]],
@@ -84,7 +84,7 @@ class LongTermMemoryService:
     ) -> list[str]:
         if not settings.LONG_TERM_MEMORY_ENABLED or not user_id.strip():
             return []
-        entries = self._confirmed_entries(user_id, items, thread_id)
+        entries = self._semantic_entries(user_id, items, thread_id)
         return [entry.memory_id for entry in await self._store_many(entries)]
 
     async def remember_turn(
@@ -92,7 +92,7 @@ class LongTermMemoryService:
         *,
         user_id: str,
         thread_id: str,
-        confirmed_items: list[dict[str, Any]],
+        user_items: list[dict[str, Any]],
         question: str,
         answer: str,
         trace: list[dict[str, Any]],
@@ -100,13 +100,13 @@ class LongTermMemoryService:
     ) -> list[str]:
         """Persist all memories from one turn with one embedding batch.
 
-        Semantic entries only come from the explicit ``confirmed_items`` field.
-        The generated task episode is intentionally marked unconfirmed, so it
-        can help route future work without becoming an authoritative case fact.
+        Semantic entries only come from the constrained user-message extractor.
+        The generated task episode is intentionally marked as agent-generated,
+        so it can help route future work without becoming a user-stated fact.
         """
         if not settings.LONG_TERM_MEMORY_ENABLED or not user_id.strip():
             return []
-        entries = self._confirmed_entries(user_id, confirmed_items, thread_id)
+        entries = self._semantic_entries(user_id, user_items, thread_id)
         episode = self._episode_entry(
             user_id=user_id,
             thread_id=thread_id,
@@ -143,7 +143,7 @@ class LongTermMemoryService:
         saved = await self._store_many([entry])
         return saved[0].memory_id if saved else None
 
-    def _confirmed_entries(
+    def _semantic_entries(
         self,
         user_id: str,
         items: list[dict[str, Any]],
@@ -160,9 +160,12 @@ class LongTermMemoryService:
                 memory_type="semantic",
                 category=category,
                 content=content,
-                source_kind="user_confirmed",
-                confirmed=True,
-                metadata={"thread_id": thread_id},
+                source_kind="user_preference" if category == "preference" else "user_statement",
+                user_stated=True,
+                metadata={
+                    "thread_id": thread_id,
+                    "source_excerpt": str(item.get("source_excerpt", ""))[:1000],
+                },
             ))
         return entries
 
@@ -194,7 +197,7 @@ class LongTermMemoryService:
             category="task_summary",
             content=content,
             source_kind="agent_episode",
-            confirmed=False,
+            user_stated=False,
             metadata={
                 "thread_id": thread_id,
                 "tools": list(dict.fromkeys(tools)),
@@ -215,7 +218,7 @@ class LongTermMemoryService:
             "user_id": entry.user_id,
             "memory_type": entry.memory_type,
             "category": entry.category,
-            "is_confirmed": entry.is_confirmed,
+            "is_user_stated": entry.source_kind in {"user_statement", "user_preference", "user_confirmed"},
         } for entry in saved_entries]
         try:
             await asyncio.to_thread(self.vectorstore.delete, ids)
@@ -240,7 +243,7 @@ class LongTermMemoryService:
         category: str,
         content: str,
         source_kind: str,
-        confirmed: bool,
+        user_stated: bool,
         metadata: dict[str, Any],
     ) -> MemoryEntry:
         return MemoryEntry(
@@ -251,8 +254,11 @@ class LongTermMemoryService:
             content=content,
             content_hash=hashlib.sha256(content.casefold().encode("utf-8")).hexdigest(),
             source_kind=source_kind,
-            is_confirmed=confirmed,
-            confidence=1.0 if confirmed else 0.5,
+            # Keep the existing database column for schema compatibility. It now
+            # means the semantic item is grounded in an explicit user utterance,
+            # not that the UI asked for a separate confirmation.
+            is_confirmed=user_stated,
+            confidence=1.0 if user_stated else 0.5,
             memory_metadata=metadata,
         )
 
@@ -260,14 +266,14 @@ class LongTermMemoryService:
     def format_context(memories: list[RecalledMemory]) -> str:
         if not memories:
             return ""
-        semantic = [item for item in memories if item.memory_type == "semantic" and item.is_confirmed]
+        semantic = [item for item in memories if item.memory_type == "semantic" and item.is_user_stated]
         episodic = [item for item in memories if item.memory_type == "episodic"]
         parts: list[str] = []
         if semantic:
-            parts.append("长期语义记忆（用户已确认，可用于理解偏好和案件事实）：")
+            parts.append("长期语义记忆（来自用户明确陈述，可用于理解偏好和案件事实）：")
             parts.extend(f"- [{item.category}] {item.content}" for item in semantic)
         if episodic:
-            parts.append("长期情景记忆（历史任务摘要，仅供流程参考，不得视为已确认事实）：")
+            parts.append("长期情景记忆（历史任务摘要，仅供流程参考，不得视为用户陈述的事实）：")
             parts.extend(f"- {item.content}" for item in episodic)
         return "\n".join(parts)
 

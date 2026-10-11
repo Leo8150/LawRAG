@@ -30,7 +30,7 @@ class FakeMemoryVectorStore:
         ][:k]
 
 
-def test_long_term_memory_deduplicates_and_separates_confirmation(tmp_path):
+def test_long_term_memory_deduplicates_user_statements_and_separates_episodes(tmp_path):
     from app.memory.long_term import LongTermMemoryService
     from app.memory.repository import LongTermMemoryRepository
 
@@ -38,14 +38,14 @@ def test_long_term_memory_deduplicates_and_separates_confirmation(tmp_path):
     vectorstore = FakeMemoryVectorStore()
     service = LongTermMemoryService(repository, vectorstore)
 
-    first = asyncio.run(service.remember_confirmed(
+    first = asyncio.run(service.remember_user_statements(
         "user-a",
-        [{"category": "case_fact", "content": "劳动合同于2026年1月签订"}],
+        [{"category": "case_fact", "content": "劳动合同于2026年1月签订", "source_excerpt": "劳动合同于2026年1月签订"}],
         "thread-a",
     ))
-    second = asyncio.run(service.remember_confirmed(
+    second = asyncio.run(service.remember_user_statements(
         "user-a",
-        [{"category": "case_fact", "content": "劳动合同于2026年1月签订"}],
+        [{"category": "case_fact", "content": "劳动合同于2026年1月签订", "source_excerpt": "劳动合同于2026年1月签订"}],
         "thread-b",
     ))
     episode_id = asyncio.run(service.remember_episode(
@@ -64,18 +64,18 @@ def test_long_term_memory_deduplicates_and_separates_confirmation(tmp_path):
     semantic = next(row for row in rows if row.memory_type == "semantic")
     episodic = next(row for row in rows if row.memory_type == "episodic")
     assert semantic.is_confirmed is True
-    assert semantic.source_kind == "user_confirmed"
+    assert semantic.source_kind == "user_statement"
     assert episodic.is_confirmed is False
     assert episodic.source_kind == "agent_episode"
 
     recalled = asyncio.run(service.recall("user-a", "劳动合同工资"))
     context = service.format_context(recalled)
-    assert "用户已确认" in context
-    assert "不得视为已确认事实" in context
+    assert "来自用户明确陈述" in context
+    assert "不得视为用户陈述的事实" in context
     assert all(item.memory_id in vectorstore.documents for item in recalled)
 
 
-def test_short_term_builder_compresses_history_and_carries_confirmed_facts(monkeypatch):
+def test_short_term_builder_compresses_history_and_carries_user_stated_facts(monkeypatch):
     from app.config import settings
     from app.memory.checkpoint import ShortTermContextBuilder, ShortTermSnapshot
 
@@ -87,16 +87,16 @@ def test_short_term_builder_compresses_history_and_carries_confirmed_facts(monke
             snapshot,
             f"第{index}问",
             f"第{index}答",
-            ["用户已确认已经签订书面合同"] if index == 0 else [],
+            ["已经签订书面合同"] if index == 0 else [],
         )
 
     assert len(snapshot.recent_turns) == 2
     assert "第0问" in snapshot.summary
     assert snapshot.turn_count == 4
-    assert snapshot.case_facts == ["用户已确认已经签订书面合同"]
+    assert snapshot.case_facts == ["已经签订书面合同"]
     context = ShortTermContextBuilder.build_context(snapshot)
     assert "历史消息压缩摘要" in context
-    assert "用户已确认的本案事实" in context
+    assert "用户在对话中明确陈述的本案事实" in context
     resolved = ShortTermContextBuilder.resolve_question("那如果已经付款呢？", snapshot)
     assert "上一轮问题" in resolved
 
@@ -112,9 +112,9 @@ def test_remember_turn_batches_semantic_and_episode_embeddings(tmp_path):
     memory_ids = asyncio.run(service.remember_turn(
         user_id="user-a",
         thread_id="thread-a",
-        confirmed_items=[
-            {"category": "case_fact", "content": "用户确认工资已拖欠三个月"},
-            {"category": "preference", "content": "用户希望回答先给结论"},
+        user_items=[
+            {"category": "case_fact", "content": "工资已拖欠三个月", "source_excerpt": "工资已拖欠三个月"},
+            {"category": "preference", "content": "回答先给结论", "source_excerpt": "请先给结论"},
         ],
         question="公司拖欠工资怎么办？",
         answer="可以准备证据后申请劳动仲裁。",
@@ -162,4 +162,4 @@ def test_chat_request_memory_defaults_are_privacy_safe():
     request = ChatRequest(question="测试记忆")
     assert request.memory_mode == "off"
     assert request.user_id is None
-    assert request.confirmed_memories == []
+    assert not hasattr(request, "confirmed_memories")

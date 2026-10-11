@@ -67,7 +67,7 @@ class ShortTermContextBuilder:
         if snapshot.summary:
             parts.extend(["历史消息压缩摘要：", snapshot.summary])
         if snapshot.case_facts:
-            parts.append("用户已确认的本案事实：")
+            parts.append("用户在对话中明确陈述的本案事实：")
             parts.extend(f"- {fact}" for fact in snapshot.case_facts[-12:])
         if snapshot.recent_turns:
             parts.append("最近对话：")
@@ -96,7 +96,7 @@ class ShortTermContextBuilder:
         snapshot: ShortTermSnapshot,
         question: str,
         answer: str,
-        confirmed_case_facts: list[str],
+        user_case_facts: list[str],
     ) -> ShortTermSnapshot:
         turns = [*snapshot.recent_turns, {"question": question, "answer": answer}]
         overflow = turns[:-settings.SHORT_TERM_RECENT_TURNS]
@@ -110,7 +110,7 @@ class ShortTermContextBuilder:
         summary = summary[-settings.SHORT_TERM_SUMMARY_MAX_CHARS :]
         facts = list(dict.fromkeys([
             *snapshot.case_facts,
-            *(fact.strip() for fact in confirmed_case_facts if fact.strip()),
+            *(fact.strip() for fact in user_case_facts if fact.strip()),
         ]))[-settings.SHORT_TERM_MAX_CASE_FACTS :]
         return ShortTermSnapshot(
             summary=summary,

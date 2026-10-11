@@ -58,12 +58,6 @@ class QualityAggregated(BaseModel):
 
 # ===================== 问答 =====================
 
-class ConfirmedMemoryInput(BaseModel):
-    """Information the user explicitly authorized as long-term semantic memory."""
-
-    category: Literal["case_fact", "preference"]
-    content: str = Field(..., min_length=1, max_length=1000)
-
 class ChatRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=2000)
     use_rerank: bool = True
@@ -81,7 +75,6 @@ class ChatRequest(BaseModel):
     thread_id: str | None = Field(default=None, min_length=8, max_length=64)
     user_id: str | None = Field(default=None, min_length=1, max_length=128)
     memory_mode: Literal["off", "read", "read_write"] = "off"
-    confirmed_memories: list[ConfirmedMemoryInput] = Field(default_factory=list, max_length=10)
     skill_name: str = Field(
         "auto",
         pattern=r"^(auto|general_legal|criminal_law|labor_law|contract_law|traffic_law)$",
@@ -126,6 +119,8 @@ class StageMetrics(BaseModel):
     grounding_passed: bool = False
     long_term_memory_retrieved: int = 0
     long_term_memory_written: int = 0
+    memory_extraction_ms: float = 0.0
+    memory_extracted_count: int = 0
 
 
 class ChatResponse(BaseModel):

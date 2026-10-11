@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 from uuid import uuid4
@@ -17,6 +18,7 @@ from app.agentic.prompts import (
     GROUNDING_CHECK_SYSTEM,
     QUERY_REWRITE_SYSTEM,
     TOOL_ROUTER_SYSTEM,
+    USER_MEMORY_EXTRACTION_SYSTEM,
 )
 from app.agentic.state import AgenticRAGState
 from app.agentic.tools import AgentToolRegistry, ToolExecution
@@ -120,7 +122,6 @@ class AgenticRAGRunner:
         thread_id: str | None = None,
         user_id: str | None = None,
         memory_mode: str = "off",
-        confirmed_memories: list[dict[str, Any]] | None = None,
     ) -> ChatResponse:
         total_start = time.time()
         active_thread_id = thread_id or conversation_id or uuid4().hex
@@ -134,7 +135,6 @@ class AgenticRAGRunner:
             "thread_id": active_thread_id,
             "user_id": user_id or "",
             "memory_mode": memory_mode,
-            "confirmed_memories": confirmed_memories or [],
             "conversation_summary": short_snapshot.summary,
             "recent_turns": short_snapshot.recent_turns,
             "case_facts": short_snapshot.case_facts,
@@ -182,13 +182,19 @@ class AgenticRAGRunner:
         answer = result.get("answer", "现有证据不足以形成可靠回答。")
         source_ids = [format_source_display(doc.metadata) for doc in documents]
 
+        extracted_memories: list[dict[str, str]] = []
         written_memory_ids: list[str] = []
         if memory_mode == "read_write" and user_id:
+            try:
+                extracted_memories = await self._extract_user_memories(question)
+            except Exception:
+                # Extraction is optional enrichment and must not discard a legal answer.
+                extracted_memories = []
             try:
                 written_memory_ids = await long_term_memory.remember_turn(
                     user_id=user_id,
                     thread_id=active_thread_id,
-                    confirmed_items=confirmed_memories or [],
+                    user_items=extracted_memories,
                     question=question,
                     answer=answer,
                     trace=result.get("trace", []),
@@ -199,16 +205,16 @@ class AgenticRAGRunner:
                 written_memory_ids = []
         self.pipeline.metrics["long_term_memory_written"] = len(written_memory_ids)
 
-        confirmed_case_facts = [
+        extracted_case_facts = [
             str(item.get("content", ""))
-            for item in (confirmed_memories or [])
+            for item in extracted_memories
             if item.get("category") == "case_fact"
         ]
         advanced = short_term_context.advance(
             short_snapshot,
             question,
             answer,
-            confirmed_case_facts,
+            extracted_case_facts,
         )
         await self.graph.aupdate_state(graph_config, {
             "conversation_summary": advanced.summary,
@@ -250,21 +256,81 @@ class AgenticRAGRunner:
             agent_trace=result.get("trace", []),
         )
 
+    async def _extract_user_memories(self, user_message: str) -> list[dict[str, str]]:
+        """Extract only user-stated facts/preferences backed by an exact source span."""
+        started = time.time()
+        self.pipeline.metrics["llm_calls"] += 1
+        response = await get_llm(temperature=0).ainvoke([
+            SystemMessage(content=USER_MEMORY_EXTRACTION_SYSTEM),
+            HumanMessage(content=f"本轮用户原始消息：\n{user_message}"),
+        ])
+        self.pipeline.metrics["memory_extraction_ms"] = round(
+            (time.time() - started) * 1000,
+            1,
+        )
+
+        payload = _json_object(str(response.content))
+        candidates = payload.get("memories", [])
+        if not isinstance(candidates, list):
+            return []
+
+        normalized_message = re.sub(r"\s+", "", user_message)
+        accepted: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in candidates[: settings.MEMORY_MAX_WRITES_PER_TURN]:
+            if not isinstance(item, dict):
+                continue
+            category = str(item.get("category", "")).strip()
+            proposed_content = re.sub(r"\s+", " ", str(item.get("content", ""))).strip()
+            evidence = str(item.get("evidence", "")).strip()
+            normalized_evidence = re.sub(r"\s+", "", evidence)
+            if category not in {"case_fact", "preference"}:
+                continue
+            if not proposed_content or not normalized_evidence:
+                continue
+            # A model-generated item cannot enter memory without an exact span
+            # in the raw user message. Answers, tools and retrieved evidence are
+            # deliberately absent from this extraction call.
+            if normalized_evidence not in normalized_message:
+                continue
+            # Persist the verified user span itself, never the model's rewrite.
+            content = re.sub(r"\s+", " ", evidence).strip()
+            if len(content) > 1000:
+                continue
+            if category == "case_fact" and self._reject_case_fact(content, evidence):
+                continue
+            key = (category, content.casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            accepted.append({
+                "category": category,
+                "content": content,
+                "source_excerpt": evidence,
+            })
+
+        self.pipeline.metrics["memory_extracted_count"] = len(accepted)
+        return accepted
+
+    @staticmethod
+    def _reject_case_fact(content: str, evidence: str) -> bool:
+        """Reject hypothetical/question content and legal characterizations."""
+        candidate = f"{content} {evidence}"
+        if any(marker in candidate for marker in ("如果", "假如", "假设", "要是", "是否", "能否", "会不会", "怎么办", "吗？", "？")):
+            return True
+        legal_patterns = (
+            r"构成.{0,12}(罪|违法|违约|侵权)",
+            r"(应当|应该|可以|必须|依法).{0,18}(判处|处罚|赔偿|承担|负责)",
+            r"根据.{0,24}(法|条例|规定)",
+            r"(合同|行为|判决|裁决).{0,12}(合法|违法|有效|无效)",
+            r"第[一二三四五六七八九十百千万零〇0-9]+条",
+        )
+        return any(re.search(pattern, candidate) for pattern in legal_patterns)
+
     async def _prepare(self, state: AgenticRAGState) -> dict:
         snapshot = short_term_context.from_values(state)
         resolved = short_term_context.resolve_question(state["question"], snapshot)
         short_context = short_term_context.build_context(snapshot)
-        current_confirmed = [
-            f"- [{item.get('category', 'case_fact')}] {str(item.get('content', '')).strip()}"
-            for item in state.get("confirmed_memories", [])
-            if str(item.get("content", "")).strip()
-        ]
-        if current_confirmed:
-            short_context = "\n".join([
-                short_context,
-                "本轮由用户明确确认的信息：",
-                *current_confirmed,
-            ]).strip()
         recalled = []
         if state.get("memory_mode") in {"read", "read_write"} and state.get("user_id"):
             recalled = await long_term_memory.recall(

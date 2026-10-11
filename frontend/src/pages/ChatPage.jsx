@@ -17,8 +17,6 @@ export default function ChatPage() {
   const [skillName, setSkillName] = useState('auto')
   const [memoryMode, setMemoryMode] = useState('off')
   const [userId, setUserId] = useState('')
-  const [memoryCategory, setMemoryCategory] = useState('case_fact')
-  const [confirmedMemory, setConfirmedMemory] = useState('')
   const conversationIdRef = useRef(
     globalThis.crypto?.randomUUID?.() || `lawrag-${Date.now()}`
   )
@@ -103,9 +101,6 @@ export default function ChatPage() {
         threadId: conversationIdRef.current,
         userId: userId.trim() || undefined,
         memoryMode,
-        confirmedMemories: memoryMode === 'read_write' && confirmedMemory.trim()
-          ? [{ category: memoryCategory, content: confirmedMemory.trim() }]
-          : [],
         skillName,
       })
 
@@ -131,7 +126,6 @@ export default function ChatPage() {
         recalledMemoryIds: result.recalled_memory_ids,
         writtenMemoryIds: result.written_memory_ids,
       }])
-      if (memoryMode === 'read_write') setConfirmedMemory('')
     } catch (err) {
       stopLiveMonitor()
       setMessages(prev => [...prev, {
@@ -225,7 +219,7 @@ export default function ChatPage() {
           <select className="select-small" value={memoryMode} onChange={e => setMemoryMode(e.target.value)}>
             <option value="off">关闭</option>
             <option value="read">只读</option>
-            <option value="read_write">读写（明确授权）</option>
+            <option value="read_write">读写（自动提取）</option>
           </select>
           {memoryMode !== 'off' && (
             <input
@@ -237,19 +231,9 @@ export default function ChatPage() {
             />
           )}
           {memoryMode === 'read_write' && (
-            <>
-              <select className="select-small" value={memoryCategory} onChange={e => setMemoryCategory(e.target.value)}>
-                <option value="case_fact">确认案件事实</option>
-                <option value="preference">确认回答偏好</option>
-              </select>
-              <input
-                className="input"
-                style={{ width: 220, padding: '4px 8px' }}
-                placeholder="可选：本轮明确确认的信息"
-                value={confirmedMemory}
-                onChange={e => setConfirmedMemory(e.target.value)}
-              />
-            </>
+            <span className="option-hint" title="仅从用户原始消息提取明确陈述的事实和偏好，不保存模型推断或法律结论">
+              自动提取用户陈述
+            </span>
           )}
         </div>
         <div style={{ borderLeft: '1px solid var(--border)', height: 20, margin: '0 4px' }} />

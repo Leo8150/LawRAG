@@ -113,7 +113,7 @@ class MemoryEntry(Base):
     category: Mapped[str] = mapped_column(String(32), default="")
     content: Mapped[str] = mapped_column(LONG_TEXT)
     content_hash: Mapped[str] = mapped_column(String(64), index=True)
-    source_kind: Mapped[str] = mapped_column(String(32), default="user_confirmed")
+    source_kind: Mapped[str] = mapped_column(String(32), default="user_statement")
     is_confirmed: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     confidence: Mapped[float] = mapped_column(Float, default=1.0)
     memory_metadata: Mapped[dict] = mapped_column("metadata", JSON, default=dict)

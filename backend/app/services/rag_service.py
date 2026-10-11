@@ -28,7 +28,6 @@ async def rag_query(
     thread_id: str | None = None,
     user_id: str | None = None,
     memory_mode: str = "off",
-    confirmed_memories: list[dict] | None = None,
 ) -> ChatResponse:
     """
     执行唯一的 Agentic RAG 状态图。
@@ -63,5 +62,4 @@ async def rag_query(
         thread_id=thread_id,
         user_id=user_id,
         memory_mode=memory_mode,
-        confirmed_memories=confirmed_memories,
     )

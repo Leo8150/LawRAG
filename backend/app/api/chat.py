@@ -39,7 +39,6 @@ async def chat(req: ChatRequest):
             thread_id=req.thread_id,
             user_id=req.user_id,
             memory_mode=req.memory_mode,
-            confirmed_memories=[item.model_dump() for item in req.confirmed_memories],
         )
 
         # 系统快照（问答后）

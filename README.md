@@ -28,7 +28,12 @@ LawRAG 是一个面向中国法律咨询场景的检索增强生成（Retrieval-
    - [3.4 上下文标头注入](#34-上下文标头注入)
    - [3.5 MySQL 持久化与 Child 向量入库](#35-mysql持久化与child向量入库)
 4. [一次问答的完整执行流程](#4-一次问答的完整执行流程)
-   - [4.1 短期、长期 Memory 与 Skill Loading](#41-短期长期-memory-与-skill-loading)
+   - [4.1 记忆管理和 Skill Loading](#41-记忆管理和-skill-loading)
+     - [4.1.1 记忆分层与身份隔离](#411-记忆分层与身份隔离)
+     - [4.1.2 会话开始：恢复与召回](#412-会话开始恢复与召回)
+     - [4.1.3 会话结束：提取、校验与写入](#413-会话结束提取校验与写入)
+     - [4.1.4 记忆整合与授权模式](#414-记忆整合与授权模式)
+     - [4.1.5 Skill Loading](#415-skill-loading)
    - [4.2 LangGraph 节点图与 State](#42-langgraph-节点图与-state)
      - [4.2.1 AgenticRAGState](#421-agenticragstate)
      - [4.2.2 节点功能](#422-节点功能)
@@ -78,9 +83,8 @@ LawRAG 围绕法律文本特点实现以下能力：
 - 使用 Document → Parent Chunk → Child Chunk 三级结构，兼顾召回精度和证据完整性；
 - 以 MySQL 作为原文事实库，以 `child_chunk_id`、`parent_chunk_id` 关联 ChromaDB 派生索引；
 - 结合 BM25 关键词检索与向量语义检索，提高精确匹配和语义召回能力；
-- 使用 LangGraph 编排 Skill Loading、工具决策、证据评估、查询改写、生成和引用校验；
+- **Agentic RAG 智能编排：**基于 LangGraph 构建有状态 Agent 工作流，支持自主工具选择；`grade_evidence` 节点评估证据充分性，在证据不足时通过 Query Rewrite 动态补充检索，`verify_grounding` 节点在生成后校验结论忠实度与引用完整性，并将修正意见反馈给生成节点；检索与生成均采用有界反思循环，缓解法律问答幻觉问题；
 - 由 LLM 动态选择法律检索、CrimeKG 与原始来源回查工具，策略层强制至少执行一次权威知识检索；
-- 证据不足时自动生成针对性查询并重新检索，所有循环均设置硬上限；
 - 使用结构化犯罪知识补充罪名定义、构成要件和量刑信息；
 - 在法律检索工具内部支持不重排、轻量重排和云端专用 Reranker；
 - 使用 LangGraph State + Checkpointer 按 `thread_id` 管理最近对话、摘要、已确认案件事实和 Agent 状态；
@@ -586,11 +590,14 @@ flowchart TD
     M --> N{Grounding 与引用检查}
     N -->|未通过且未超限| M
     N -->|通过或达到上限| O[形成最终答案]
-    O --> O1[更新短期状态<br/>最近 3 轮 + 摘要 + 已确认事实]
-    O1 --> O2{memory_mode 是否为 read_write}
-    O2 -->|是| O3[单批次写入长期记忆<br/>确认信息 + 未确认任务摘要]
-    O2 -->|否| P{是否开启 RAG 评测}
-    O3 --> P
+    O --> O2{memory_mode 是否为 read_write}
+    O2 -->|是| OX[从用户原始消息自动提取<br/>事实与偏好 + 原文证据校验]
+    OX --> O1[更新短期状态<br/>最近 3 轮 + 摘要 + 用户陈述事实]
+    O2 -->|否| O1
+    O1 --> O3{是否存在长期写入授权}
+    O3 -->|是| O4[单批次写入长期记忆<br/>用户陈述 + Agent 任务摘要]
+    O3 -->|否| P{是否开启 RAG 评测}
+    O4 --> P
     P -->|是| P1["Recall@5 + MRR@10<br/>P95 Latency + Faithfulness"]
     P -->|否| Q[组装 ChatResponse]
     P1 --> Q
@@ -608,7 +615,7 @@ flowchart TD
 
 `retrieve_legal_evidence` 是一个高层检索工具。LLM 只决定检索 Query、`laws/cases/all` 范围和 Top K，工具内部固定执行 MySQL BM25、ChromaDB Child 向量召回、RRF、MySQL Child 回查、Child Reranker、Parent 聚合与 MySQL Parent 回查。底层步骤不会暴露给 LLM，避免其跳过来源恢复或任意拼装检索链路。
 
-长期记忆使用另一套独立索引：ChromaDB `long_term_memory` Collection 只保存向量、`memory_id`、`user_id` 和分类字段；命中后必须按 `memory_id + user_id` 回查 MySQL `memory_entries`，MySQL 中的有效状态、确认标记和正文才是最终依据。知识库 Child 与长期记忆不会混用 Collection。
+长期记忆使用另一套独立索引：ChromaDB `long_term_memory` Collection 只保存向量、`memory_id`、`user_id` 和分类字段；命中后必须按 `memory_id + user_id` 回查 MySQL `memory_entries`，MySQL 中的有效状态、来源类型和正文才是最终依据。知识库 Child 与长期记忆不会混用 Collection。
 
 流程图中的每个阶段都可以定位到具体实现：
 
@@ -618,7 +625,7 @@ flowchart TD
 | Agent 状态图 | LangGraph、TypedDict、条件边 | `agentic/runtime.py`、`agentic/state.py` | 否 |
 | 短期记忆 | LangGraph State、Checkpointer、`thread_id`、摘要压缩、追问补全 | `memory/checkpoint.py` | 否 |
 | 长期记忆读取 | ChromaDB 语义召回、`memory_id` 批量回查 MySQL、`user_id` 隔离 | `memory/long_term.py`、`memory/repository.py` | `read/read_write` 模式产生 1 次 Query Embedding |
-| 长期记忆写入 | 明示确认、哈希去重、MySQL + ChromaDB 单批次双写 | `memory/long_term.py`、`db/models.py` | `read_write` 模式产生 1 次批量 Embedding |
+| 长期记忆写入 | 用户陈述自动提取、原文证据校验、哈希去重、MySQL + ChromaDB 单批次双写 | `agentic/runtime.py`、`memory/long_term.py`、`db/models.py` | `read_write` 模式产生 1 次提取调用和 1 次批量 Embedding |
 | Skill 路由与加载 | frontmatter 目录、Tool Calling、`load_skill`、ToolMessage | `skills/loader.py`、`skills/tool.py`、`backend/skills/` | `auto` 模式调用 1 次 |
 | 工具决策 | LangChain `bind_tools`、工具白名单、参数约束 | `agentic/tools.py`、`agentic/runtime.py` | 每个工具轮次 1 次 |
 | 证据充分性判断 | JSON 结构化判断、缺失信息提取 | `agentic/runtime.py`、`agentic/prompts.py` | 每轮检索后 1 次 |
@@ -638,54 +645,119 @@ flowchart TD
 | RAG 评测 | 相关文档标注、排名指标、LLM-as-a-Judge | `services/quality_service.py`、`services/perf_service.py` | 检索和延迟指标否，Faithfulness 是 |
 | 响应展示 | Pydantic、Axios、React Markdown | `models/schemas.py`、`ChatPage.jsx` | 否 |
 
-### 4.1 短期、长期 Memory 与 Skill Loading
+### 4.1 记忆管理和 Skill Loading
 
-一次请求同时携带 `thread_id` 和可选的 `user_id`：`thread_id` 表示当前对话线程，用于隔离 LangGraph Checkpoint；`user_id` 表示同一用户的跨会话身份，只在长期记忆模式开启时使用。旧版 `conversation_id` 继续作为 `thread_id` 的兼容别名。
-
-短期状态由 `AgenticRAGState + InMemorySaver` 管理，保存最近 3 轮对话、较早消息的压缩摘要、用户已确认的本案事实、Agent 节点状态与轮次。每次调用先通过同一 `thread_id` 恢复 Checkpoint，再识别“如果已经退赃呢”“那未成年人呢”等追问并构造可独立检索的 `resolved_question`。超过窗口的消息会进入有界摘要，Checkpoint 超过 24 小时未访问后自动清理。
-
-长期记忆分为三类：
-
-| 类型 | 保存内容 | 确认规则 | 存储与注入方式 |
-|---|---|---|---|
-| Semantic Memory | 用户偏好、已确认案件事实 | 仅接受请求中显式提交的 `confirmed_memories` | MySQL 保存正文与确认状态，ChromaDB 语义召回；作为“用户已确认”上下文注入 |
-| Episodic Memory | 历史任务摘要、调用工具、来源 ID 与处理结论 | Agent 自动生成并固定标记为 `is_confirmed=false` | MySQL + ChromaDB；作为流程参考注入，Prompt 明确禁止当作已确认事实 |
-| Procedural Memory | 各法律领域的分析步骤、证据优先级和工具策略 | 由版本化 `SKILL.md` 管理 | 启动时只注入技能目录，调用 `load_skill` 后才把完整规范写入 `ToolMessage` |
+LawRAG 将记忆管理拆分为“会话开始读取、运行中按需注入、会话结束提取与持久化”三个阶段。运行期间需要参与推理的记忆通过统一的 `AgenticRAGState` 传递；回答结束后提取出的新记忆直接进入持久化流程，不在 State 中长期滞留，也不会把 MySQL 中的全部历史直接塞入 Prompt。
 
 ```mermaid
-flowchart LR
-    Q[当前问题] --> ST[按 thread_id 恢复短期状态]
-    ST --> MODE{memory_mode}
-    MODE -->|off| MERGE[组装按需上下文]
-    MODE -->|read 或 read_write| VS[ChromaDB long_term_memory<br/>按 user_id 过滤]
-    VS --> IDS[memory_id 列表]
-    IDS --> SQL[MySQL memory_entries<br/>正文与确认状态回查]
-    SQL --> MERGE
-    SK[Skill 目录] --> MERGE
-    MERGE --> AGENT[Agentic RAG]
-    AGENT --> STW[更新 Checkpoint<br/>最近轮次 + 摘要 + 案件事实]
-    AGENT --> WRITE{read_write}
-    WRITE -->|是| BATCH[确认的 Semantic + 未确认的 Episodic<br/>单次批量向量化写入]
+flowchart TD
+    Q[用户问题] --> CP[按 thread_id 恢复 Checkpoint]
+    CP --> RESOLVE[结合摘要与最近对话<br/>补全多轮追问]
+    RESOLVE --> MODE{memory_mode}
+    MODE -->|off| MERGE[组装 memory_context]
+    MODE -->|read / read_write| VECTOR[ChromaDB long_term_memory<br/>Query 向量召回 + user_id 过滤]
+    VECTOR --> IDS[Top K memory_id]
+    IDS --> MYSQL[MySQL memory_entries<br/>回查有效正文与来源类型]
+    MYSQL --> MERGE
+    MERGE --> RAG[Agentic RAG 检索与生成]
+    RAG --> CHECK[答案忠实度校验]
+    CHECK --> WRITE{memory_mode = read_write}
+    WRITE -->|否| SHORT[更新短期记忆<br/>最近对话 + 摘要]
+    WRITE -->|是| EXTRACT[仅从用户原始消息<br/>提取事实与偏好]
+    EXTRACT --> GUARD[原文 evidence 校验<br/>过滤假设、推断与法律结论]
+    GUARD --> SEM[Semantic Memory]
+    WRITE -->|是| EPI[Episodic Memory<br/>问题 + 最终答案 + 工具 + 来源]
+    SEM --> UPSERT[MySQL 哈希去重写入]
+    EPI --> UPSERT
+    UPSERT --> INDEX[ChromaDB 单批次向量化]
+    INDEX --> SHORT
+    SHORT --> END([结束])
 ```
 
-`memory_mode` 控制本次请求的授权边界：`off` 不读不写，`read` 只召回，`read_write` 召回并在回答结束后写入。默认值为 `off`。Semantic Memory 不从模型回答中自动抽取事实；只有用户通过 `confirmed_memories` 明确确认的 `case_fact` 或 `preference` 才能写入。相同用户、相同类型和相同规范化内容通过 SHA-256 哈希去重，重复提交会更新原记录而不是制造副本。
+#### 4.1.1 记忆分层与身份隔离
 
-短期上下文、召回的长期记忆与完整 Skill 都采用按需注入：短期只注入摘要、最近窗口和确认事实；长期只注入当前 Query 的 Top K 相关记忆；完整 Skill 只在 `load_skill` 被调用后进入消息。这样避免将全部历史和全部领域规范一次性塞入 Prompt。
+一次请求携带 `thread_id` 和可选的 `user_id`。`thread_id` 隔离当前会话的 LangGraph Checkpoint；`user_id` 隔离同一用户跨会话的长期记忆。旧版 `conversation_id` 继续作为 `thread_id` 的兼容别名。
+
+| 记忆层 | 保存内容 | 生命周期与存储 | 使用边界 |
+|---|---|---|---|
+| Short-Term Memory | 最近 3 轮问答、较早历史摘要、用户明确陈述的案件事实、Agent 状态 | `AgenticRAGState + InMemorySaver`，按 `thread_id` 隔离，默认 24 小时未访问后清理 | 只服务当前会话和多轮追问 |
+| Semantic Memory | 用户明确表达的案件事实与回答偏好 | MySQL `memory_entries` 保存权威正文，ChromaDB `long_term_memory` 保存向量索引 | 可跨会话召回，必须按 `user_id` 过滤 |
+| Episodic Memory | 历史问题、最终处理结论、调用工具与来源 ID | MySQL + ChromaDB，来源类型为 `agent_episode` | 仅用于参考历史处理过程，不得作为用户案件事实 |
+| Procedural Memory | 法律领域分析步骤、证据优先级和工具策略 | 版本化 `SKILL.md` | 通过 Skill Loading 按领域加载 |
+
+短期 Checkpoint、长期记忆和 Skill 分别解决“当前对话发生了什么”“这个用户过去提供过什么”“此类法律任务应该怎样处理”，三者不会混用存储空间。
+
+#### 4.1.2 会话开始：恢复与召回
+
+`prepare` 节点首先按 `thread_id` 恢复 `conversation_summary`、`recent_turns`、`case_facts` 和 `memory_turns`。系统根据“那如果”“上述”“该案件”等追问标记，将缺少上下文的问题补全为可独立检索的 `resolved_question`；出现“换个问题”“新案件”等标记时则不关联上一轮。
+
+长期记忆只在 `memory_mode=read/read_write` 且请求携带稳定 `user_id` 时召回：
+
+```text
+resolved_question
+    → Query Embedding
+    → ChromaDB 按 user_id 相似度检索
+    → Top K memory_id
+    → MySQL 按 user_id + memory_id 批量回查
+    → 记录 access_count / last_accessed_at
+```
+
+默认最多召回 `MEMORY_RECALL_TOP_K=6` 条。ChromaDB 是可重建索引，MySQL 中的正文、有效状态和来源类型才是最终依据；向量命中后不能绕过 MySQL 直接注入 Prompt。
+
+#### 4.1.3 会话结束：提取、校验与写入
+
+长期写入发生在最终答案完成 Grounding 校验之后，避免将中间答案或失败尝试持久化。`read_write` 模式会执行两类写入：
+
+1. **Semantic Memory**：提取器只能读取本轮用户原始消息，输出 `case_fact/preference + evidence`。`evidence` 必须是用户消息中的连续原文，后端校验成功后直接以该原文作为记忆正文，不采用模型改写文本；
+2. **Episodic Memory**：系统根据本轮问题、最终答案、Agent Trace 中的工具名称和来源 ID 生成任务摘要，并标记为 `agent_episode`。
+
+提取结果还会经过确定性规则过滤：疑问句、假设条件、模型推断、法条内容以及“构成某罪”“合同无效”“依法应当处罚”等法律定性不会进入 `case_fact`。提取器看不到助手回答、工具结果和检索证据，因此这些内容也不能被误存为用户事实。
+
+MySQL 使用 `user_id + memory_type + SHA-256(normalized_content)` 去重。重复内容会更新原记录的元数据、活跃状态和时间，再以同一个 `memory_id` 更新 ChromaDB；若向量写入失败，MySQL 正文仍然保留，并将索引状态标记为 `pending`。Semantic 与 Episodic 条目合并为一个 Embedding 批次，减少外部调用次数。
+
+#### 4.1.4 记忆整合与授权模式
+
+短期记忆先被格式化为“历史摘要 + 用户陈述事实 + 最近对话”，长期记忆再按来源划分为 Semantic 与 Episodic 两部分，最终合并为 `state["memory_context"]`：
+
+```text
+历史消息压缩摘要：……
+
+用户在对话中明确陈述的本案事实：
+- 公司已经拖欠三个月工资
+
+最近对话：
+- 用户：应该如何维权？
+- 助手：可以收集证据后申请劳动仲裁……
+
+长期语义记忆：
+- [preference] 请先给结论
+
+长期情景记忆（仅供流程参考）：
+- 历史任务：曾查询劳动仲裁材料……
+```
+
+生成节点只读取当前召回并格式化后的 `memory_context`，不会加载用户全部历史。三种授权模式如下：
+
+| `memory_mode` | 长期召回 | 自动提取 | 长期写入 |
+|---|---:|---:|---:|
+| `off` | 否 | 否 | 否 |
+| `read` | 是 | 否 | 否 |
+| `read_write` | 是 | 是 | 是 |
+
+短期 Checkpoint 独立于该开关，始终用于同一 `thread_id` 下的多轮对话。`read_write` 会额外产生 1 次记忆提取模型调用和 1 次长期记忆批量 Embedding。
+
+#### 4.1.5 Skill Loading
+
+Skill 作为 Procedural Memory 按需加载：启动时 `SkillLoader.scan()` 只读取各 `SKILL.md` frontmatter 中的 `name` 和 `description`，完整正文保持未加载；运行时模型先查看技能目录，调用 `load_skill(name)` 后才读取一个完整 Skill，并以 `ToolMessage` 追加到消息序列。
 
 ```mermaid
 flowchart LR
-    subgraph START[服务启动]
-        A[扫描 skills/*/SKILL.md] --> B[解析 YAML frontmatter]
-        B --> C[name + description 技能目录]
-        C --> D[注入 system prompt]
-    end
-    subgraph RUNTIME[请求运行]
-        E[LLM 查看技能目录] --> F[调用 load_skill name]
-        F --> G[读取选中的完整 SKILL.md]
-        G --> H[以 tool_result 追加到 messages]
-        H --> I[后续 RAG 与答案生成]
-    end
-    D -.每次请求使用目录.-> E
+    A[扫描 skills/*/SKILL.md] --> B[name + description 目录]
+    B --> C[Skill Router]
+    C --> D[调用 load_skill name]
+    D --> E[读取一个完整 SKILL.md]
+    E --> F[作为 tool_result 写入 messages]
+    F --> G[工具决策与答案生成]
 ```
 
 项目内置五个领域 Skill：
@@ -693,14 +765,12 @@ flowchart LR
 | Skill | 典型问题 | 加载后的能力 |
 |---|---|---|
 | `general_legal` | 未明确分类的一般法律问题 | 通用法律关系分析，法规优先 |
-| `criminal_law` | 盗窃、诈骗、伤害、量刑 | 自动启用 CrimeKG 本地精确匹配，优先罪名结构与刑法依据 |
+| `criminal_law` | 盗窃、诈骗、伤害、量刑 | 启用 CrimeKG 本地精确匹配，优先罪名结构与刑法依据 |
 | `labor_law` | 工资、辞退、工伤、仲裁 | 强调劳动关系、仲裁时效和举证责任 |
 | `contract_law` | 借款、买卖、租赁、违约 | 强调合同效力、履行、解除和损失范围 |
 | `traffic_law` | 交通事故、酒驾、保险赔偿 | 区分行政、民事与刑事责任 |
 
-每个 `SKILL.md` 使用 YAML frontmatter 声明 `name` 和 `description`。服务启动时 `SkillLoader.scan()` 只读取这两项元数据，完整正文保持未加载；`skill_name=auto` 时，模型根据 system prompt 中的目录调用 `load_skill(name)`，Loader 才读取对应的完整 `SKILL.md`，并以 `ToolMessage` 追加到消息序列。下一次模型调用同时看到技能目录、`tool_result`、检索证据和当前问题。手动指定 `skill_name` 时跳过自动选择调用，但仍通过相同的 `load_skill → tool_result → messages` 路径加载正文。
-
-自动选择 Skill 会增加 1 次轻量 LLM 调用。完整 Skill 进入状态图后，Tool Router 结合领域规则决定是否调用 CrimeKG；CrimeKG 工具本身只执行本地精确查询，不产生嵌套模型调用。
+`skill_name=auto` 时自动选择 Skill 会增加 1 次轻量模型调用；手动指定时跳过选择调用，但仍通过 `load_skill → tool_result → messages` 路径加载正文。完整 Skill 进入 State 后，Tool Router 才结合领域规则选择 CrimeKG、法律检索或外部 MCP 工具。
 
 ### 4.2 LangGraph 节点图与 State
 
@@ -733,8 +803,8 @@ flowchart TD
 | State 分类 | 核心字段 | 作用 |
 |---|---|---|
 | 请求与身份 | `question`、`conversation_id`、`thread_id`、`user_id`、`memory_mode` | 保存原始问题、线程身份、用户身份和长期记忆授权模式 |
-| 短期记忆 | `conversation_summary`、`recent_turns`、`case_facts`、`memory_turns` | 保存历史摘要、最近对话、用户确认事实和累计轮数 |
-| 长期记忆 | `confirmed_memories`、`memory_context`、`recalled_memory_ids` | 保存本轮确认信息、按需注入的记忆上下文和实际召回 ID |
+| 短期记忆 | `conversation_summary`、`recent_turns`、`case_facts`、`memory_turns` | 保存历史摘要、最近对话、用户明确陈述的事实和累计轮数 |
+| 长期记忆 | `memory_context`、`recalled_memory_ids` | 保存按需注入的记忆上下文和本轮实际召回的 Memory ID；自动提取与持久化在回答结束后执行，不把临时提取结果滞留在 Graph State 中 |
 | Skill | `skill`、`skill_messages` | 保存当前法律领域 Skill 及以 `ToolMessage` 表示的完整执行规范 |
 | 消息与工具 | `messages`、`pending_query`、`tool_calls` | 保存 Agent 消息、当前待检索 Query 和 LLM 生成的工具调用 |
 | 检索证据 | `evidence`、`kg_entities`、`rewritten_queries`、`missing_information` | 汇总法规、案例、CrimeKG、MCP 证据及证据缺口 |
@@ -743,7 +813,7 @@ flowchart TD
 | 生成与校验 | `answer`、`grounding_feedback`、`grounding_passed` | 保存候选答案、校验反馈和最终通过状态 |
 | 可观测性 | `trace` | 按执行顺序记录节点、工具、判断结果和循环信息 |
 
-每次新问题会重置工具调用、临时证据、生成结果和 Trace，只从 Checkpoint 恢复摘要、最近对话、确认事实与轮次，防止上一轮的中间结果泄漏到当前执行。
+每次新问题会重置工具调用、临时证据、生成结果和 Trace，只从 Checkpoint 恢复摘要、最近对话、用户陈述事实与轮次，防止上一轮的中间结果泄漏到当前执行。
 
 #### 4.2.2 节点功能
 
@@ -759,7 +829,7 @@ flowchart TD
 | `generate` | `resolved_question`、`compacted_context`、`memory_context`、`skill_messages` | 根据检索证据、按需记忆与领域规范生成带来源引用的法律回答 | `answer`、`generation_rounds`、`trace` |
 | `verify_grounding` | `answer`、`compacted_context`、`generation_rounds` | 检查关键结论是否得到证据支持、引用是否完整；未通过时生成修正反馈 | `grounding_passed`、`grounding_feedback`、`trace` |
 
-`grade_evidence` 后的条件边形成检索纠错循环，`verify_grounding` 后的条件边形成答案修正循环。两个循环都受配置中的最大轮数约束。图执行完成后，Runner 在图外更新短期 Checkpoint；只有 `memory_mode=read_write` 时，才将用户确认信息和未确认任务摘要批量写入长期记忆。长期写入放在 Grounding 校验之后，避免中间答案进入持久化记忆。
+`grade_evidence` 后的条件边形成检索纠错循环，`verify_grounding` 后的条件边形成答案修正循环。两个循环都受配置中的最大轮数约束。图执行完成后，Runner 在图外更新短期 Checkpoint；只有 `memory_mode=read_write` 时，才自动提取带原文依据的用户陈述，并与 Agent 任务摘要批量写入长期记忆。长期写入放在 Grounding 校验之后，避免中间答案进入持久化记忆。
 
 ### 4.3 工具决策与检索纠错
 
@@ -837,7 +907,7 @@ flowchart LR
 | `tool_result_budget` | 每轮执行；最新一批 Tool Result 总计超过 200,000 字符 | 从最大的结果开始处理；单项超过 30,000 字符时完整写入 `.task_outputs/tool-results/`，消息中保留文件路径和前 2,000 字符预览 | 否 |
 | `snip_compact` | 每轮执行；消息超过 50 条 | 先将完整历史写入 `.transcripts/`，再保留最初 3 条、归档标记和最近 46 条；切点保护 `AIMessage(tool_calls)` 与 `ToolMessage` 的配对关系 | 否 |
 | `micro_compact` | 前两步后仍超过 50,000 字符 | 保留最近 3 条已经消费的 Tool Result，将更早结果完整落盘并替换为可恢复路径，直到接近阈值的 80% | 否 |
-| `compact_history` | Micro 和未读结果适配后仍然超限，或模型主动调用同名工具 | 保存完整 transcript，生成只包含目标、约束、确认事实、工具、来源、决定和剩余工作的状态摘要；当前用户请求与历史摘要分开保存 | 是，最多 1 次摘要调用 |
+| `compact_history` | Micro 和未读结果适配后仍然超限，或模型主动调用同名工具 | 保存完整 transcript，生成只包含目标、约束、用户陈述事实、工具、来源、决定和剩余工作的状态摘要；当前用户请求与历史摘要分开保存 | 是，最多 1 次摘要调用 |
 
 最新一批尚未被模型读取的 Tool Result 不会被 `micro_compact` 直接删除。如果仅未读结果就足以撑满上下文，`fit_tool_results` 会把最大的结果完整落盘，在消息中保留 1,000 字符预览和路径，使模型至少看到一次结果概况。每次工具响应包含多个调用时，系统会先执行完整批次并为每个 Tool Call 写入对应的 Tool Result，再处理主动 `compact_history` 请求，避免出现孤立结果或重复执行具有副作用的工具。
 
@@ -931,12 +1001,12 @@ flowchart LR
 2. **离线整理罪名知识**：CrimeKG 中“盗窃罪”的 `gainian`、`tezheng`、`chufa`、`fatiao` 等字段被展开为可检索文本，同时建立以“盗窃罪”为键的内存索引；
 3. **离线整理案例**：CAIL2018 中罪名为盗窃、关联法条为264的案件被转换为案例文档，保留案件事实、罪名、刑期和来源信息；
 4. **双库存储**：原文、Parent 和 Child 先写入 MySQL；仅 Child 调用 `text-embedding-v3`，法规与 CrimeKG Child 写入 ChromaDB `laws`，案例 Child 写入 `cases`，向量记录 ID 等于 `child_chunk_id`；
-5. **恢复记忆并加载 Skill**：系统按 `thread_id` 恢复最近问答、摘要和确认事实；若本次为 `read` 或 `read_write`，再按 `user_id + 当前问题` 召回相关长期记忆；模型选择 `criminal_law` 并调用 `load_skill`，完整刑事执行规范以 `ToolMessage` 进入 Agent 状态；
+5. **恢复记忆并加载 Skill**：系统按 `thread_id` 恢复最近问答、摘要和用户陈述事实；若本次为 `read` 或 `read_write`，再按 `user_id + 当前问题` 召回相关长期记忆；模型选择 `criminal_law` 并调用 `load_skill`，完整刑事执行规范以 `ToolMessage` 进入 Agent 状态；
 6. **Agent 工具决策**：Tool Router 选择 `retrieve_legal_evidence(query, all, 5)`，并为罪名结构调用 `lookup_crime_knowledge(盗窃罪)`；策略层确保法律检索不会被跳过；
 7. **检索工具执行**：问题 Embedding 查询 ChromaDB 得到 Child ID，BM25 在 MySQL Child 中匹配关键词，RRF 融合后回查 Child 原文、完成 Child 精排并恢复完整 Parent；
 8. **消息压缩与证据评估**：完整 Tool Result 先闭合写入消息，再依次经过结果转存、历史归档、旧结果替换和必要的状态摘要；Evidence Grader 判断法条、构成要件和案例是否足够，不足时生成针对性 Query 并在有界循环中补充检索；
 9. **基于证据生成与校验**：`LegalEvidencePacker` 在独立 Token 预算内裁剪、去重、排序并打包最终证据，生成模型据此组织结构化答案；Grounding Checker 检查结论和引用，未通过时最多重新生成一次；
-10. **更新记忆与评测**：问题、答案、摘要和用户确认事实写回短期 Checkpoint；`read_write` 模式将显式确认信息作为 Semantic Memory、将任务摘要作为未确认的 Episodic Memory，以一个 Embedding 批次写入 MySQL 与 ChromaDB；接口返回 Agent Trace、记忆 ID、来源及阶段耗时，并计算 Recall@5、MRR@10、P95 Latency 和 Faithfulness。
+10. **更新记忆与评测**：`read_write` 模式仅将本轮用户原始消息交给记忆提取器，后端通过原文片段校验后，把用户陈述的事实和偏好作为 Semantic Memory，并把任务摘要作为 `agent_episode`，以一个 Embedding 批次写入 MySQL 与 ChromaDB；最近对话、摘要和提取出的案件事实同时写回短期 Checkpoint。接口返回 Agent Trace、记忆 ID、来源及阶段耗时，并计算 Recall@5、MRR@10、P95 Latency 和 Faithfulness。
 
 该问题最终使用的证据上下文示意如下：
 
@@ -1013,30 +1083,20 @@ backend/
 
 ```json
 {
-  "question": "公司拖欠工资三个月，员工应该如何维权？",
+  "question": "公司已经拖欠我三个月工资，请先给结论，再说明如何维权。",
   "collection": "all",
   "rerank_strategy": "simple",
   "generation_strategy": "structured_legal",
   "thread_id": "thread-labor-20261011",
   "user_id": "user-10001",
   "memory_mode": "read_write",
-  "confirmed_memories": [
-    {
-      "category": "case_fact",
-      "content": "用户确认公司已经连续拖欠工资三个月"
-    },
-    {
-      "category": "preference",
-      "content": "用户希望回答先给结论，再列法律依据"
-    }
-  ],
   "skill_name": "auto",
   "top_k": 5,
   "evaluate_quality": false
 }
 ```
 
-响应中的 `recalled_memory_ids` 表示本轮实际召回的长期记忆，`written_memory_ids` 表示本轮完成去重并写入/更新的记忆。只需要多轮对话而不需要跨会话记忆时，复用 `thread_id` 并保持 `memory_mode=off`；只读取既有长期记忆时使用 `read`；只有同时提供稳定 `user_id` 和明确写入授权时才使用 `read_write`。
+提取器会从上述 `question` 中识别“公司已经拖欠我三个月工资”和“请先给结论”，分别形成案件事实与回答偏好；它不会读取生成答案或检索证据。响应中的 `recalled_memory_ids` 表示本轮实际召回的长期记忆，`written_memory_ids` 表示本轮完成去重并写入/更新的记忆。只需要多轮对话而不需要跨会话记忆时，复用 `thread_id` 并保持 `memory_mode=off`；只读取既有长期记忆时使用 `read`；只有同时提供稳定 `user_id` 和写入授权时才使用 `read_write`。
 
 ### 5.3 前端页面
 
@@ -1249,9 +1309,9 @@ python -m scripts.run_quality_eval
 - **稳定 ID 关联**：`doc_id → parent_chunk_id → child_chunk_id` 使用确定性 ID 串联导入、检索、删除、重建和来源回查；
 - **上下文可恢复**：四阶段消息压缩先把完整结果与 Transcript 落盘，再替换旧内容；仅在确定性手段耗尽后调用摘要模型；
 - **证据有预算**：`LegalEvidencePacker` 单独限制生成证据规模，保留法条原文、来源标签和高相关 Parent；
-- **短期状态可恢复**：LangGraph Checkpointer 以 `thread_id` 隔离线程，保存最近 3 轮、历史摘要、确认事实和 Agent 状态，并使用 TTL 自动过期；
-- **长期记忆双存储**：MySQL 是记忆正文和确认状态的事实库，ChromaDB 只负责按 `memory_id` 召回 Semantic / Episodic 记忆；
-- **写入需要授权**：默认 `memory_mode=off`；Semantic Memory 只接收用户显式确认内容，Agent 任务摘要固定标记为未确认；
+- **短期状态可恢复**：LangGraph Checkpointer 以 `thread_id` 隔离线程，保存最近 3 轮、历史摘要、用户陈述事实和 Agent 状态，并使用 TTL 自动过期；
+- **长期记忆双存储**：MySQL 是记忆正文、原文片段和来源类型的事实库，ChromaDB 只负责按 `memory_id` 召回 Semantic / Episodic 记忆；
+- **写入需要授权**：默认 `memory_mode=off`；`read_write` 模式自动提取用户明确陈述的事实与偏好，并通过原文 evidence 校验阻止模型推断、检索结果和法律结论进入事实记忆；
 - **能力按需加载**：Skills 作为 Procedural Memory，启动时只有技能目录进入 system prompt，完整 `SKILL.md` 仅在 `load_skill` 调用后以 tool_result 注入；
 - **云端调用隔离**：模型客户端按需初始化，服务启动与单元测试保持零外部调用；
 - **重排自动降级**：云端排序异常时切换到轻量算法，并将降级状态写入响应指标；
