@@ -5,6 +5,7 @@
 
 from app.core.llm import get_llm
 from app.services.prompts import SELF_REFLECT_PROMPT, SELF_REFLECT_CORRECT_PROMPT
+from app.tracing import traced_ainvoke
 
 
 async def self_reflect_and_correct(
@@ -31,7 +32,7 @@ async def self_reflect_and_correct(
     for _ in range(max_iterations):
         # 反思：检查回答准确性
         reflect_chain = SELF_REFLECT_PROMPT | llm
-        reflect_resp = await reflect_chain.ainvoke({
+        reflect_resp = await traced_ainvoke("llm.self_reflect", reflect_chain, {
             "context": context,
             "answer": current_answer,
         })
@@ -43,7 +44,7 @@ async def self_reflect_and_correct(
 
         # 修正：基于反思结果重新生成
         correct_chain = SELF_REFLECT_CORRECT_PROMPT | llm
-        correct_resp = await correct_chain.ainvoke({
+        correct_resp = await traced_ainvoke("llm.self_correct", correct_chain, {
             "correction_guidance": reflection,
             "context": context,
             "question": question,

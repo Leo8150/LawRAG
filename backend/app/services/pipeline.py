@@ -17,6 +17,7 @@ from app.services.prompts import (
     LEGAL_STRUCTURED_PROMPT,
 )
 from app.models.schemas import ChatResponse
+from app.tracing import traced_ainvoke
 from app.config import settings
 from app.context import LegalEvidencePacker
 from app.skills import LegalSkill, load_skill, skill_loader
@@ -141,7 +142,7 @@ class RAGPipeline:
         requested = self.config.skill_name
         if requested == "auto":
             selector = get_llm(temperature=0).bind_tools([load_skill], tool_choice="load_skill")
-            selection = await selector.ainvoke([
+            selection = await traced_ainvoke("llm.skill_router", selector, [
                 SystemMessage(content=(
                     "你是 LawRAG 的技能路由器。根据用户问题，从目录中选择且只选择一个技能，"
                     "并调用 load_skill(name)。不要直接回答法律问题。\n\n"
@@ -423,7 +424,7 @@ class RAGPipeline:
 
         llm = get_llm()
         chain = prompt | llm
-        response = await chain.ainvoke({
+        response = await traced_ainvoke("llm.generate", chain, {
             "context": context,
             "question": question,
             "memory_context": memory_context or "无历史会话，本轮作为独立问题处理。",

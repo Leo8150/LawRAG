@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
+from app.tracing import trace_span
 
 
 @dataclass(frozen=True)
@@ -43,15 +44,21 @@ class MCPHttpClient:
             ) from exc
 
         try:
-            timeout = httpx.Timeout(server.timeout_seconds)
-            async with httpx.AsyncClient(headers=server.headers, timeout=timeout) as http_client:
-                async with streamable_http_client(
-                    server.url,
-                    http_client=http_client,
-                ) as (read_stream, write_stream, _):
-                    async with ClientSession(read_stream, write_stream) as session:
-                        await session.initialize()
-                        result = await session.call_tool(tool_name, arguments=arguments)
+            with trace_span(
+                "mcp.call_tool",
+                "mcp",
+                {"server": server.name, "tool_name": tool_name},
+            ) as mcp_span:
+                timeout = httpx.Timeout(server.timeout_seconds)
+                async with httpx.AsyncClient(headers=server.headers, timeout=timeout) as http_client:
+                    async with streamable_http_client(
+                        server.url,
+                        http_client=http_client,
+                    ) as (read_stream, write_stream, _):
+                        async with ClientSession(read_stream, write_stream) as session:
+                            await session.initialize()
+                            result = await session.call_tool(tool_name, arguments=arguments)
+                mcp_span.metadata(result_is_error=bool(getattr(result, "isError", False)))
         except Exception as exc:
             raise MCPClientError(
                 f"MCP server {server.name!r} failed while calling {tool_name!r}: "

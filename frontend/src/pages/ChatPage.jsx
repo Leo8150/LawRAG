@@ -123,6 +123,7 @@ export default function ChatPage() {
         activeSkill: result.active_skill,
         contextCompaction: result.context_compaction,
         agentTrace: result.agent_trace,
+        trace: result.trace,
         recalledMemoryIds: result.recalled_memory_ids,
         writtenMemoryIds: result.written_memory_ids,
       }])
@@ -353,6 +354,8 @@ export default function ChatPage() {
                 </details>
               )}
 
+              {msg.trace?.spans?.length > 0 && <TracePanel trace={msg.trace} />}
+
               {/* 内联性能监控面板 */}
               {msg.role === 'assistant' && (msg.systemBefore || msg.quality) && (
                 <MonitorPanel msg={msg} onSave={() => handleSaveRecord(msg)} />
@@ -437,6 +440,72 @@ export default function ChatPage() {
         </button>
       </div>
     </div>
+  )
+}
+
+
+function TracePanel({ trace }) {
+  const spans = trace.spans || []
+  const byId = Object.fromEntries(spans.map(span => [span.span_id, span]))
+  const depthOf = (span) => {
+    let depth = 0
+    let parent = byId[span.parent_span_id]
+    const visited = new Set()
+    while (parent && depth < 8 && !visited.has(parent.span_id)) {
+      visited.add(parent.span_id)
+      depth += 1
+      parent = byId[parent.parent_span_id]
+    }
+    return depth
+  }
+  const evidence = (metadata = {}) => [
+    ...(metadata.chunk_ids || []),
+    ...(metadata.parent_ids || []),
+    ...(metadata.law_ids || []),
+  ]
+
+  return (
+    <details style={{ marginTop: 10 }}>
+      <summary style={{ cursor: 'pointer', fontSize: 12, color: 'var(--text-muted)' }}>
+        Trace {trace.trace_id?.slice(0, 8)} · {trace.duration_ms}ms · {trace.total_tokens || 0} tokens
+      </summary>
+      <div style={{ marginTop: 7, borderLeft: '2px solid var(--border)', paddingLeft: 8 }}>
+        {spans.map(span => {
+          const ids = evidence(span.metadata)
+          return (
+            <div
+              key={span.span_id}
+              style={{
+                marginLeft: depthOf(span) * 14,
+                marginBottom: 5,
+                padding: '5px 7px',
+                border: '1px solid var(--border)',
+                borderRadius: 5,
+                fontSize: 11,
+              }}
+            >
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                <strong>{span.name}</strong>
+                <span>{span.kind}</span>
+                <span>{span.duration_ms}ms</span>
+                {span.total_tokens > 0 && <span>{span.total_tokens} tokens</span>}
+                <span style={{ color: span.status === 'error' ? '#ef4444' : '#22c55e' }}>
+                  {span.status}
+                </span>
+              </div>
+              {span.error_summary && (
+                <div style={{ color: '#ef4444', marginTop: 3 }}>{span.error_summary}</div>
+              )}
+              {ids.length > 0 && (
+                <div style={{ color: 'var(--text-muted)', marginTop: 3, wordBreak: 'break-all' }}>
+                  Evidence: {ids.slice(0, 12).join(', ')}{ids.length > 12 ? ' …' : ''}
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </details>
   )
 }
 

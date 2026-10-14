@@ -13,6 +13,7 @@ import httpx
 from langchain_core.documents import Document
 
 from app.config import settings
+from app.tracing import trace_span
 
 
 class CloudRerankError(RuntimeError):
@@ -120,11 +121,17 @@ async def cloud_rerank(
     try:
         for attempt in range(settings.RERANKER_MAX_RETRIES + 1):
             try:
-                response = await http_client.post(
-                    get_reranker_url(),
-                    headers=headers,
-                    json=payload,
-                )
+                with trace_span(
+                    "reranker.http",
+                    "reranker_request",
+                    {"attempt": attempt + 1, "model": settings.RERANKER_MODEL},
+                ) as request_span:
+                    response = await http_client.post(
+                        get_reranker_url(),
+                        headers=headers,
+                        json=payload,
+                    )
+                    request_span.metadata(status_code=response.status_code)
                 if response.status_code == 429 or response.status_code >= 500:
                     response.raise_for_status()
                 if response.status_code >= 400:

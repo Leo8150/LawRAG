@@ -128,3 +128,48 @@ class MemoryEntry(Base):
     )
     last_accessed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     forgotten_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class RAGTrace(Base):
+    """One end-to-end Agentic RAG request."""
+
+    __tablename__ = "rag_traces"
+
+    trace_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    duration_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    error_summary: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    trace_metadata: Mapped[dict] = mapped_column("metadata", JSON, default=dict)
+
+
+class RAGSpan(Base):
+    """A node or leaf operation belonging to a RAG trace."""
+
+    __tablename__ = "rag_spans"
+    __table_args__ = (
+        Index("idx_rag_span_trace_sequence", "trace_id", "sequence"),
+        Index("idx_rag_span_trace_parent", "trace_id", "parent_span_id"),
+    )
+
+    span_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    trace_id: Mapped[str] = mapped_column(
+        ForeignKey("rag_traces.trace_id", ondelete="CASCADE"), index=True
+    )
+    parent_span_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    name: Mapped[str] = mapped_column(String(128), index=True)
+    kind: Mapped[str] = mapped_column(String(32), index=True)
+    sequence: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    duration_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    error_summary: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    span_metadata: Mapped[dict] = mapped_column("metadata", JSON, default=dict)

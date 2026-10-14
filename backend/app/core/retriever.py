@@ -8,6 +8,7 @@ from rank_bm25 import BM25Okapi
 from app.core.vectorstore import get_vectorstore
 from app.config import settings
 from app.db.repository import ParentChildRepository, get_parent_child_repository
+from app.tracing import evidence_metadata, trace_span
 
 
 class BM25ChineseRetriever(BaseRetriever):
@@ -99,7 +100,9 @@ class HybridRetriever(BaseRetriever):
 
         # BM25 检索
         if self.bm25_retriever:
-            bm25_results = self.bm25_retriever.invoke(bm25_query)
+            with trace_span("bm25.search", "bm25", {"top_k": self.k}) as bm25_span:
+                bm25_results = self.bm25_retriever.invoke(bm25_query)
+                bm25_span.metadata(**evidence_metadata(bm25_results))
             for rank, doc in enumerate(bm25_results):
                 key = str(doc.metadata.get("child_chunk_id", ""))
                 if not key:
@@ -110,7 +113,11 @@ class HybridRetriever(BaseRetriever):
         # 向量检索
         for name in self.collection_names:
             try:
-                vec_results = get_vectorstore(name).similarity_search(vector_query, k=self.k)
+                with trace_span(
+                    "dense.search", "dense", {"collection": name, "top_k": self.k}
+                ) as dense_span:
+                    vec_results = get_vectorstore(name).similarity_search(vector_query, k=self.k)
+                    dense_span.metadata(**evidence_metadata(vec_results))
                 for rank, doc in enumerate(vec_results):
                     key = str(doc.metadata.get("child_chunk_id", ""))
                     if not key:

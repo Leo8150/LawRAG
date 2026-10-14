@@ -34,6 +34,15 @@ from app.memory import checkpoint_manager, long_term_memory, short_term_context
 from app.mcp import ExternalLegalMCPService
 from app.models.schemas import ChatResponse, SourceDocument, StageMetrics
 from app.skills import skill_loader
+from app.tracing import (
+    TraceCollector,
+    activate_trace,
+    evidence_metadata,
+    trace_node,
+    trace_persistence,
+    trace_span,
+    traced_ainvoke,
+)
 from app.utils.metadata import format_source_display
 
 
@@ -117,6 +126,35 @@ class AgenticRAGRunner:
         return graph.compile(checkpointer=checkpoint_manager.saver)
 
     async def run(
+        self,
+        question: str,
+        conversation_id: str | None = None,
+        *,
+        thread_id: str | None = None,
+        user_id: str | None = None,
+        memory_mode: str = "off",
+    ) -> ChatResponse:
+        collector = TraceCollector(metadata={"architecture": "agentic_rag"})
+        try:
+            with activate_trace(collector):
+                response = await self._run_impl(
+                    question,
+                    conversation_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    memory_mode=memory_mode,
+                )
+        except BaseException as exc:
+            snapshot = collector.finish(exc)
+            trace_persistence.enqueue(snapshot)
+            raise
+        snapshot = collector.finish()
+        trace_persistence.enqueue(snapshot)
+        response.trace_id = collector.trace_id
+        response.trace = snapshot
+        return response
+
+    async def _run_impl(
         self,
         question: str,
         conversation_id: str | None = None,
@@ -225,7 +263,7 @@ class AgenticRAGRunner:
         """Extract only user-stated facts/preferences backed by an exact source span."""
         started = time.time()
         self.pipeline.metrics["llm_calls"] += 1
-        response = await get_llm(temperature=0).ainvoke([
+        response = await traced_ainvoke("llm.memory_extraction", get_llm(temperature=0), [
             SystemMessage(content=USER_MEMORY_EXTRACTION_SYSTEM),
             HumanMessage(content=f"本轮用户原始消息：\n{user_message}"),
         ])
@@ -292,6 +330,7 @@ class AgenticRAGRunner:
         )
         return any(re.search(pattern, candidate) for pattern in legal_patterns)
 
+    @trace_node("prepare")
     async def _prepare(self, state: AgenticRAGState) -> dict:
         snapshot = short_term_context.from_values(state)
         resolved = short_term_context.resolve_question(state["question"], snapshot)
@@ -322,6 +361,7 @@ class AgenticRAGRunner:
             ),
         }
 
+    @trace_node("load_skill")
     async def _load_skill(self, state: AgenticRAGState) -> dict:
         skill, messages = await self.pipeline._select_skill(state["resolved_question"])
         if set(self.pipeline.config.collection_names) == {
@@ -336,6 +376,7 @@ class AgenticRAGRunner:
             "trace": _trace(state, "load_skill", skill=skill.name),
         }
 
+    @trace_node("decide_tools")
     async def _decide_tools(self, state: AgenticRAGState) -> dict:
         if state.get("tool_rounds", 0) >= settings.AGENT_MAX_TOOL_ROUNDS:
             return {"tool_calls": [], "trace": _trace(state, "decide_tools", stopped="round_limit")}
@@ -358,11 +399,16 @@ class AgenticRAGRunner:
         while True:
             try:
                 self.pipeline.metrics["llm_calls"] += 1
-                decision = await llm.ainvoke([
-                    SystemMessage(content=TOOL_ROUTER_SYSTEM),
-                    *compacted_messages,
-                    HumanMessage(content=prompt),
-                ])
+                decision = await traced_ainvoke(
+                    "llm.tool_router",
+                    llm,
+                    [
+                        SystemMessage(content=TOOL_ROUTER_SYSTEM),
+                        *compacted_messages,
+                        HumanMessage(content=prompt),
+                    ],
+                    metadata={"retry": reactive_retries},
+                )
                 break
             except Exception as exc:
                 if (
@@ -418,6 +464,7 @@ class AgenticRAGRunner:
             "trace": _trace(state, "decide_tools", tool_count=len(calls), tools=[c["name"] for c in calls]),
         }
 
+    @trace_node("execute_tools")
     async def _execute_tools(self, state: AgenticRAGState) -> dict:
         evidence = list(state.get("evidence", []))
         entities = list(state.get("kg_entities", []))
@@ -429,7 +476,14 @@ class AgenticRAGRunner:
         for call in state.get("tool_calls", []):
             name = str(call.get("name", ""))
             try:
-                execution = await self.registry.execute(name, dict(call.get("args") or {}))
+                safe_tool_metadata = {"tool_name": name}
+                arguments = dict(call.get("args") or {})
+                for key in ("collection", "top_k", "chunk_id"):
+                    if key in arguments:
+                        safe_tool_metadata[key] = arguments[key]
+                with trace_span(f"tool.{name}", "tool", safe_tool_metadata) as tool_span:
+                    execution = await self.registry.execute(name, arguments)
+                    tool_span.metadata(**evidence_metadata(execution.documents))
             except Exception as exc:
                 execution = ToolExecution(content=f"工具执行失败：{type(exc).__name__}")
             if name == "retrieve_legal_evidence":
@@ -482,6 +536,7 @@ class AgenticRAGRunner:
             "trace": _trace(state, "execute_tools", tools=executed, evidence_count=len(evidence)),
         }
 
+    @trace_node("grade_evidence")
     async def _grade_evidence(self, state: AgenticRAGState) -> dict:
         started = time.time()
         evidence = state.get("evidence", [])
@@ -497,7 +552,7 @@ class AgenticRAGRunner:
             evidence,
             question=state["resolved_question"],
         ).context
-        response = await get_llm(temperature=0).ainvoke([
+        response = await traced_ainvoke("llm.grade_evidence", get_llm(temperature=0), [
             SystemMessage(content=EVIDENCE_GRADE_SYSTEM),
             HumanMessage(content=f"问题：{state['resolved_question']}\n\n证据：\n{preview}"),
         ])
@@ -525,11 +580,12 @@ class AgenticRAGRunner:
             return "compact"
         return "rewrite"
 
+    @trace_node("rewrite_query")
     async def _rewrite_query(self, state: AgenticRAGState) -> dict:
         started = time.time()
         suggested = (state.get("pending_query") or "").strip()
         if not suggested or suggested == state["resolved_question"]:
-            response = await get_llm(temperature=0).ainvoke([
+            response = await traced_ainvoke("llm.rewrite_query", get_llm(temperature=0), [
                 SystemMessage(content=QUERY_REWRITE_SYSTEM),
                 HumanMessage(content=(
                     f"原问题：{state['resolved_question']}\n"
@@ -546,6 +602,7 @@ class AgenticRAGRunner:
             "trace": _trace(state, "rewrite_query", query=suggested),
         }
 
+    @trace_node("compact_context")
     async def _compact_context(self, state: AgenticRAGState) -> dict:
         started = time.time()
         result = LegalEvidencePacker(settings.CONTEXT_MAX_TOKENS).compact(
@@ -567,6 +624,7 @@ class AgenticRAGRunner:
             "trace": _trace(state, "compact_context", document_count=len(result.documents)),
         }
 
+    @trace_node("generate")
     async def _generate(self, state: AgenticRAGState) -> dict:
         question = state["resolved_question"]
         if state.get("grounding_feedback"):
@@ -586,9 +644,10 @@ class AgenticRAGRunner:
             "trace": _trace(state, "generate", round=state.get("generation_rounds", 0) + 1),
         }
 
+    @trace_node("verify_grounding")
     async def _verify_grounding(self, state: AgenticRAGState) -> dict:
         started = time.time()
-        response = await get_llm(temperature=0).ainvoke([
+        response = await traced_ainvoke("llm.verify_grounding", get_llm(temperature=0), [
             SystemMessage(content=GROUNDING_CHECK_SYSTEM),
             HumanMessage(content=(
                 f"问题：{state['resolved_question']}\n\n"
@@ -616,6 +675,7 @@ class AgenticRAGRunner:
             return "finish"
         return "regenerate"
 
+    @trace_node("update_memory")
     async def _update_memory(self, state: AgenticRAGState) -> dict:
         """Extract and persist memory after the final answer without blocking it."""
         snapshot = short_term_context.from_values(state)
@@ -690,7 +750,7 @@ class AgenticRAGRunner:
             for message in messages
         )
         self.pipeline.metrics["llm_calls"] += 1
-        response = await get_llm(temperature=0).ainvoke([
+        response = await traced_ainvoke("llm.compact_summary", get_llm(temperature=0), [
             SystemMessage(content=CONTEXT_SUMMARY_SYSTEM),
             HumanMessage(content=(
                 f"当前用户请求：\n{active_request}\n\n"
@@ -714,11 +774,28 @@ class AgenticRAGRunner:
         try:
             children = await self.pipeline._retrieve([query], None)
             self.pipeline.metrics["retrieved_child_count"] += len(children)
-            reranked = await self.pipeline._rerank(
-                query,
-                children,
-                top_k=max(self.pipeline.config.top_k, settings.CHILD_RERANK_TOP_K),
-            )
+            with trace_span(
+                "reranker",
+                "reranker",
+                {
+                    "strategy": getattr(
+                        getattr(self.pipeline.config, "rerank_strategy", "unknown"),
+                        "value",
+                        getattr(self.pipeline.config, "rerank_strategy", "unknown"),
+                    ),
+                    "candidate_count": len(children),
+                },
+            ) as rerank_span:
+                reranked = await self.pipeline._rerank(
+                    query,
+                    children,
+                    top_k=max(self.pipeline.config.top_k, settings.CHILD_RERANK_TOP_K),
+                )
+                rerank_span.tokens(input_tokens=self.pipeline.metrics.get("rerank_tokens", 0))
+                rerank_span.metadata(
+                    **evidence_metadata(reranked),
+                    fallback=self.pipeline.metrics.get("rerank_fallback", False),
+                )
             self.pipeline.metrics["reranked_child_count"] += len(reranked)
             parents = self.pipeline._aggregate_and_hydrate_parents(reranked)
             self.pipeline.metrics["parent_candidate_count"] += len(parents)

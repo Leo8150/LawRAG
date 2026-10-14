@@ -144,6 +144,8 @@ class ChatResponse(BaseModel):
     active_skill: str | None = None
     context_compaction: dict | None = None
     agent_trace: list[dict] = []
+    trace_id: str | None = None
+    trace: dict | None = None
 
 
 # ===================== 知识库 =====================

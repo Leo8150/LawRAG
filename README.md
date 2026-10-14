@@ -48,6 +48,7 @@ LawRAG 是一个面向中国法律咨询场景的检索增强生成（Retrieval-
    - [5.1 后端分层](#51-后端分层)
    - [5.2 主要 API](#52-主要-api)
    - [5.3 前端页面](#53-前端页面)
+   - [5.4 Trace 链路追踪](#54-trace-链路追踪)
 6. [环境配置与项目运行](#6-环境配置与项目运行)
    - [6.1 环境要求](#61-环境要求)
    - [6.2 安装后端](#62-安装后端)
@@ -1071,6 +1072,7 @@ backend/
 │   ├── models/              # Pydantic 请求与响应模型
 │   ├── services/            # 导入、检索执行与生成能力
 │   ├── skills/              # frontmatter 扫描器、按需加载器与 load_skill 工具
+│   ├── tracing/             # Trace/Span 上下文、异步批量持久化与统计
 │   ├── utils/               # 法律分块、Parent/Child 分块和元数据工具
 │   ├── config.py            # 环境变量与默认配置
 │   └── main.py              # FastAPI 应用入口
@@ -1106,6 +1108,9 @@ backend/
 | `POST` | `/api/performance/bench` | 执行性能或质量测试 |
 | `POST` | `/api/performance/report` | 生成并保存测试报告 |
 | `GET` | `/api/performance/reports` | 查询历史报告 |
+| `GET` | `/api/traces/{trace_id}` | 查询一条 Trace 及其完整 Span 调用链 |
+| `GET` | `/api/traces` | 查询最近的 Trace 摘要 |
+| `GET` | `/api/traces/stats/summary` | 查询端到端 P95、Token 总量和节点耗时统计 |
 
 带长期记忆授权的问答请求示例：
 
@@ -1133,6 +1138,14 @@ backend/
 - **性能监控**：查看 CPU/内存，执行基准测试，展示延迟分解和质量指标，导出历史报告。
 
 Vite 开发服务器默认运行在 `http://127.0.0.1:5173`，并将 `/api` 请求代理到后端 `8000` 端口。
+
+### 5.4 Trace 链路追踪
+
+每次问答创建一个独立 `trace_id`，LangGraph 节点通过统一的 `@trace_node` 装饰器生成节点 Span；LLM、BM25、Dense、Reranker、MCP 和具体工具调用作为子 Span，通过 `span_id` 与 `parent_span_id` 组成调用链。循环补充检索和生成重试会生成新的同名 Span，并以执行顺序区分，不修改 Agent State 或业务分支。
+
+`rag_traces` 保存端到端状态、耗时和 Token 总量，`rag_spans` 保存节点/操作耗时、错误摘要及 `chunk_id`、`parent_id`、法条 ID 等证据标识，差异字段统一放在 `metadata` JSON。采集器不保存问题、Prompt、回答、工具正文、用户 ID 或 API Key；采集与异步批量落库失败均不会中断问答。端到端 P95 直接基于 Trace 计算，总 Token 只累计携带用量的 LLM/Reranker 叶子 Span，避免嵌套 Span 重复统计。
+
+`POST /api/chat` 会直接返回本轮 `trace_id` 与 Trace 快照，前端问答卡片中的 Trace 折叠面板按层级展示调用链、耗时、Token、错误和证据 ID；持久化后的历史链路与聚合统计可通过上述只读接口查询。
 
 ---
 
@@ -1307,6 +1320,7 @@ npm run dev
 | `test_parent_child_storage.py` | 稳定父子 ID、MySQL 回查、Child 权威正文、Child 精排与 Parent 聚合 |
 | `test_agentic_rag.py` | LangGraph 节点顺序、LLM 工具决策、强制检索策略、证据评估和 Grounding 校验 |
 | `test_external_mcp.py` | MCP 工具注册、底层参数映射、查询脱敏、结果上限和官方域名白名单 |
+| `test_tracing.py` | 同步/异步节点装饰器、父子 Span、异常、Token 去重、敏感字段脱敏、SQLite 持久化与统计 |
 
 ```powershell
 cd backend
