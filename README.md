@@ -48,17 +48,25 @@ LawRAG 是一个面向中国法律咨询场景的检索增强生成（Retrieval-
    - [5.1 后端分层](#51-后端分层)
    - [5.2 主要 API](#52-主要-api)
    - [5.3 前端页面](#53-前端页面)
-   - [5.4 Trace 链路追踪](#54-trace-链路追踪)
-6. [环境配置与项目运行](#6-环境配置与项目运行)
-   - [6.1 环境要求](#61-环境要求)
-   - [6.2 安装后端](#62-安装后端)
-   - [6.3 安装并启动法律 MCP](#63-安装并启动法律-mcp)
-   - [6.4 准备数据与建立索引](#64-准备数据与建立索引)
-   - [6.5 启动后端和前端](#65-启动后端和前端)
-7. [测试评测与质量保障](#7-测试评测与质量保障)
-   - [7.1 单元测试](#71-单元测试)
-   - [7.2 RAG 核心评测](#72-rag-核心评测)
-   - [7.3 工程质量设计](#73-工程质量设计)
+6. [Trace 链路追踪设计](#6-trace-链路追踪设计)
+   - [6.1 设计目标与总体架构](#61-设计目标与总体架构)
+   - [6.2 Trace 与 Span 数据模型](#62-trace-与-span-数据模型)
+   - [6.3 采集生命周期与父子关系](#63-采集生命周期与父子关系)
+   - [6.4 节点装饰器与关键操作埋点](#64-节点装饰器与关键操作埋点)
+   - [6.5 非阻塞批量持久化](#65-非阻塞批量持久化)
+   - [6.6 统计口径与查询接口](#66-统计口径与查询接口)
+   - [6.7 前端 Trace 面板](#67-前端-trace-面板)
+   - [6.8 隐私与故障隔离](#68-隐私与故障隔离)
+7. [环境配置与项目运行](#7-环境配置与项目运行)
+   - [7.1 环境要求](#71-环境要求)
+   - [7.2 安装后端](#72-安装后端)
+   - [7.3 安装并启动法律 MCP](#73-安装并启动法律-mcp)
+   - [7.4 准备数据与建立索引](#74-准备数据与建立索引)
+   - [7.5 启动后端和前端](#75-启动后端和前端)
+8. [测试评测与质量保障](#8-测试评测与质量保障)
+   - [8.1 单元测试](#81-单元测试)
+   - [8.2 RAG 核心评测](#82-rag-核心评测)
+   - [8.3 工程质量设计](#83-工程质量设计)
 
 ---
 
@@ -1139,21 +1147,305 @@ backend/
 
 Vite 开发服务器默认运行在 `http://127.0.0.1:5173`，并将 `/api` 请求代理到后端 `8000` 端口。
 
-### 5.4 Trace 链路追踪
+---
 
-每次问答创建一个独立 `trace_id`，LangGraph 节点通过统一的 `@trace_node` 装饰器生成节点 Span；LLM、BM25、Dense、Reranker、MCP 和具体工具调用作为子 Span，通过 `span_id` 与 `parent_span_id` 组成调用链。循环补充检索和生成重试会生成新的同名 Span，并以执行顺序区分，不修改 Agent State 或业务分支。
+## 6. Trace 链路追踪设计
 
-`rag_traces` 保存端到端状态、耗时和 Token 总量，`rag_spans` 保存节点/操作耗时、错误摘要及 `chunk_id`、`parent_id`、法条 ID 等证据标识，差异字段统一放在 `metadata` JSON。采集器不保存问题、Prompt、回答、工具正文、用户 ID 或 API Key；采集与异步批量落库失败均不会中断问答。端到端 P95 直接基于 Trace 计算，总 Token 只累计携带用量的 LLM/Reranker 叶子 Span，避免嵌套 Span 重复统计。
+**本章使用的核心技术**：Python `contextvars`、装饰器、上下文管理器、SQLAlchemy、`asyncio.to_thread`、FastAPI 与 React。系统采用轻量级 **Trace + Span 两层模型**，对一次 Agentic RAG 问答进行端到端观测，不引入额外的分布式追踪平台，也不改变 LangGraph State 和节点路由。
 
-`POST /api/chat` 会直接返回本轮 `trace_id` 与 Trace 快照，前端问答卡片中的 Trace 折叠面板按层级展示调用链、耗时、Token、错误和证据 ID；持久化后的历史链路与聚合统计可通过上述只读接口查询。
+### 6.1 设计目标与总体架构
+
+Trace 系统回答四个核心问题：一次问答是否成功、整体耗时多少、Token 消耗在哪里、哪一步使用了哪些证据。每次调用 `POST /api/chat` 创建一个 Trace；LangGraph 节点、工具以及节点内部的模型与检索操作分别形成 Span。
+
+```mermaid
+flowchart TD
+    A[POST /api/chat] --> B[创建 TraceCollector]
+    B --> C[激活 ContextVar Trace 上下文]
+    C --> D[执行 LangGraph]
+
+    D --> N1[节点 Span: prepare]
+    D --> N2[节点 Span: decide_tools]
+    D --> N3[节点 Span: execute_tools]
+    D --> N4[节点 Span: grade_evidence]
+    D --> N5[节点 Span: generate]
+    D --> N6[节点 Span: verify_grounding]
+
+    N2 --> L1[LLM Span: tool_router]
+    N3 --> T1[Tool Span]
+    T1 --> B1[BM25 Span]
+    T1 --> V1[Dense Span]
+    T1 --> R1[Reranker Span]
+    T1 --> M1[MCP Span]
+    N5 --> L2[LLM Span: generate]
+
+    D --> E[结束 Trace 并生成快照]
+    E --> F[ChatResponse 返回 trace_id 与快照]
+    E --> Q[后台批量持久化]
+    Q --> DB[(MySQL rag_traces + rag_spans)]
+```
+
+两层模型的职责如下：
+
+| 层级 | 粒度 | 主要内容 |
+|---|---|---|
+| Trace | 一次完整问答 | 端到端耗时、总体状态、Input/Output/Total Token、错误摘要 |
+| Span | 一个节点或关键操作 | 节点/工具名称、父子关系、局部耗时、状态、Token、证据 ID 与扩展 metadata |
+
+业务侧已有的 `agent_trace` 用于解释 Agent 经过了哪些业务节点；本章的 Trace 用于性能、错误和资源消耗观测。二者职责不同，互不替代。
+
+### 6.2 Trace 与 Span 数据模型
+
+MySQL 使用 `rag_traces` 和 `rag_spans` 两张表。`TraceRepository` 首次使用时检查并创建表结构。
+
+```mermaid
+erDiagram
+    RAG_TRACES ||--o{ RAG_SPANS : contains
+    RAG_TRACES {
+        string trace_id PK
+        string status
+        datetime started_at
+        datetime ended_at
+        float duration_ms
+        int input_tokens
+        int output_tokens
+        int total_tokens
+        string error_summary
+        json metadata
+    }
+    RAG_SPANS {
+        string span_id PK
+        string trace_id FK
+        string parent_span_id
+        string name
+        string kind
+        int sequence
+        string status
+        datetime started_at
+        datetime ended_at
+        float duration_ms
+        int input_tokens
+        int output_tokens
+        int total_tokens
+        string error_summary
+        json metadata
+    }
+```
+
+`kind` 用于区分 `node`、`tool`、`llm`、`bm25`、`dense`、`reranker`、`reranker_request` 和 `mcp`。不同操作的差异字段统一写入 `metadata`：
+
+| Span 类型 | metadata 示例 |
+|---|---|
+| LangGraph 节点 | `tool_rounds`、`retrieval_rounds`、`generation_rounds` |
+| BM25 / Dense | `collection`、`top_k`、`result_count`、`chunk_ids` |
+| Reranker | `strategy`、`candidate_count`、`fallback`、`parent_ids` |
+| Agent Tool | `tool_name`、`collection`、`top_k`、证据 ID |
+| MCP | `server`、`tool_name`、`result_is_error` |
+| LLM | 模型操作名称及 Input/Output Token，不保存 Prompt 和回答正文 |
+
+### 6.3 采集生命周期与父子关系
+
+问答入口在执行状态图前创建 `TraceCollector`，并通过 `activate_trace` 将 Collector 写入请求级 `ContextVar`。异步任务和 `asyncio.to_thread` 可以继承当前上下文，因此节点和底层服务不需要逐层传递 `trace_id`。
+
+核心入口位于 `backend/app/agentic/runtime.py`：
+
+```python
+collector = TraceCollector(metadata={"architecture": "agentic_rag"})
+try:
+    with activate_trace(collector):
+        response = await self._run_impl(...)
+except BaseException as exc:
+    snapshot = collector.finish(exc)
+    trace_persistence.enqueue(snapshot)
+    raise
+
+snapshot = collector.finish()
+trace_persistence.enqueue(snapshot)
+response.trace_id = collector.trace_id
+response.trace = snapshot
+```
+
+创建 Span 时自动读取当前父 Span：
+
+```python
+span = {
+    "span_id": uuid4().hex,
+    "trace_id": collector.trace_id,
+    "parent_span_id": _span_var.get(),
+    "sequence": len(spans) + 1,
+    "status": "running",
+}
+```
+
+进入节点 Span 后，当前 `span_id` 会暂时写入另一个 `ContextVar`。节点内部创建的 LLM、检索、重排和工具 Span 自动指向该节点。Span 结束时恢复原父级，从而形成稳定的调用树。
+
+LangGraph 的 Query Rewrite、补充检索和答案修正会重复经过同一节点。每次执行都创建新的 `span_id` 和递增的 `sequence`，因此同名 Span 可以完整表示循环。云端 Reranker 的每次 HTTP 重试同样创建独立的 `reranker.http` Span，并在 metadata 中记录 `attempt`。
+
+### 6.4 节点装饰器与关键操作埋点
+
+#### 6.4.1 `@trace_node` 节点装饰器
+
+所有 LangGraph 节点统一使用 `@trace_node`，装饰器通过 `inspect.iscoroutinefunction` 同时兼容同步和异步函数：
+
+```python
+def trace_node(name: str | None = None):
+    def decorate(func):
+        span_name = name or func.__name__.lstrip("_")
+
+        if inspect.iscoroutinefunction(func):
+            @wraps(func)
+            async def async_wrapper(*args, **kwargs):
+                with trace_span(span_name, "node", _node_metadata(args, kwargs)):
+                    return await func(*args, **kwargs)
+            return async_wrapper
+
+        @wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            with trace_span(span_name, "node", _node_metadata(args, kwargs)):
+                return func(*args, **kwargs)
+        return sync_wrapper
+    return decorate
+```
+
+节点业务代码只增加一行声明：
+
+```python
+@trace_node("grade_evidence")
+async def _grade_evidence(self, state: AgenticRAGState) -> dict:
+    ...
+```
+
+装饰器自动记录开始时间、结束时间、耗时和异常摘要，并从 State 中提取轮次计数，不读取问题、回答或消息正文。
+
+#### 6.4.2 LLM Span 与 Token
+
+LLM 调用统一通过 `traced_ainvoke` 包装。该函数读取 LangChain `AIMessage.usage_metadata`，并兼容供应商响应中的 `response_metadata.token_usage`：
+
+```python
+async def traced_ainvoke(name, runnable, value, *, metadata=None):
+    with trace_span(name, "llm", metadata) as span:
+        response = await runnable.ainvoke(value)
+        span.response_tokens(response)
+        return response
+```
+
+系统已覆盖 Skill Router、Tool Router、证据充分性评估、Query Rewrite、答案生成、忠实度校验、历史摘要、记忆提取和自我修正等模型调用。
+
+#### 6.4.3 检索、重排、工具与 MCP Span
+
+关键操作使用同一个 `trace_span` 上下文管理器：
+
+```python
+with trace_span("dense.search", "dense", {
+    "collection": collection_name,
+    "top_k": top_k,
+}) as span:
+    documents = vectorstore.similarity_search(query, k=top_k)
+    span.metadata(**evidence_metadata(documents))
+```
+
+`evidence_metadata` 只提取可追溯标识：
+
+```json
+{
+  "result_count": 3,
+  "chunk_ids": ["child-001", "child-002"],
+  "parent_ids": ["parent-001"],
+  "law_ids": ["第二百六十四条"]
+}
+```
+
+Agent 工具 Span 包含一次完整工具执行；其内部可以继续嵌套 BM25、Dense、Reranker 或 MCP Span。例如本地法律检索的调用链为：
+
+```text
+execute_tools
+└── tool.retrieve_legal_evidence
+    ├── bm25.search
+    ├── dense.search [laws]
+    ├── dense.search [cases]
+    └── reranker
+```
+
+### 6.5 非阻塞批量持久化
+
+问答完成后，Trace 快照先随 `ChatResponse` 返回前端，同时加入后台持久化队列。持久化服务设置一个短合并窗口，将并发完成的多个 Trace 合并后交给工作线程：
+
+```python
+def enqueue(self, snapshot: dict) -> None:
+    self._pending.append(snapshot)
+    if self._worker is None or self._worker.done():
+        self._worker = asyncio.get_running_loop().create_task(self._drain())
+
+async def _drain(self) -> None:
+    await asyncio.sleep(0.05)
+    while self._pending:
+        batch, self._pending = self._pending, []
+        await asyncio.to_thread(
+            self.repository_factory().save_many,
+            batch,
+        )
+```
+
+`save_many` 在一个数据库事务中写入一批 Trace 及其全部 Span。请求协程不等待 MySQL 写入，因此 Trace 存储延迟不会进入用户感知的问答耗时。
+
+### 6.6 统计口径与查询接口
+
+系统提供三类统计：
+
+- **端到端 P95 Latency**：取最近 N 条 `rag_traces.duration_ms`，升序排列后选择第 95 百分位；不累加 Span 耗时。
+- **Token 总量**：每个模型或 Reranker 叶子 Span 记录自己的 Token，Trace 汇总这些叶子值；节点和工具父 Span 的 Token 保持为 0。
+- **节点耗时**：只筛选 `kind=node` 的 Span，按节点名称计算执行次数、平均耗时、P95 耗时和错误次数。
+
+例如 `generate` 节点耗时已经包含内部 `llm.generate`，因此它只用于节点维度分析，不再计入端到端耗时求和；一次请求的整体耗时始终以 Trace 为准。
+
+| 方法 | 接口 | 返回内容 |
+|---|---|---|
+| `GET` | `/api/traces/{trace_id}` | Trace 基本信息和按 `sequence` 排序的完整 Span |
+| `GET` | `/api/traces?limit=50` | 最近的 Trace 摘要 |
+| `GET` | `/api/traces/stats/summary?limit=500` | Trace 数量、错误数、端到端 P95、Token 总量和节点统计 |
+
+`POST /api/chat` 同时返回 `trace_id` 和本轮 `trace` 快照，因此前端无需等待后台落库即可展示当前调用链。
+
+### 6.7 前端 Trace 面板
+
+React 问答卡片包含独立的可折叠 Trace 面板。面板根据 `parent_span_id` 计算缩进层级，并按 `sequence` 展示：
+
+- Trace ID、端到端耗时和总 Token；
+- 节点、工具与底层操作的父子调用关系；
+- 每个 Span 的类型、耗时、状态和 Token；
+- 错误 Span 的错误摘要；
+- 检索与重排涉及的 Child Chunk、Parent Chunk 和法条 ID。
+
+面板保持与回答、来源卡片和业务 `Agent Trace` 分离，定位性能问题时查看 Trace，理解 Agent 决策过程时查看 Agent Trace。
+
+### 6.8 隐私与故障隔离
+
+采集层使用字段白名单和统一 JSON 清洗规则：
+
+- 不记录用户问题、Prompt、回答正文、工具返回正文和用户 ID；
+- `api_key`、`authorization`、`token`、`password`、`secret` 等字段统一替换为 `[REDACTED]`；
+- 错误摘要限制长度，并对 Bearer Token 和 `sk-` 格式密钥二次脱敏；
+- metadata 中只保留模型统计、工具名称、集合名称、轮次、数量和证据 ID；
+- Collector、Span 更新和后台落库均采用故障隔离，Trace 采集异常不会改变节点返回值、图路由或最终答案。
+
+核心实现文件如下：
+
+| 文件 | 职责 |
+|---|---|
+| `backend/app/tracing/core.py` | Collector、ContextVar、Span、装饰器、Token 与证据元数据采集 |
+| `backend/app/tracing/persistence.py` | 非阻塞队列、批量合并与工作线程持久化 |
+| `backend/app/tracing/repository.py` | MySQL 写入、Trace 查询、P95 与节点统计 |
+| `backend/app/db/models.py` | `rag_traces`、`rag_spans` SQLAlchemy 模型 |
+| `backend/app/api/traces.py` | Trace 历史、详情与聚合统计接口 |
+| `frontend/src/pages/ChatPage.jsx` | Trace 调用树面板 |
+| `backend/tests/test_tracing.py` | 父子链路、同步/异步节点、异常、脱敏、批量持久化和统计测试 |
 
 ---
 
-## 6. 环境配置与项目运行
+## 7. 环境配置与项目运行
 
 **本章使用的核心技术**：Python `venv`、pip、Node.js、npm、Uvicorn、Vite、`pydantic-settings` 和环境变量。模型密钥与代码分离，后端与前端分别运行并通过开发代理通信。
 
-### 6.1 环境要求
+### 7.1 环境要求
 
 - Python 3.10 或更高版本；
 - Node.js 18 或更高版本；
@@ -1163,7 +1455,7 @@ Vite 开发服务器默认运行在 `http://127.0.0.1:5173`，并将 `/api` 请�
 
 模型层使用 `qwen-turbo`、`text-embedding-v3`、`qwen3.7-text-rerank` 和 DashScope API。
 
-### 6.2 安装后端
+### 7.2 安装后端
 
 ```powershell
 cd "D:\LLM study\LawRAG\LawRAG\backend"
@@ -1237,7 +1529,7 @@ PARENT_TOP_K=5
 
 复制 `backend/.env.example` 为 `backend/.env` 并填写环境变量。真实密钥仅保存在 `.env`，该文件已被 Git 忽略。云端 Reranker 使用带业务空间 ID 的独立文本排序 Endpoint，Chat 和 Embedding 使用 OpenAI 兼容地址。`TAVILY_API_KEY` 留空时，Tavily 的两个工具不会注册到 LLM 工具池，也不会产生 Tavily 调用。
 
-### 6.3 安装并启动法律 MCP
+### 7.3 安装并启动法律 MCP
 
 项目通过官方 MCP Python SDK 连接 Streamable HTTP 服务。安装脚本把社区法律 MCP 下载到已忽略的 `backend/external/`，不会把第三方源码提交到本项目：
 
@@ -1259,7 +1551,7 @@ python -m scripts.check_mcp_servers
 
 LawRAG 不暴露下载、导出、登录、全站爬取等 MCP 原始工具。适配层限制结果数，对查询中的手机号和身份证号进行脱敏，并拒绝 Tavily 提取白名单以外的 URL。服务启动只完成工具注册，不访问任何外部 MCP；实际调用只发生在 Tool Router 选择对应工具之后。
 
-### 6.4 准备数据与建立索引
+### 7.4 准备数据与建立索引
 
 ```powershell
 cd "D:\LLM study\LawRAG\LawRAG\backend"
@@ -1271,7 +1563,7 @@ python -m scripts.import_data
 
 `init_mysql` 创建 Documents、Parent Chunks、Child Chunks 和 `memory_entries` 表，并为已有记忆表补充 `importance`、`half_life_days`、`forgotten_at` 生命周期字段，全程不调用模型。`prepare_datasets` 完成本地格式转换；`import_data` 先把原文及父子块写入 MySQL，再批量调用 `text-embedding-v3` 生成 Child 向量并写入 ChromaDB。长期记忆 Collection 在首次授权读写时按需创建，与知识库索引相互独立。旧版 ChromaDB 记录不含稳定 Child ID，升级后需要重新执行一次 `import_data`。
 
-### 6.5 启动后端和前端
+### 7.5 启动后端和前端
 
 后端：
 
@@ -1299,11 +1591,11 @@ npm run dev
 
 ---
 
-## 7. 测试、评测与质量保障
+## 8. 测试、评测与质量保障
 
 **本章使用的核心技术**：pytest、人工相关文档标注、排名指标、LLM-as-a-Judge、psutil 和 JSON 报告。测试负责验证确定性代码，评测从检索、生成和端到端延迟三个层面衡量 RAG 系统。
 
-### 7.1 单元测试
+### 8.1 单元测试
 
 项目使用离线单元测试覆盖管线基础能力与 RAG 指标计算：
 
@@ -1330,7 +1622,7 @@ pytest tests -v
 
 测试套件将模型和网络依赖替换为可控 Mock。云端重排测试通过 `httpx.MockTransport` 验证请求、响应、排序映射与降级逻辑，形成稳定的离线回归环境。
 
-### 7.2 RAG 核心评测
+### 8.2 RAG 核心评测
 
 项目将评测指标收敛为四项核心指标：
 
@@ -1350,7 +1642,7 @@ python -m scripts.run_quality_eval
 
 `run_integration_test` 使用 40 个问题验证多种策略组合；`run_quality_eval` 读取标准评测集，统一输出四项核心指标并将完整结果保存到 `backend/data/reports/rag_eval_results.json`。其中 Recall@5、MRR@10 和 P95 Latency 不需要额外 Judge 调用，Faithfulness 在显式运行完整评测时调用 LLM Judge。
 
-### 7.3 工程质量设计
+### 8.3 工程质量设计
 
 项目通过以下机制保证管线稳定性和结果可分析性：
 
