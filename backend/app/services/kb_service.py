@@ -30,6 +30,8 @@ def _detect_doc_type(filepath: str) -> str:
     path_lower = filepath.lower()
     if "case" in path_lower or "案例" in path_lower:
         return "case"
+    if "crimekg" in path_lower or "犯罪知识" in path_lower or "罪名知识" in path_lower:
+        return "crime"
     return "law"
 
 
@@ -65,7 +67,7 @@ def get_kb_stats() -> KnowledgeStats:
     stats = KnowledgeStats()
     try:
         counts = get_parent_child_repository().child_counts_by_doc_type()
-        stats.laws_chunks = counts.get("law", 0)
+        stats.laws_chunks = counts.get("law", 0) + counts.get("crime", 0)
         stats.cases_chunks = counts.get("case", 0)
         stats.total_chunks = stats.laws_chunks + stats.cases_chunks
         if stats.laws_chunks:
@@ -131,9 +133,10 @@ def list_documents() -> list[KnowledgeFileInfo]:
     ]:
         for fpath in _collect_files(dir_path, exts):
             fname = os.path.relpath(fpath, dir_path)
+            actual_type = _detect_doc_type(fpath) if dir_path == settings.LAWS_DIR else dtype
             files.append(KnowledgeFileInfo(
                 filename=fname,
-                doc_type=dtype,
+                doc_type=actual_type,
                 size_bytes=os.path.getsize(fpath),
             ))
     return files

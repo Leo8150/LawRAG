@@ -17,6 +17,22 @@ def test_config_loads():
     assert settings.DEFAULT_QUERY_TRANSFORM == "none"
     assert settings.DEFAULT_RERANK == "simple"
     assert settings.DEFAULT_GENERATION == "standard"
+    assert settings.CHUNKER_VERSION == "parent-child-v2-typed"
+    assert (
+        settings.LAW_PARENT_CHUNK_SIZE,
+        settings.LAW_CHILD_CHUNK_SIZE,
+        settings.LAW_CHILD_CHUNK_OVERLAP,
+    ) == (1024, 320, 64)
+    assert (
+        settings.CASE_PARENT_CHUNK_SIZE,
+        settings.CASE_CHILD_CHUNK_SIZE,
+        settings.CASE_CHILD_CHUNK_OVERLAP,
+    ) == (2048, 512, 96)
+    assert (
+        settings.CRIME_PARENT_CHUNK_SIZE,
+        settings.CRIME_CHILD_CHUNK_SIZE,
+        settings.CRIME_CHILD_CHUNK_OVERLAP,
+    ) == (768, 256, 48)
 
 
 def test_legal_chunker_law():

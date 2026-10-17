@@ -80,7 +80,7 @@ class HybridRetriever(BaseRetriever):
         """Load authoritative child text from MySQL for the sparse index."""
         doc_types = []
         if settings.LAWS_COLLECTION in self.collection_names:
-            doc_types.append("law")
+            doc_types.extend(["law", "crime"])
         if settings.CASES_COLLECTION in self.collection_names:
             doc_types.append("case")
         all_docs = self.repository.list_children(doc_types)  # type: ignore[union-attr]

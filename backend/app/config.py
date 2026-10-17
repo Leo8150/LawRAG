@@ -42,9 +42,16 @@ class Settings(BaseSettings):
     # --- MySQL 原文库（唯一事实来源）---
     MYSQL_URL: str = "mysql+pymysql://root:password@127.0.0.1:3306/lawrag?charset=utf8mb4"
     MYSQL_ECHO: bool = False
-    CHUNKER_VERSION: str = "parent-child-v1"
-    CHILD_CHUNK_SIZE: int = 320
-    CHILD_CHUNK_OVERLAP: int = 64
+    CHUNKER_VERSION: str = "parent-child-v2-typed"
+    LAW_PARENT_CHUNK_SIZE: int = 1024
+    LAW_CHILD_CHUNK_SIZE: int = 320
+    LAW_CHILD_CHUNK_OVERLAP: int = 64
+    CASE_PARENT_CHUNK_SIZE: int = 2048
+    CASE_CHILD_CHUNK_SIZE: int = 512
+    CASE_CHILD_CHUNK_OVERLAP: int = 96
+    CRIME_PARENT_CHUNK_SIZE: int = 768
+    CRIME_CHILD_CHUNK_SIZE: int = 256
+    CRIME_CHILD_CHUNK_OVERLAP: int = 48
     CHILD_RERANK_TOP_K: int = 15
     PARENT_TOP_K: int = 5
     PARENT_HIT_BONUS: float = 0.02

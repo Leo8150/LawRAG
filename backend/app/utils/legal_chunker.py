@@ -11,6 +11,8 @@ import re
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
+from app.config import settings
+
 
 # ===================== 法律条文分块器 =====================
 
@@ -141,12 +143,23 @@ def extract_case_metadata(text: str, filename: str = "") -> dict:
     return metadata
 
 
+def extract_crime_metadata(text: str, filename: str = "") -> dict:
+    """Extract the first CrimeKG entry metadata for document-level display."""
+    match = re.search(r"(?:^|\n)(?:=+)?【([^】]+)】(?:（([^）]+)）)?", text)
+    return {
+        "doc_type": "crime",
+        "source_file": filename,
+        "crime_name": match.group(1).strip() if match else "",
+        "crime_category": match.group(2).strip() if match and match.group(2) else "",
+    }
+
+
 def enrich_chunk_metadata(chunk: Document, parent_metadata: dict, chunk_index: int) -> Document:
     """为分块添加详细的元数据"""
     text = chunk.page_content
 
     # 合并父文档元数据
-    enriched = {**parent_metadata}
+    enriched = {**parent_metadata, **chunk.metadata}
     enriched["chunk_index"] = chunk_index
 
     # 提取当前 chunk 所属的章节
@@ -208,11 +221,178 @@ def add_contextual_header(chunk: Document, parent_metadata: dict) -> Document:
     if section_type:
         parts.append(f"段落: {section_type}")
 
+    crime_name = parent_metadata.get("crime_name", "")
+    if crime_name:
+        parts.append(f"罪名: {crime_name}")
+
+    knowledge_type = chunk.metadata.get("knowledge_type", "")
+    if knowledge_type:
+        parts.append(f"知识类型: {knowledge_type}")
+
     if parts:
         header = "[" + " | ".join(parts) + "]\n"
         chunk.page_content = header + chunk.page_content
 
     return chunk
+
+
+# ===================== Parent 结构切分 =====================
+
+_LAW_ARTICLE_START = re.compile(
+    r"(?m)^(?:《[^》\n]+》)?\s*第[一二三四五六七八九十百千万零〇两\d]+条(?:之一|之二|之三)?(?:规定)?"
+)
+_LAW_DIVISION = re.compile(r"第[一二三四五六七八九十百千万零〇两\d]+编[^\n]*")
+_LAW_CHAPTER = re.compile(r"第[一二三四五六七八九十百千万零〇两\d]+章[^\n]*")
+_LAW_SECTION = re.compile(r"第[一二三四五六七八九十百千万零〇两\d]+节[^\n]*")
+_CASE_SECTION_START = re.compile(
+    r"(?m)^\s*(裁判要旨|裁判要点|基本案情|案情简介|案件事实|裁判结果|判决结果|裁判理由|裁判说理|法院认为|关键词|相关法条)\s*[：:]?\s*$"
+)
+_CRIME_ENTRY_START = re.compile(r"(?m)^(?:=+)?【([^】]+)】(?:（([^）]+)）)?\s*$")
+_CRIME_SECTION_START = re.compile(
+    r"(?m)^\s*(概念与定义|犯罪构成特征|认定与区分|量刑处罚|相关法条|司法解释)\s*：\s*$"
+)
+
+
+def _soft_split(text: str, chunk_size: int, separators: list[str]) -> list[str]:
+    """Apply a character soft limit only after a semantic unit is identified."""
+    value = text.strip()
+    if not value:
+        return []
+    if len(value) <= chunk_size:
+        return [value]
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=0,
+        separators=separators,
+        is_separator_regex=True,
+        keep_separator=True,
+    )
+    return [part.strip() for part in splitter.split_text(value) if part.strip()]
+
+
+def _law_parent_documents(text: str, filename: str, chunk_size: int) -> list[Document]:
+    base = extract_law_metadata(text, filename)
+    matches = list(_LAW_ARTICLE_START.finditer(text))
+    if not matches:
+        parts = _soft_split(
+            text,
+            chunk_size,
+            ["\n\n", "\n", "。", "；", "，", ""],
+        )
+        return [Document(page_content=part, metadata=dict(base)) for part in parts]
+
+    documents: list[Document] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        article_text = text[match.start():end].strip()
+        metadata = dict(base)
+        article = re.search(r"第([一二三四五六七八九十百千万零〇两\d]+)条(?:之一|之二|之三)?", match.group(0))
+        if article:
+            metadata["article_number"] = article.group(1)
+        divisions = list(_LAW_DIVISION.finditer(text, 0, match.start()))
+        chapters = list(_LAW_CHAPTER.finditer(text, 0, match.start()))
+        sections = list(_LAW_SECTION.finditer(text, 0, match.start()))
+        if divisions:
+            metadata["division"] = divisions[-1].group(0).strip()
+        if chapters:
+            metadata["chapter"] = chapters[-1].group(0).strip()
+        if sections:
+            metadata["section"] = sections[-1].group(0).strip()
+        for part in _soft_split(
+            article_text,
+            chunk_size,
+            [
+                r"\n[一二三四五六七八九十百]+、",
+                r"\n（[一二三四五六七八九十百]+）",
+                r"\n\(\d+\)",
+                "\n\n",
+                "。",
+                "；",
+                "，",
+                "",
+            ],
+        ):
+            documents.append(Document(page_content=part, metadata=dict(metadata)))
+    return documents
+
+
+def _case_parent_documents(text: str, filename: str, chunk_size: int) -> list[Document]:
+    base = extract_case_metadata(text, filename)
+    matches = list(_CASE_SECTION_START.finditer(text))
+    sections: list[tuple[str, str]] = []
+    if matches:
+        prefix = text[:matches[0].start()].strip()
+        if prefix:
+            sections.append(("案例信息", prefix))
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            section_name = match.group(1)
+            normalized = {
+                "裁判要点": "裁判要旨",
+                "案情简介": "基本案情",
+                "案件事实": "基本案情",
+                "判决结果": "裁判结果",
+                "裁判说理": "裁判理由",
+                "法院认为": "裁判理由",
+            }.get(section_name, section_name)
+            sections.append((normalized, text[match.start():end].strip()))
+    else:
+        sections.append(("案件事实", text))
+
+    documents: list[Document] = []
+    for section_type, section_text in sections:
+        metadata = {**base, "section_type": section_type}
+        for part in _soft_split(
+            section_text,
+            chunk_size,
+            ["\n\n", "\n", "。", "；", "，", ""],
+        ):
+            documents.append(Document(page_content=part, metadata=dict(metadata)))
+    return documents
+
+
+def _crime_parent_documents(text: str, filename: str, chunk_size: int) -> list[Document]:
+    entries = list(_CRIME_ENTRY_START.finditer(text))
+    if not entries:
+        base = extract_crime_metadata(text, filename)
+        return [
+            Document(page_content=part, metadata=dict(base))
+            for part in _soft_split(text, chunk_size, ["\n\n", "\n", "。", "；", "，", ""])
+        ]
+
+    documents: list[Document] = []
+    for entry_index, entry in enumerate(entries):
+        entry_end = entries[entry_index + 1].start() if entry_index + 1 < len(entries) else len(text)
+        crime_name = entry.group(1).strip()
+        crime_category = (entry.group(2) or "").strip()
+        entry_text = text[entry.end():entry_end]
+        sections = list(_CRIME_SECTION_START.finditer(entry_text))
+        if not sections:
+            sections_and_text = [("罪名知识", entry_text)]
+        else:
+            sections_and_text = []
+            for section_index, section in enumerate(sections):
+                section_end = sections[section_index + 1].start() if section_index + 1 < len(sections) else len(entry_text)
+                sections_and_text.append((
+                    section.group(1),
+                    entry_text[section.start():section_end].strip(),
+                ))
+        for knowledge_type, section_text in sections_and_text:
+            metadata = {
+                "doc_type": "crime",
+                "source_file": filename,
+                "crime_name": crime_name,
+                "crime_category": crime_category,
+                "knowledge_type": knowledge_type,
+                "section_type": knowledge_type,
+            }
+            for part in _soft_split(
+                section_text,
+                chunk_size,
+                ["\n\n", "\n", "。", "；", "，", ""],
+            ):
+                documents.append(Document(page_content=part, metadata=dict(metadata)))
+    return documents
 
 
 # ===================== 统一处理入口 =====================
@@ -221,15 +401,15 @@ def split_legal_document(
     text: str,
     doc_type: str = "law",
     filename: str = "",
-    chunk_size: int = 512,
-    chunk_overlap: int = 64,
+    chunk_size: int | None = None,
+    chunk_overlap: int = 0,
 ) -> list[Document]:
     """
     统一的法律文档分块入口
 
     Args:
         text: 文档全文
-        doc_type: 文档类型 "law" | "case"
+        doc_type: 文档类型 "law" | "case" | "crime"
         filename: 源文件名
         chunk_size: 分块大小
         chunk_overlap: 分块重叠
@@ -237,16 +417,19 @@ def split_legal_document(
     Returns:
         带有丰富元数据的 Document 列表
     """
-    # 选择分块器
+    del chunk_overlap  # Parent 之间不重叠；重叠仅用于 Parent 内的 Child。
     if doc_type == "case":
-        splitter = LegalCaseSplitter(chunk_size=chunk_size * 2, chunk_overlap=chunk_overlap * 2)
+        parent_size = chunk_size or settings.CASE_PARENT_CHUNK_SIZE
+        chunks = _case_parent_documents(text, filename, parent_size)
         parent_metadata = extract_case_metadata(text, filename)
+    elif doc_type == "crime":
+        parent_size = chunk_size or settings.CRIME_PARENT_CHUNK_SIZE
+        chunks = _crime_parent_documents(text, filename, parent_size)
+        parent_metadata = extract_crime_metadata(text, filename)
     else:
-        splitter = LegalArticleSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        parent_size = chunk_size or settings.LAW_PARENT_CHUNK_SIZE
+        chunks = _law_parent_documents(text, filename, parent_size)
         parent_metadata = extract_law_metadata(text, filename)
-
-    # 分块
-    chunks = splitter.create_documents([text])
 
     # 元数据增强
     enriched_chunks = []
@@ -255,9 +438,8 @@ def split_legal_document(
         enriched_chunks.append(enriched)
 
     # 可选：注入上下文标头
-    from app.config import settings
     if settings.CONTEXTUAL_CHUNKING:
         for chunk in enriched_chunks:
-            add_contextual_header(chunk, parent_metadata)
+            add_contextual_header(chunk, chunk.metadata)
 
     return enriched_chunks

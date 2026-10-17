@@ -24,7 +24,7 @@ LawRAG 是一个面向中国法律咨询场景的检索增强生成（Retrieval-
      - [3.1.4 CAIL2018：刑事案例](#314-cail2018刑事案例)
      - [3.1.5 CAIL2019 与 RAG 评测标注](#315-cail2019-与-rag-评测标注)
    - [3.2 数据预处理](#32-数据预处理)
-   - [3.3 法律结构化分块](#33-法律结构化分块)
+   - [3.3 差异化 Parent-Child 结构化分块](#33-差异化-parent-child-结构化分块)
    - [3.4 上下文标头注入](#34-上下文标头注入)
    - [3.5 MySQL 持久化与 Child 向量入库](#35-mysql持久化与child向量入库)
 4. [一次问答的完整执行流程](#4-一次问答的完整执行流程)
@@ -467,18 +467,27 @@ flowchart TD
     A4 --> B
     B --> C{文档类型判断}
 
-    C -->|law| D1[生成 Parent<br/>完整法条或法律结构单元]
-    C -->|case| D2[生成 Parent<br/>案情、裁判理由或结果]
-    C -->|crime knowledge| D3[解析罪名、定义、构成要件<br/>量刑和相关法条]
+    C -->|law| D1[法规 Parent<br/>完整法条 · 软上限 1024]
+    C -->|case| D2[案例 Parent<br/>案件事实语义单元 · 软上限 2048]
+    C -->|crime| D3[罪名 Parent<br/>结构化知识字段 · 软上限 768]
 
     D1 --> E[正则提取元数据]
     D2 --> E
     D3 --> E
     E --> F[生成稳定 doc_id<br/>parent_chunk_id]
-    F --> G[Parent 切分为 Child<br/>生成 child_chunk_id]
-    G --> M1[(MySQL documents)]
-    G --> M2[(MySQL parent_chunks)]
-    G --> M3[(MySQL child_chunks)]
+    F --> G{Parent 内递归切分 Child}
+    G --> G1[法规 Child<br/>320 / overlap 64]
+    G --> G2[案例 Child<br/>512 / overlap 96]
+    G --> G3[罪名 Child<br/>256 / overlap 48]
+    G1 --> M1[(MySQL documents)]
+    G2 --> M1
+    G3 --> M1
+    G1 --> M2[(MySQL parent_chunks)]
+    G2 --> M2
+    G3 --> M2
+    G1 --> M3[(MySQL child_chunks)]
+    G2 --> M3
+    G3 --> M3
     M3 --> H[Child 注入上下文标头<br/>调用 text-embedding-v3]
     H --> I{目标 Collection}
     I -->|法规与犯罪知识| J[(ChromaDB · laws)]
@@ -489,19 +498,123 @@ flowchart TD
 
 这条链路体现了四个技术层次：格式转换解决数据源不统一，Parent 保留法律证据完整性，Child 提高检索粒度，MySQL 与 ChromaDB 则分别承担事实存储和派生向量索引。
 
-### 3.3 法律结构化分块
+### 3.3 差异化 Parent-Child 结构化分块
 
 普通 RAG 常按固定字符或 Token 窗口切分文档。但如果在法条中间直接切开，适用条件与法律后果可能被分到两个 Chunk，检索后只能得到半条规则。
 
-LawRAG 为两类文本分别设计 Parent，再将每个 Parent 切为更小的 Child：
+LawRAG 采用 Parent-Child Chunk（父子分块）策略：Parent 保证证据的语义完整性，Child 提高 BM25 与向量召回精度，形成“小块检索、大块生成”。三类数据采用不同的字符级软上限：
 
-| 文档类型 | Parent 单位 | Child 参数 |
-|---|---|---|
-| 法律法规 | 完整法条；超长法条按款项形成父级结构单元 | 320 字符，64 字符重叠 |
-| 裁判案例 | 裁判要旨、基本案情、裁判理由、裁判结果 | 320 字符，64 字符重叠 |
-| CrimeKG | 一个罪名知识条目 | 概念、构成、认定、处罚和法条片段 |
+| 数据类型 | Parent Size | Child Size | Overlap | Parent 语义单位 |
+|---|---:|---:|---:|---|
+| 法律法规 | 1024 | 320 | 64 | 完整法条或超长法条中的款、项 |
+| 刑事案例 | 2048 | 512 | 96 | 案件事实、裁判理由、裁判结果等语义段 |
+| 罪名知识 | 768 | 256 | 48 | 概念、构成特征、认定、处罚、法条或司法解释字段 |
+
+单位均为字符。Parent Size 是软上限：系统优先保持完整结构，只有结构单元超过上限时才继续按下一级语义边界切分。参数集中在 `config.py`，分块器版本为 `parent-child-v2-typed`。
+
+#### 3.3.1 法律法规：法条层级分块
+
+法律法规支持 TXT 及由 Parquet 转换得到的 TXT。Parent 构建流程如下：
+
+1. 解析法律名称及“编 → 章 → 节 → 条 → 款 → 项”层级；
+2. 以完整法条作为首选 Parent，避免割裂构成要件、适用条件和法律后果；
+3. Parent 超过 1024 字符时，依次按照款、项、自然段、句号、分号和逗号继续切分；
+4. 保存 `law_name`、`chapter`、`article_number`、生效日期及来源文件等元数据。
+
+每个法规 Parent 再按照以下优先级递归切为 Child：
+
+```text
+款/项 → 自然段 → 换行 → 句号 → 分号 → 逗号 → 字符兜底
+chunk_size = 320
+chunk_overlap = 64
+```
+
+例如《中华人民共和国民法典》第五百零九条首先形成完整 Parent；如果条文较长，其内部生成多个 Child。Child 向量文本会注入法律名称、章节和条号：
+
+```text
+[法律名称: 中华人民共和国民法典 | 章节: 第四章 合同的履行 | 条号: 第五百零九条]
+当事人应当按照约定全面履行自己的义务……
+```
+
+#### 3.3.2 刑事案例：案件事实语义分块
+
+CAIL2018 JSONL 中的 `fact` 是参与正文切分的案件事实，`meta` 中的罪名、相关法条、被告人和刑期只作为结构化元数据保存，不直接拼接进事实文本。
+
+对于包含标题的指导案例，系统优先识别裁判要旨、基本案情、裁判理由和裁判结果；对于没有标题的 CAIL `fact`，则按案件事件及事实语义边界形成 Parent。Parent 超过 2048 字符时，按照自然段、换行、句号、分号和逗号继续拆分，尽量保留行为、时间地点、涉案金额和量刑情节之间的联系。
+
+案例 Child 使用更大的窗口，降低关键案件事实被拆散的概率：
+
+```text
+自然段 → 换行 → 句号 → 分号 → 逗号 → 字符兜底
+chunk_size = 512
+chunk_overlap = 96
+```
+
+案例 Parent 和 Child 通过 metadata 保存 `case_number`、`guiding_number`、`section_type`、`accusation` 和 `relevant_articles` 等字段。
+
+#### 3.3.3 CrimeKG：罪名知识字段分块
+
+CrimeKgAssitant 原始 JSONL 经预处理转换为 `犯罪知识图谱.txt` 后，导入器将其识别为独立的 `crime` 类型，而不是普通法规。系统先按 `【罪名】（罪名大类）` 划分罪名条目，再按以下字段生成 Parent：
+
+- 概念与定义；
+- 犯罪构成特征；
+- 认定与区分；
+- 量刑处罚；
+- 相关法条；
+- 司法解释。
+
+字段内容不超过 768 字符时直接保留为一个 Parent；超过上限时再按自然段、句号、分号和逗号拆分。每个 Parent 内按照 `256/48` 生成 Child，并保留 `crime_name`、`crime_category`、`knowledge_type` 和来源信息。
+
+```text
+知识字段 → 自然段 → 换行 → 句号 → 分号 → 逗号 → 字符兜底
+chunk_size = 256
+chunk_overlap = 48
+```
+
+向量化前加入罪名和知识类型，避免“本罪”“本行为”等指代脱离语境：
+
+```text
+[罪名: 盗窃罪 | 知识类型: 认定与区分]
+盗窃罪与其他罪名的认定和区分……
+```
+
+#### 3.3.4 稳定 ID、存储与检索关联
 
 `doc_id`、`parent_chunk_id` 和 `child_chunk_id` 由源数据哈希、分块器版本和序号通过 UUIDv5 确定性生成。重复执行相同导入会得到相同 ID；升级 `CHUNKER_VERSION` 后生成新索引版本。Parent 保存法律名称、条号、案号和原文位置，Child 保存其所属 Parent ID 以及自身字符范围。
+
+```text
+原始数据（TXT / Parquet 转换结果 / JSONL）
+  ↓
+按数据类型生成 Parent
+  ├─ 法律法规：完整法条或款项
+  ├─ 刑事案例：案件事实语义单元
+  └─ 罪名知识：结构化知识字段
+  ↓
+Parent 内生成差异化 Child
+  ↓
+doc_id → parent_chunk_id → child_chunk_id
+  ↓
+  ┌────────────────────────────┐
+  │                            │
+MySQL                       ChromaDB
+Document 原文               Child 向量
+Parent / Child 正文         child_chunk_id
+父子关系与元数据            必要检索元数据
+  │                            │
+  └─────────────┬──────────────┘
+                ↓
+        BM25 + Dense 检索 Child
+                ↓
+             RRF 融合
+                ↓
+          Reranker 精排 Child
+                ↓
+     根据 parent_chunk_id 回查 MySQL
+                ↓
+       Parent 证据进入 LLM 生成
+```
+
+ChromaDB 只承担 Child 向量召回；BM25 语料和向量命中结果最终都依据 `child_chunk_id` 回查 MySQL 权威 Child 正文。Child 精排完成后按 `parent_chunk_id` 聚合，再从 MySQL 取回完整 Parent，Parent 本身不执行第二次 Reranker。
 
 ### 3.4 上下文标头注入
 
@@ -521,7 +634,7 @@ LawRAG 为两类文本分别设计 Parent，再将每个 Parent 切为更小的 
 ```text
 读取本地文件
   → 尝试 UTF-8 / GBK / GB2312 编码
-  → 判断法规或案例类型
+  → 判断 law / case / crime 数据类型
   → 构建 Document / Parent / Child
   → 先写入 MySQL 事实库
   → 仅对 Child 批量请求 text-embedding-v3
@@ -531,7 +644,7 @@ LawRAG 为两类文本分别设计 Parent，再将每个 Parent 切为更小的 
 
 MySQL 写入与向量索引之间通过 `pending → chunked → indexed / failed` 状态衔接。向量阶段失败时，原始数据和父子块仍保留在 MySQL，可根据稳定 ID 幂等重试。ChromaDB 中即使保存了 Child 文本派生副本，在线检索仍根据返回的 `child_chunk_id` 批量回查 MySQL，不把向量库副本作为权威正文。
 
-> 资源说明：`python -m scripts.import_data` 会为全部 Chunk 请求 Embedding。索引与 Embedding 模型版本绑定，数据或模型发生变化时执行重建。
+> 资源说明：`python -m scripts.import_data` 会为全部 Child 请求 Embedding。分块策略已升级为 `parent-child-v2-typed`，旧版 MySQL 父子块和 ChromaDB 向量不与新 ID 混用；部署新版后需执行一次完整重建。重建索引会调用 Embedding API。
 
 ---
 
@@ -1477,6 +1590,16 @@ DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 RERANKER_MODEL=qwen3.7-text-rerank
 RERANKER_CANDIDATE_K=20
 RERANKER_DOCUMENT_MAX_CHARS=1200
+CHUNKER_VERSION=parent-child-v2-typed
+LAW_PARENT_CHUNK_SIZE=1024
+LAW_CHILD_CHUNK_SIZE=320
+LAW_CHILD_CHUNK_OVERLAP=64
+CASE_PARENT_CHUNK_SIZE=2048
+CASE_CHILD_CHUNK_SIZE=512
+CASE_CHILD_CHUNK_OVERLAP=96
+CRIME_PARENT_CHUNK_SIZE=768
+CRIME_CHILD_CHUNK_SIZE=256
+CRIME_CHILD_CHUNK_OVERLAP=48
 CONTEXT_MAX_TOKENS=4000
 CONTEXT_CHAR_LIMIT=50000
 CONTEXT_TARGET_RATIO=0.8
@@ -1520,9 +1643,6 @@ TAVILY_API_KEY=tvly-your-api-key
 TAVILY_LEGAL_DOMAINS=["flk.npc.gov.cn","court.gov.cn","spp.gov.cn","gov.cn","moj.gov.cn"]
 MYSQL_URL=mysql+pymysql://root:your-password@127.0.0.1:3306/lawrag?charset=utf8mb4
 MYSQL_ECHO=false
-CHUNKER_VERSION=parent-child-v1
-CHILD_CHUNK_SIZE=320
-CHILD_CHUNK_OVERLAP=64
 CHILD_RERANK_TOP_K=15
 PARENT_TOP_K=5
 ```
@@ -1609,7 +1729,7 @@ npm run dev
 | `test_rag_evaluation.py` | Recall@5、MRR@10、指标聚合和 P95 计算 |
 | `test_context_memory_skills.py` | 大结果转存、消息归档、Tool Call/Result 配对保护、Micro 替换、历史摘要、法律证据打包与 Skill Loading |
 | `test_long_term_memory.py` | Checkpointer 线程隔离、历史摘要压缩、Semantic/Episodic 确认边界、去重、双存储关联与单批次写入 |
-| `test_parent_child_storage.py` | 稳定父子 ID、MySQL 回查、Child 权威正文、Child 精排与 Parent 聚合 |
+| `test_parent_child_storage.py` | 三类差异化分块参数、法规/案例/罪名结构切分、稳定父子 ID、MySQL 回查、Child 精排与 Parent 聚合 |
 | `test_agentic_rag.py` | LangGraph 节点顺序、LLM 工具决策、强制检索策略、证据评估和 Grounding 校验 |
 | `test_external_mcp.py` | MCP 工具注册、底层参数映射、查询脱敏、结果上限和官方域名白名单 |
 | `test_tracing.py` | 同步/异步节点装饰器、父子 Span、异常、Token 去重、敏感字段脱敏、SQLite 持久化与统计 |

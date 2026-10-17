@@ -3,6 +3,87 @@
 from langchain_core.documents import Document
 
 
+def test_differentiated_chunk_profiles_match_data_types():
+    from app.utils.parent_child_chunker import get_chunk_profile
+
+    law = get_chunk_profile("law")
+    case = get_chunk_profile("case")
+    crime = get_chunk_profile("crime")
+
+    assert (law.parent_size, law.child_size, law.child_overlap) == (1024, 320, 64)
+    assert (case.parent_size, case.child_size, case.child_overlap) == (2048, 512, 96)
+    assert (crime.parent_size, crime.child_size, crime.child_overlap) == (768, 256, 48)
+
+
+def test_law_uses_article_parents_and_small_children():
+    from app.utils.parent_child_chunker import build_parent_child_tree
+
+    long_clause = "当事人应当依法履行义务，" * 100
+    text = f"""中华人民共和国示例法
+第一章 总则
+第一条 {long_clause}
+第二条 本条保持为独立法条。"""
+    tree = build_parent_child_tree(text, doc_type="law", source_file="示例法.txt")
+
+    assert {parent.article_number for parent in tree.document.parents} >= {"一", "二"}
+    assert all(len(parent.parent_text) <= 1024 for parent in tree.document.parents)
+    children = [child for parent in tree.document.parents for child in parent.children]
+    assert all(len(child.child_text) <= 320 for child in children)
+    assert all(child.child_metadata["child_chunk_overlap"] == 64 for child in children)
+    assert "法律名称:" in tree.vector_documents[0].page_content
+
+
+def test_case_uses_semantic_section_parents_and_larger_children():
+    from app.utils.parent_child_chunker import build_parent_child_tree
+
+    text = """指导案例99号
+
+基本案情
+被告人实施了相关行为。案发后主动到案。双方对事实没有争议。
+
+裁判理由
+法院结合证据、行为方式和法律规定进行认定。
+
+裁判结果
+法院依法作出判决。"""
+    tree = build_parent_child_tree(text, doc_type="case", source_file="指导案例99号.txt")
+
+    section_types = {parent.section_type for parent in tree.document.parents}
+    assert {"基本案情", "裁判理由", "裁判结果"}.issubset(section_types)
+    children = [child for parent in tree.document.parents for child in parent.children]
+    assert all(child.child_metadata["child_chunk_size"] == 512 for child in children)
+    assert all(child.child_metadata["child_chunk_overlap"] == 96 for child in children)
+
+
+def test_crime_kg_uses_field_parents_and_context_headers():
+    from app.utils.parent_child_chunker import build_parent_child_tree
+
+    text = """【盗窃罪】（侵犯财产罪）
+
+概念与定义：
+盗窃罪是以非法占有为目的秘密窃取财物的行为。
+
+犯罪构成特征：
+本罪应结合主体、主观方面、客体和客观方面进行判断。
+
+量刑处罚：
+根据盗窃数额和犯罪情节依法处罚。
+
+【诈骗罪】（侵犯财产罪）
+
+概念与定义：
+诈骗罪是以非法占有为目的骗取财物的行为。"""
+    tree = build_parent_child_tree(text, doc_type="crime", source_file="犯罪知识图谱.txt")
+
+    parent_metadata = [parent.chunk_metadata for parent in tree.document.parents]
+    assert {item["crime_name"] for item in parent_metadata} == {"盗窃罪", "诈骗罪"}
+    assert "概念与定义" in {item["knowledge_type"] for item in parent_metadata}
+    children = [child for parent in tree.document.parents for child in parent.children]
+    assert all(len(child.child_text) <= 256 for child in children)
+    assert all(child.child_metadata["child_chunk_overlap"] == 48 for child in children)
+    assert any("罪名: 盗窃罪" in item.page_content for item in tree.vector_documents)
+
+
 def test_parent_child_ids_are_stable_and_linked():
     from app.utils.parent_child_chunker import build_parent_child_tree
 

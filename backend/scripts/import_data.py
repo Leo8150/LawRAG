@@ -6,6 +6,7 @@
 
 支持:
 - data/laws/ 下的 .txt 文件（递归子目录）
+- data/laws/CrimeKG/ 下的结构化罪名知识文本
 - data/cases/ 下的 .json (JSONL) 文件（递归子目录）
 """
 
@@ -57,12 +58,14 @@ def import_laws(repository, dir_path: str) -> int:
         fname = os.path.basename(fpath)
         try:
             text = read_file(fpath)
+            normalized_path = fpath.replace("\\", "/").casefold()
+            is_crime_kg = "/crimekg/" in normalized_path or fname == os.path.basename(settings.KG_DATA_PATH)
             tree = prepare_document(
                 text,
-                doc_type="law",
+                doc_type="crime" if is_crime_kg else "law",
                 source_file=fname,
                 source_path=fpath,
-                dataset_name="laws",
+                dataset_name="crime_kg" if is_crime_kg else "laws",
             )
             persist_and_index(
                 tree,
@@ -163,6 +166,10 @@ def import_cases_jsonl(repository, dir_path: str, max_cases: int = 5000) -> int:
                     tree.document.document_metadata.update(extra_meta)
                     for parent in tree.document.parents:
                         parent.chunk_metadata.update(extra_meta)
+                        for child in parent.children:
+                            child.child_metadata.update(extra_meta)
+                    for vector_document in tree.vector_documents:
+                        vector_document.metadata.update(extra_meta)
                     persist_and_index(
                         tree,
                         collection_name=settings.CASES_COLLECTION,

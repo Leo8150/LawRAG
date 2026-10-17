@@ -39,6 +39,52 @@ class ParentChildTree:
     child_ids: list[str]
 
 
+@dataclass(frozen=True)
+class ChunkProfile:
+    parent_size: int
+    child_size: int
+    child_overlap: int
+    child_separators: tuple[str, ...]
+    strategy: str
+
+
+def get_chunk_profile(doc_type: str) -> ChunkProfile:
+    """Return the differentiated Parent/Child policy for one data type."""
+    if doc_type == "case":
+        return ChunkProfile(
+            settings.CASE_PARENT_CHUNK_SIZE,
+            settings.CASE_CHILD_CHUNK_SIZE,
+            settings.CASE_CHILD_CHUNK_OVERLAP,
+            ("\n\n", "\n", "。", "；", "，", ""),
+            "case_fact_semantic",
+        )
+    if doc_type == "crime":
+        return ChunkProfile(
+            settings.CRIME_PARENT_CHUNK_SIZE,
+            settings.CRIME_CHILD_CHUNK_SIZE,
+            settings.CRIME_CHILD_CHUNK_OVERLAP,
+            ("\n\n", "\n", "。", "；", "，", ""),
+            "crime_knowledge_field",
+        )
+    return ChunkProfile(
+        settings.LAW_PARENT_CHUNK_SIZE,
+        settings.LAW_CHILD_CHUNK_SIZE,
+        settings.LAW_CHILD_CHUNK_OVERLAP,
+        (
+            r"\n[一二三四五六七八九十百]+、",
+            r"\n（[一二三四五六七八九十百]+）",
+            r"\n\(\d+\)",
+            "\n\n",
+            "\n",
+            "。",
+            "；",
+            "，",
+            "",
+        ),
+        "law_article_structure",
+    )
+
+
 def build_parent_child_tree(
     text: str,
     *,
@@ -49,16 +95,23 @@ def build_parent_child_tree(
     source_record_id: str = "",
 ) -> ParentChildTree:
     """Create MySQL entities plus child Documents ready for vector indexing."""
+    profile = get_chunk_profile(doc_type)
     content_hash = _sha256(text)
     identity = f"{doc_type}:{source_file}:{source_record_id}:{content_hash}"
     doc_id = _stable_id(uuid.NAMESPACE_URL, identity)
 
-    parent_documents = split_legal_document(text, doc_type=doc_type, filename=source_file)
+    parent_documents = split_legal_document(
+        text,
+        doc_type=doc_type,
+        filename=source_file,
+        chunk_size=profile.parent_size,
+    )
     title = ""
     if parent_documents:
         title = str(
             parent_documents[0].metadata.get("law_name")
             or parent_documents[0].metadata.get("case_title")
+            or parent_documents[0].metadata.get("crime_name")
             or source_file
         )
     source = SourceDocument(
@@ -76,9 +129,10 @@ def build_parent_child_tree(
     )
 
     child_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=settings.CHILD_CHUNK_SIZE,
-        chunk_overlap=settings.CHILD_CHUNK_OVERLAP,
-        separators=["\n\n", "。", "；", "，", "\n", ""],
+        chunk_size=profile.child_size,
+        chunk_overlap=profile.child_overlap,
+        separators=list(profile.child_separators),
+        is_separator_regex=True,
         keep_separator=True,
     )
     vector_documents: list[Document] = []
@@ -103,7 +157,11 @@ def build_parent_child_tree(
             parent_chunk_id=parent_id,
             doc_id=doc_id,
             parent_index=parent_index,
-            parent_type=str(metadata.get("section_type") or ("article" if doc_type == "law" else "case_section")),
+            parent_type=str(
+                metadata.get("knowledge_type")
+                or metadata.get("section_type")
+                or ("article" if doc_type == "law" else "case_section")
+            ),
             parent_text=parent_text,
             content_hash=parent_hash,
             char_start=parent_start,
@@ -117,7 +175,13 @@ def build_parent_child_tree(
             case_number=str(metadata.get("case_number", "")),
             guiding_number=str(metadata.get("guiding_number", "")),
             section_type=str(metadata.get("section_type", "")),
-            chunk_metadata=metadata,
+            chunk_metadata={
+                **metadata,
+                "chunk_strategy": profile.strategy,
+                "parent_chunk_size": profile.parent_size,
+                "child_chunk_size": profile.child_size,
+                "child_chunk_overlap": profile.child_overlap,
+            },
             chunker_version=settings.CHUNKER_VERSION,
         )
         source.parents.append(parent)
@@ -133,7 +197,10 @@ def build_parent_child_tree(
                 uuid.UUID(parent_id),
                 f"child:{child_index}:{child_hash}",
             )
-            local_start = parent_text.find(child_text, max(0, child_search_start - settings.CHILD_CHUNK_OVERLAP))
+            local_start = parent_text.find(
+                child_text,
+                max(0, child_search_start - profile.child_overlap),
+            )
             local_start = local_start if local_start >= 0 else None
             local_end = local_start + len(child_text) if local_start is not None else None
             if local_end is not None:
@@ -156,9 +223,19 @@ def build_parent_child_tree(
                 "source_file": source_file,
                 "law_name": parent.law_name,
                 "article_number": parent.article_number,
+                "division": str(metadata.get("division", "")),
+                "chapter": parent.chapter,
+                "section": str(metadata.get("section", "")),
                 "case_number": parent.case_number,
                 "guiding_number": parent.guiding_number,
                 "section_type": parent.section_type,
+                "crime_name": str(metadata.get("crime_name", "")),
+                "crime_category": str(metadata.get("crime_category", "")),
+                "knowledge_type": str(metadata.get("knowledge_type", "")),
+                "chunk_strategy": profile.strategy,
+                "parent_chunk_size": profile.parent_size,
+                "child_chunk_size": profile.child_size,
+                "child_chunk_overlap": profile.child_overlap,
             }
             parent.children.append(ChildChunk(
                 child_chunk_id=child_id,
@@ -172,13 +249,23 @@ def build_parent_child_tree(
                 token_count=estimate_tokens(child_text),
                 child_metadata=child_meta,
             ))
-            header_bits = [
-                value for value in (
-                    parent.law_name,
-                    f"第{parent.article_number}条" if parent.article_number else "",
-                    parent.section_type,
-                ) if value
-            ]
+            header_bits = []
+            if parent.law_name:
+                header_bits.append(f"法律名称: {parent.law_name}")
+            if parent.chapter:
+                header_bits.append(f"章节: {parent.chapter}")
+            if parent.article_number:
+                header_bits.append(f"条号: 第{parent.article_number}条")
+            if parent.guiding_number:
+                header_bits.append(f"案例: {parent.guiding_number}")
+            crime_name = str(metadata.get("crime_name", ""))
+            knowledge_type = str(metadata.get("knowledge_type", ""))
+            if crime_name:
+                header_bits.append(f"罪名: {crime_name}")
+            if knowledge_type:
+                header_bits.append(f"知识类型: {knowledge_type}")
+            elif parent.section_type:
+                header_bits.append(f"段落: {parent.section_type}")
             vector_text = f"[{' / '.join(header_bits)}]\n{child_text}" if header_bits else child_text
             vector_documents.append(Document(page_content=vector_text, metadata=child_meta))
             child_ids.append(child_id)
